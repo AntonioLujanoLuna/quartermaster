@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import argparse
 import logging
-from pathlib import Path
 import os
+from datetime import datetime, timezone
+from pathlib import Path
 
 from .config import Settings
 from .db import SQLiteStore
@@ -22,6 +23,8 @@ def main() -> int:
     parser.add_argument("--db", default="quartermaster.sqlite", type=Path)
     parser.add_argument("command", choices=["export", "run", "health", "maintenance", "backup", "restore"])
     parser.add_argument("--destination", type=Path)
+    parser.add_argument("--off-device-directory", type=Path)
+    parser.add_argument("--retention-count", type=int, default=7)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--replace", action="store_true")
     args = parser.parse_args()
@@ -47,10 +50,17 @@ def main() -> int:
                 handle_retention_seconds=settings.handle_retention_seconds,
             ))
     elif args.command == "backup":
-        if args.destination is None:
-            parser.error("backup requires --destination")
+        destination = args.destination or (
+            Path("backups")
+            / f"quartermaster-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%SZ')}.sqlite"
+        )
         with SQLiteStore(args.db).open() as store:
-            print(create_backup(store, args.destination))
+            print(create_backup(
+                store,
+                destination,
+                off_device_directory=args.off_device_directory,
+                retention_count=args.retention_count,
+            ))
     else:
         if args.source is None:
             parser.error("restore requires --source")

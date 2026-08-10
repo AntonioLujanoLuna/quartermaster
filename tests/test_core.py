@@ -2,26 +2,36 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from quartermaster.config import ConfigurationError, Settings
-from quartermaster.db import SQLiteStore
+from quartermaster.db import SCHEMA_VERSION, SQLiteStore
 from quartermaster.export import render_export
 from quartermaster.handles import HandleError, HandleRepository
 from quartermaster.inventory import InventoryService, SemanticStaleness
 from quartermaster.loot import LootDropService
-from quartermaster.operations import health_report, restore_backup, run_maintenance, validate_backup
+from quartermaster.operations import create_backup, health_report, restore_backup, run_maintenance, validate_backup
 from quartermaster.projections import EventOutboxWorker, StateProjectionScheduler
 from quartermaster.receipts import ReceiptRepository
 from quartermaster.recovery import recover_startup
-from quartermaster.response import ResponseController, ResponseState, ResponseStateError
+from quartermaster.response import (
+    DeferredExecutionError,
+    ResponseController,
+    ResponseState,
+    ResponseStateError,
+    execute_deferred,
+    execute_fast,
+)
 from quartermaster.sessions import SessionService
 from quartermaster.transport import FakeDiscordTransport, RateLimitedError
+from quartermaster.discord_projection import DiscordProjectionTransport
 
 
 class QuartermasterCoreTests(unittest.TestCase):
@@ -124,6 +134,108 @@ class QuartermasterCoreTests(unittest.TestCase):
         with self.assertRaises(ResponseStateError):
             controller.respond({"late": True})
 
+    def test_execute_fast_falls_back_to_deferred_before_long_local_work_finishes(self) -> None:
+        release = threading.Event()
+
+        class Response:
+            def __init__(self) -> None:
+                self.deferred = False
+
+            def is_done(self) -> bool:
+                return self.deferred
+
+            async def defer(self, *, ephemeral: bool = False) -> None:
+                self.deferred = True
+                release.set()
+
+        class Interaction:
+            def __init__(self) -> None:
+                self.response = Response()
+
+        interaction = Interaction()
+
+        def operation() -> dict[str, bool]:
+            release.wait(1)
+            return {"ok": True}
+
+        async def run() -> object:
+            return await execute_fast(
+                interaction,
+                operation,
+                soft_deadline_seconds=0.01,
+            )
+
+        result = asyncio.run(run())
+        self.assertTrue(result.deferred)
+        self.assertEqual(result.value, {"ok": True})
+        self.assertTrue(interaction.response.deferred)
+
+    def test_execute_deferred_commits_replays_and_records_failure(self) -> None:
+        class Response:
+            def __init__(self) -> None:
+                self.deferred = False
+
+            def is_done(self) -> bool:
+                return self.deferred
+
+            async def defer(self, *, ephemeral: bool = False) -> None:
+                self.deferred = True
+
+        class Interaction:
+            def __init__(self, interaction_id: str) -> None:
+                self.id = interaction_id
+                self.response = Response()
+
+        calls = 0
+
+        def operation() -> dict[str, str]:
+            nonlocal calls
+            calls += 1
+            return {"value": "export"}
+
+        first = asyncio.run(
+            execute_deferred(
+                Interaction("deferred-1"),
+                self.receipts,
+                operation,
+                actor_id="actor-1",
+                response_kind="export",
+                ephemeral=True,
+            )
+        )
+        replay = asyncio.run(
+            execute_deferred(
+                Interaction("deferred-1"),
+                self.receipts,
+                operation,
+                actor_id="actor-1",
+                response_kind="export",
+                ephemeral=True,
+            )
+        )
+        self.assertEqual(first.receipt.status, "COMMITTED")
+        self.assertTrue(first.deferred)
+        self.assertFalse(replay.deferred)
+        self.assertEqual(replay.receipt.logical_response, {"value": "export"})
+        self.assertEqual(calls, 1)
+
+        def failing_operation() -> object:
+            raise RuntimeError("export failed")
+
+        with self.assertRaises(DeferredExecutionError) as raised:
+            asyncio.run(
+                execute_deferred(
+                    Interaction("deferred-2"),
+                    self.receipts,
+                    failing_operation,
+                    actor_id="actor-1",
+                    response_kind="export",
+                    ephemeral=True,
+                )
+            )
+        self.assertEqual(raised.exception.receipt.status, "FAILED")
+        self.assertTrue(raised.exception.receipt.logical_response["retryable"])
+
     def test_export_is_human_readable_and_uses_canonical_state(self) -> None:
         with self.store.transaction() as connection:
             connection.execute(
@@ -141,22 +253,54 @@ class QuartermasterCoreTests(unittest.TestCase):
         backup = self.store.snapshot(Path(self.tempdir.name) / "backup.sqlite")
         self.assertTrue(backup.exists())
         with SQLiteStore(backup).open() as restored:
-            self.assertEqual(restored.connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 4)
+            self.assertEqual(restored.connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], SCHEMA_VERSION)
 
     def test_backup_validation_and_restore_are_equivalent(self) -> None:
         self.inventory.grant_interaction("backup-grant", actor_id="dm", item_name="Backup Token", quantity=2)
         backup = self.store.snapshot(Path(self.tempdir.name) / "backup.sqlite")
-        self.assertEqual(validate_backup(backup)["schema_version"], 4)
+        self.assertEqual(validate_backup(backup)["schema_version"], SCHEMA_VERSION)
         restored = restore_backup(backup, Path(self.tempdir.name) / "restored.sqlite")
-        self.assertEqual(restored["schema_version"], 4)
+        self.assertEqual(restored["schema_version"], SCHEMA_VERSION)
         with SQLiteStore(Path(self.tempdir.name) / "restored.sqlite").open() as restored_store:
             self.assertIn("Backup Token x2", render_export(restored_store))
 
+    def test_backup_copies_off_device_applies_retention_and_affects_health(self) -> None:
+        primary = Path(self.tempdir.name) / "backups"
+        off_device = Path(self.tempdir.name) / "off-device"
+        primary.mkdir()
+        old_backup = primary / "quartermaster-older.sqlite"
+        old_backup.write_text("retained only until the next backup", encoding="utf-8")
+        old_timestamp = old_backup.stat().st_mtime - 3600
+        os.utime(old_backup, (old_timestamp, old_timestamp))
+
+        result = create_backup(
+            self.store,
+            primary / "quartermaster-current.sqlite",
+            off_device_directory=off_device,
+            retention_count=1,
+        )
+        self.assertTrue(Path(result["primary_path"]).is_file())
+        self.assertTrue(Path(result["off_device_path"]).is_file())
+        self.assertFalse(old_backup.exists())
+        self.assertEqual(result["retention_count"], 1)
+        details = self.store.connection.execute(
+            "SELECT last_details FROM maintenance_runs WHERE name = 'backup'"
+        ).fetchone()
+        self.assertEqual(json.loads(details["last_details"])["off_device_path"], result["off_device_path"])
+        self.assertEqual(health_report(self.store)["checks"]["backup"], "OK")
+
+        Path(result["off_device_path"]).unlink()
+        degraded = health_report(self.store)
+        self.assertEqual(degraded["status"], "DEGRADED")
+        self.assertEqual(degraded["checks"]["backup"], "DEGRADED")
+
     def test_health_report_is_healthy_for_clean_database(self) -> None:
+        create_backup(self.store, Path(self.tempdir.name) / "health-backup.sqlite")
         report = health_report(self.store)
         self.assertEqual(report["status"], "HEALTHY")
         self.assertEqual(report["checks"]["database"], "OK")
         self.assertEqual(report["checks"]["schema"], "OK")
+        self.assertEqual(report["checks"]["backup"], "OK")
 
     def test_maintenance_expires_drops_and_removes_retained_state(self) -> None:
         receipt = self.inventory.grant_interaction("maintenance-receipt", actor_id="dm", item_name="Old Token", quantity=1)
@@ -192,8 +336,48 @@ class QuartermasterCoreTests(unittest.TestCase):
         commands = bot.tree.get_commands(guild=discord.Object(id=123))
         self.assertEqual(
             {command.name for command in commands},
-            {"stash", "grant", "loot", "loot-drop", "loot-close", "session-start", "session-end"},
+            {"stash", "grant", "loot", "loot-drop", "loot-close", "export", "session-start", "session-end"},
         )
+
+    def test_session_projection_binds_and_reuses_a_discord_thread(self) -> None:
+        session = self.sessions.start_session()
+
+        class Thread:
+            id = 987
+
+        class Channel:
+            async def create_thread(self, **_kwargs):
+                return Thread()
+
+        class Bot:
+            def __init__(self) -> None:
+                self.channel = Channel()
+                self.fetches: list[int] = []
+
+            async def fetch_channel(self, channel_id: int):
+                self.fetches.append(channel_id)
+                return self.channel if channel_id == 123 else Thread()
+
+        bot = Bot()
+        transport = DiscordProjectionTransport(
+            bot,
+            Settings(guild_id="123", database_path=self.db_path, session_log_channel_id="123"),
+            self.store,
+        )
+
+        async def resolve() -> object:
+            first = await transport._fetch_channel(f"session:{session['session_id']}")
+            second = await transport._fetch_channel(f"session:{session['session_id']}")
+            return first, second
+
+        first, second = asyncio.run(resolve())
+        self.assertIsInstance(first, Thread)
+        self.assertIsInstance(second, Thread)
+        self.assertEqual(bot.fetches, [123, 987, 987])
+        stored = self.store.connection.execute(
+            "SELECT discord_thread_id FROM sessions WHERE id = ?", (session["session_id"],)
+        ).fetchone()
+        self.assertEqual(stored["discord_thread_id"], "987")
 
     def test_session_start_is_explicit_when_an_active_session_exists(self) -> None:
         first = self.sessions.start_session()
@@ -276,7 +460,9 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.inventory.grant_interaction("grant-4", actor_id="dm", item_name="Arrow", quantity=1)
         with self.assertRaises(SemanticStaleness):
             self.inventory.take_interaction("take-5", handle_id=handle_id, actor_id="player")
-        self.assertEqual(self.inventory.browse()[0]["quantity"], 4)
+        confirmed = self.inventory.confirm_take_interaction("take-6", handle_id=handle_id, actor_id="player")
+        self.assertEqual(confirmed.logical_response["quantity"], 4)
+        self.assertEqual(self.inventory.browse(), [])
 
     def test_state_projection_coalesces_to_latest_canonical_state(self) -> None:
         self.inventory.grant_interaction("grant-projection-1", actor_id="dm", item_name="Torch", quantity=1)

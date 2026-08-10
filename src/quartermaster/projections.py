@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import inspect
 from datetime import datetime, timedelta, timezone
@@ -18,53 +19,54 @@ def _plus_seconds(timestamp: str, seconds: float) -> str:
 
 
 def render_state(store: SQLiteStore, target_id: str) -> dict[str, Any]:
-    connection = store._require_connection()
-    if target_id == "party-stash":
-        rows = connection.execute(
+    with store.connection_lock:
+        connection = store._require_connection()
+        if target_id == "party-stash":
+            rows = connection.execute(
             """SELECT item_name, quantity, provenance
                FROM inventory_stacks
               WHERE owner_type = 'PARTY' AND owner_id = 'party'
               ORDER BY last_acquired_at DESC, item_name"""
-        ).fetchall()
-        drops = connection.execute(
+            ).fetchall()
+            drops = connection.execute(
             """SELECT loot.id, loot.expires_at, item.item_name, item.remaining_quantity
                  FROM loot_drops AS loot
                  JOIN loot_drop_items AS item ON item.drop_id = loot.id
                 WHERE loot.status = 'OPEN' AND item.remaining_quantity > 0
                 ORDER BY loot.created_at, item.created_at"""
-        ).fetchall()
-        drop_payload: dict[str, list[dict[str, Any]]] = {}
-        for drop in drops:
-            drop_payload.setdefault(drop["id"], []).append(
-                {"item_name": drop["item_name"], "remaining": drop["remaining_quantity"], "expires_at": drop["expires_at"]}
-            )
-        return {
-            "surface": "PARTY STASH",
-            "items": [
-                {"item_name": row["item_name"], "quantity": row["quantity"], "provenance": row["provenance"]}
-                for row in rows
-            ],
-            "loot_drops": [{"drop_id": drop_id, "items": items} for drop_id, items in drop_payload.items()],
-        }
-    if target_id == "session-surface":
-        active = connection.execute(
+            ).fetchall()
+            drop_payload: dict[str, list[dict[str, Any]]] = {}
+            for drop in drops:
+                drop_payload.setdefault(drop["id"], []).append(
+                    {"item_name": drop["item_name"], "remaining": drop["remaining_quantity"], "expires_at": drop["expires_at"]}
+                )
+            return {
+                "surface": "PARTY STASH",
+                "items": [
+                    {"item_name": row["item_name"], "quantity": row["quantity"], "provenance": row["provenance"]}
+                    for row in rows
+                ],
+                "loot_drops": [{"drop_id": drop_id, "items": items} for drop_id, items in drop_payload.items()],
+            }
+        if target_id == "session-surface":
+            active = connection.execute(
             "SELECT session_number, started_at FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
-        ).fetchone()
-        previous = connection.execute(
+            ).fetchone()
+            previous = connection.execute(
             "SELECT session_number, where_ended FROM sessions WHERE status = 'CLOSED' ORDER BY session_number DESC LIMIT 1"
-        ).fetchone()
-        return {
-            "surface": "SESSION",
-            "active": dict(active) if active else None,
-            "previous": dict(previous) if previous else None,
-        }
-    if target_id == "dm-surface":
-        return {
-            "surface": "QUARTERMASTER",
-            "active_session_count": connection.execute("SELECT COUNT(*) FROM sessions WHERE status = 'ACTIVE'").fetchone()[0],
-            "stash_count": connection.execute("SELECT COUNT(*) FROM inventory_stacks WHERE owner_type = 'PARTY'").fetchone()[0],
-        }
-    raise ValueError(f"unknown state projection target: {target_id}")
+            ).fetchone()
+            return {
+                "surface": "SESSION",
+                "active": dict(active) if active else None,
+                "previous": dict(previous) if previous else None,
+            }
+        if target_id == "dm-surface":
+            return {
+                "surface": "QUARTERMASTER",
+                "active_session_count": connection.execute("SELECT COUNT(*) FROM sessions WHERE status = 'ACTIVE'").fetchone()[0],
+                "stash_count": connection.execute("SELECT COUNT(*) FROM inventory_stacks WHERE owner_type = 'PARTY'").fetchone()[0],
+            }
+        raise ValueError(f"unknown state projection target: {target_id}")
 
 
 class StateProjectionScheduler:
@@ -92,22 +94,24 @@ class StateProjectionScheduler:
 
     async def run_once_async(self, transport: Any | None = None) -> bool:
         """Deliver one state target through an async transport."""
-        target = self._claim_next_target()
+        target = await asyncio.to_thread(self._claim_next_target)
         if target is None:
             return False
         target_id = target["target_id"]
         transport = transport or self.transport
         try:
-            payload = render_state(self.store, target_id)
+            payload = await asyncio.to_thread(render_state, self.store, target_id)
             result = transport.upsert_state(target_id, target["destination"], payload, target["discord_message_id"])
             message_id = await result if inspect.isawaitable(result) else result
         except RateLimitedError as error:
-            self._record_failure(target_id, f"rate limited: {error}", error.retry_after_seconds)
+            await asyncio.to_thread(
+                self._record_failure, target_id, f"rate limited: {error}", error.retry_after_seconds
+            )
             return False
         except Exception as error:
-            self._record_failure(target_id, str(error), 1.0)
+            await asyncio.to_thread(self._record_failure, target_id, str(error), 1.0)
             return False
-        self._record_success(target, message_id)
+        await asyncio.to_thread(self._record_success, target, message_id)
         return True
 
     def _record_success(self, target: Any, message_id: str) -> None:
@@ -179,7 +183,7 @@ class EventOutboxWorker:
 
     async def run_once_async(self, transport: Any | None = None) -> bool:
         """Deliver one event through an async transport."""
-        event = self._next_event()
+        event = await asyncio.to_thread(self._next_event)
         if event is None:
             return False
         transport = transport or self.transport
@@ -188,12 +192,14 @@ class EventOutboxWorker:
             if inspect.isawaitable(result):
                 await result
         except RateLimitedError as error:
-            self._retry(event["id"], f"rate limited: {error}", error.retry_after_seconds)
+            await asyncio.to_thread(
+                self._retry, event["id"], f"rate limited: {error}", error.retry_after_seconds
+            )
             return False
         except Exception as error:
-            self._retry(event["id"], str(error), 1.0)
+            await asyncio.to_thread(self._retry, event["id"], str(error), 1.0)
             return False
-        self._mark_delivered(event["id"])
+        await asyncio.to_thread(self._mark_delivered, event["id"])
         return True
 
     def _mark_delivered(self, event_id: int) -> None:
@@ -205,22 +211,23 @@ class EventOutboxWorker:
 
     def _next_event(self) -> Any:
         now = self.now()
-        connection = self.store._require_connection()
-        return connection.execute(
-            """SELECT event.*
-                 FROM event_outbox AS event
-                WHERE event.status = 'PENDING'
-                  AND event.next_attempt_at <= ?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM event_outbox AS earlier
-                       WHERE earlier.destination = event.destination
-                         AND earlier.id < event.id
-                         AND earlier.status <> 'DELIVERED'
-                  )
-                ORDER BY event.id
-                LIMIT 1""",
-            (now,),
-        ).fetchone()
+        with self.store.connection_lock:
+            connection = self.store._require_connection()
+            return connection.execute(
+                """SELECT event.*
+                     FROM event_outbox AS event
+                    WHERE event.status = 'PENDING'
+                      AND event.next_attempt_at <= ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM event_outbox AS earlier
+                           WHERE earlier.destination = event.destination
+                             AND earlier.id < event.id
+                             AND earlier.status <> 'DELIVERED'
+                      )
+                    ORDER BY event.id
+                    LIMIT 1""",
+                (now,),
+            ).fetchone()
 
     def _retry(self, event_id: int, message: str, retry_after: float) -> None:
         now = self.now()

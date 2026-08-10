@@ -5,19 +5,22 @@ Updated: 2026-08-10
 ## Verified current state
 
 - Python project managed with `uv` and `.venv`.
-- SQLite canonical state is at schema version 4.
+- SQLite canonical state is at schema version 6.
 - FAST and DEFERRED interaction receipts are implemented.
 - Opaque single-use mutation handles are implemented.
+- Bot startup now recovers interrupted DEFERRED receipts and runs transient-state maintenance before accepting interactions.
 - Party Stash Grant/Take flows are implemented.
+- Relative Take-all staleness now offers explicit confirmation of the current quantity.
 - Loot Drops support creation, claim handles, manual close, session-close, and absolute expiry.
 - Minimal Session lifecycle is implemented.
-- State projection scheduling and FIFO event delivery are implemented.
-- The `discord.py` adapter exposes guild-scoped `/stash`, `/grant`, `/session-start`, `/session-end`, `/loot`, `/loot-drop`, and `/loot-close`.
-- Discord projection delivery runs asynchronously after database commit.
+- State projection scheduling and FIFO event delivery are implemented; session projections bind to durable per-session Discord threads.
+- The `discord.py` adapter exposes guild-scoped `/stash`, `/grant`, `/session-start`, `/session-end`, `/loot`, `/loot-drop`, `/loot-close`, and DM-admin `/export`.
+- Discord projection delivery and bounded local interaction work run asynchronously after database commit, with deadline-aware response deferral at the configured soft deadline. `/export` uses the adapter-level durable `PROCESSING -> COMMITTED/FAILED` workflow; backup remains an operator CLI path.
+- Online backups create timestamped validated snapshots, optionally copy them to a secondary directory, apply retention, and record their paths and outcome for health checks.
 - Operational commands now cover `health`, `maintenance`, `backup`, and safe restore validation.
 - Managed Windows process wrappers are in `scripts/start-quartermaster.ps1` and `scripts/stop-quartermaster.ps1`.
 - Operator procedures for backup/restore and degraded operation are documented in `docs/runbook.md`.
-- 23 automated tests pass with `uv`.
+- 30 automated tests pass with `uv`.
 
 ## Live Discord setup
 
@@ -50,9 +53,9 @@ The Discord acceptance pass is now complete in the signed-in `Quartermaster Test
 - An open smoke-test Loot Drop contains `Live Loot Token x2`.
 - Close or claim the test drop during the next live acceptance pass; do not mistake it for campaign data.
 
-## Remaining acceptance checks
+## Acceptance checks completed
 
-The live checks completed from the signed-in browser session:
+The live checks completed from the signed-in browser session before the schema-5/runtime-hardening and schema-6 backup slices:
 
 1. `/grant` a clearly named test item and confirm the response and Party Stash projection.
 2. `/stash` -> `Browse` -> `Take`; confirm the quantity and event projection update.
@@ -69,9 +72,16 @@ Results:
 - The managed stop/start path reconnected, synced guild commands, and edited one existing Party Stash projection rather than creating a duplicate.
 - Final live state has no open Loot Drops, no pending events, and canonical health `HEALTHY`.
 
+The next live pass must re-verify the new runtime slice:
+
+1. Restart the bot across the schema-6 migration and confirm the canonical state remains intact.
+2. Start a session and confirm a `Session N` thread is created in `#session-log`.
+3. Confirm session events route into that thread and Party Stash remains pinned/recreated correctly.
+4. Exercise `/stash`, `/loot`, and a mutation button after restart to confirm deferred-capable callbacks still acknowledge safely.
+
 The local operational acceptance checks are complete:
 
-- `uv run pytest -q` -> 26 passed.
+- `uv run pytest -q` -> 30 passed.
 - `health` -> `HEALTHY` on the canonical database.
 - Online backup -> integrity and schema validation passed.
 - Restore to a new database -> integrity, schema, health, and export validation passed.
@@ -81,11 +91,11 @@ The live test data intentionally remains visible for cleanup/audit: Party Stash 
 
 ## Next implementation priorities
 
-After the acceptance checks:
+After the new live verification:
 
-1. Replace the ad-hoc bot process with a documented managed startup/service procedure.
-2. Add backup/restore validation, health checks, maintenance cleanup, and a degraded-operation runbook.
-3. Update export and acceptance coverage for Loot Drops and restart recovery.
+1. Extend health to cover Discord surface reachability and establish a scheduled backup invocation for the validated backup/retention path.
+2. Add adapter acceptance coverage for permissions, pins, rate limits, and acknowledgement latency on the target host.
+3. Decide whether backup should remain an operator CLI path or receive a Discord-facing durable `PROCESSING -> COMMITTED/FAILED` workflow; `/export` is covered and backup now has validated secondary-copy support.
 4. Then choose the next product slice: treasury/currency transfers or further character ownership support.
 
 The larger optional domains - Your Pack, Journal, Parking Lot, Downtime, faction clocks, rich continuity, and Undo - remain evidence-gated and should not be started yet.

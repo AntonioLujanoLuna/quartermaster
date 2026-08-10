@@ -64,6 +64,13 @@ class Settings:
             raise ConfigurationError("QM_DISCORD_TOKEN is required to run the Discord bot")
         return self.discord_token
 
+    def require_projection_channels(self) -> tuple[str, str]:
+        if not self.party_inventory_channel_id:
+            raise ConfigurationError("QM_PARTY_INVENTORY_CHANNEL_ID is required to run the Discord bot")
+        if not self.session_log_channel_id:
+            raise ConfigurationError("QM_SESSION_LOG_CHANNEL_ID is required to run the Discord bot")
+        return self.party_inventory_channel_id, self.session_log_channel_id
+
 
 def _positive_float(environment: Mapping[str, str], name: str, default: float) -> float:
     raw = environment.get(name, "").strip()

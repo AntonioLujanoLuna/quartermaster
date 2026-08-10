@@ -24,15 +24,23 @@ uv run python -m quartermaster --db $env:QM_DATABASE_PATH maintenance
 uv run python -m quartermaster --db $env:QM_DATABASE_PATH export > .\quartermaster-export.md
 ```
 
-`health` checks SQLite integrity, schema version, the one-active-session invariant, receipt recovery state, outbox backlog, dirty projections, and expired Loot Drops. `maintenance` expires due drops and removes terminal receipts and consumed/expired handles after their configured retention periods.
+`health` checks SQLite integrity, schema version, the one-active-session invariant, receipt recovery state, outbox backlog, dirty projections, expired Loot Drops, and the last transient-maintenance outcome. The bot runs startup recovery and repeats transient maintenance while projection delivery is running; the `maintenance` command remains available for operator-triggered cleanup. It expires due drops and removes terminal receipts and consumed/expired handles after their configured retention periods.
 
 ## Backup and restore
 
-Create and validate an online backup while the bot is running:
+Create and validate a timestamped online backup while the bot is running. The command keeps the newest seven `quartermaster-*.sqlite` snapshots in the primary directory:
 
 ```powershell
-uv run python -m quartermaster --db $env:QM_DATABASE_PATH backup --destination .\backups\quartermaster-$(Get-Date -Format yyyyMMdd-HHmmss).sqlite
+uv run python -m quartermaster --db $env:QM_DATABASE_PATH backup
 ```
+
+For a second mounted or network-backed destination, copy the validated snapshot there and apply the same retention count:
+
+```powershell
+uv run python -m quartermaster --db $env:QM_DATABASE_PATH backup --off-device-directory D:\quartermaster-backups --retention-count 14
+```
+
+The off-device path must be a different directory from the primary backup directory. Backup health verifies the recorded primary and secondary files still exist; a missing copy or overdue outcome degrades health.
 
 Restore is deliberately non-destructive by default. Stop the bot first, preserve the current database, then restore to a new path and verify its export before changing `QM_DATABASE_PATH`:
 

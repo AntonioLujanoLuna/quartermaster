@@ -97,6 +97,30 @@ class InventoryService:
                 ttl_seconds=300,
             )
 
+    def prepare_take_view(self, *, actor_id: str | None, limit: int = 25) -> dict[str, Any]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self.store.transaction() as connection:
+            rows = connection.execute(
+                "SELECT id, item_name, quantity, provenance, version, updated_at FROM inventory_stacks WHERE owner_type = 'PARTY' AND owner_id = 'party' ORDER BY last_acquired_at DESC, item_name LIMIT ?",
+                (limit,),
+            ).fetchall()
+            items = [dict(row) for row in rows]
+            handles = {
+                row["id"]: self.handles.create_in_transaction(
+                    connection,
+                    workflow_type="stash",
+                    action="take",
+                    actor_id=actor_id,
+                    payload={"stack_id": row["id"], "item_name": row["item_name"], "amount": 1, "mode": "ABSOLUTE"},
+                    read_set_snapshot={"quantity": row["quantity"], "version": row["version"]},
+                    single_use=True,
+                    ttl_seconds=300,
+                )
+                for row in rows
+            }
+            return {"items": items, "handles": handles}
+
     def take_interaction(self, interaction_id: str, *, handle_id: str, actor_id: str | None) -> ReceiptResult:
         return self.receipts.execute_fast(
             interaction_id,
@@ -105,15 +129,43 @@ class InventoryService:
             mutation=lambda connection, operation_id: self._take_with_handle(connection, operation_id, handle_id, actor_id),
         )
 
-    def _take_with_handle(self, connection: Any, operation_id: str, handle_id: str, actor_id: str | None) -> dict[str, Any]:
+    def confirm_take_interaction(self, interaction_id: str, *, handle_id: str, actor_id: str | None) -> ReceiptResult:
+        return self.receipts.execute_fast(
+            interaction_id,
+            actor_id=actor_id,
+            response_kind="stash",
+            mutation=lambda connection, operation_id: self._take_with_handle(
+                connection, operation_id, handle_id, actor_id, allow_relative_stale=True
+            ),
+        )
+
+    def _take_with_handle(
+        self,
+        connection: Any,
+        operation_id: str,
+        handle_id: str,
+        actor_id: str | None,
+        *,
+        allow_relative_stale: bool = False,
+    ) -> dict[str, Any]:
         return self.handles.consume_and_mutate_in_transaction(
             connection,
             handle_id,
             actor_id=actor_id,
-            mutation=lambda transaction, handle: self._take_in_transaction(transaction, operation_id, actor_id, handle),
+            mutation=lambda transaction, handle: self._take_in_transaction(
+                transaction, operation_id, actor_id, handle, allow_relative_stale=allow_relative_stale
+            ),
         )
 
-    def _take_in_transaction(self, connection: Any, operation_id: str, actor_id: str | None, handle: Handle) -> dict[str, Any]:
+    def _take_in_transaction(
+        self,
+        connection: Any,
+        operation_id: str,
+        actor_id: str | None,
+        handle: Handle,
+        *,
+        allow_relative_stale: bool = False,
+    ) -> dict[str, Any]:
         stack_id = handle.payload["stack_id"]
         row = connection.execute("SELECT * FROM inventory_stacks WHERE id = ? AND owner_type = 'PARTY'", (stack_id,)).fetchone()
         if row is None:
@@ -121,7 +173,7 @@ class InventoryService:
         mode = handle.payload["mode"]
         observed = int(handle.read_set_snapshot["quantity"])
         current = int(row["quantity"])
-        if mode == "RELATIVE" and current != observed:
+        if mode == "RELATIVE" and current != observed and not allow_relative_stale:
             raise SemanticStaleness(f"quantity changed from {observed} to {current}")
         amount = current if mode == "RELATIVE" else int(handle.payload["amount"])
         if current < amount:
@@ -137,7 +189,8 @@ class InventoryService:
         return {"status": "TAKEN", "stack_id": stack_id, "item_name": row["item_name"], "quantity": amount, "remaining": remaining}
 
     def browse(self) -> list[dict[str, Any]]:
-        rows = self.store._require_connection().execute(
-            "SELECT id, item_name, quantity, provenance, version, updated_at FROM inventory_stacks WHERE owner_type = 'PARTY' AND owner_id = 'party' ORDER BY last_acquired_at DESC, item_name"
-        ).fetchall()
+        with self.store.connection_lock:
+            rows = self.store._require_connection().execute(
+                "SELECT id, item_name, quantity, provenance, version, updated_at FROM inventory_stacks WHERE owner_type = 'PARTY' AND owner_id = 'party' ORDER BY last_acquired_at DESC, item_name"
+            ).fetchall()
         return [dict(row) for row in rows]

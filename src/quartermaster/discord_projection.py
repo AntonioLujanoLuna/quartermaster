@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from time import monotonic
 from typing import Any
 
 import discord
@@ -11,8 +13,12 @@ import discord
 from .config import Settings
 from .db import SQLiteStore
 from .loot import expire_due_drops
+from .operations import run_maintenance
 from .projections import EventOutboxWorker, StateProjectionScheduler
 from .transport import RateLimitedError
+
+
+logger = logging.getLogger(__name__)
 
 
 class ProjectionConfigurationError(RuntimeError):
@@ -60,9 +66,10 @@ def _content_for_event(event_type: str, payload: dict[str, Any]) -> str:
 
 
 class DiscordProjectionTransport:
-    def __init__(self, bot: discord.Client, settings: Settings) -> None:
+    def __init__(self, bot: discord.Client, settings: Settings, store: SQLiteStore | None = None) -> None:
         self.bot = bot
         self.settings = settings
+        self.store = store
 
     def _channel_id_for(self, destination: str) -> str:
         if destination == "party-inventory":
@@ -77,7 +84,70 @@ class DiscordProjectionTransport:
             raise ProjectionConfigurationError(f"no Discord channel configured for {destination}")
         return channel_id
 
+    async def _ensure_session_thread(self, session_id: str) -> str | None:
+        if self.store is None:
+            return None
+        with self.store.connection_lock:
+            connection = self.store._require_connection()
+            session = connection.execute(
+                "SELECT session_number, discord_thread_id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if session is None:
+            return None
+        if session["discord_thread_id"]:
+            return str(session["discord_thread_id"])
+
+        base_channel = await self.bot.fetch_channel(int(self.settings.session_log_channel_id))
+        try:
+            thread = await base_channel.create_thread(
+                name=f"Session {session['session_number']}",
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=10080,
+            )
+        except discord.HTTPException as error:
+            if error.status == 429:
+                raise RateLimitedError(getattr(error, "retry_after", 1.0)) from error
+            raise
+
+        with self.store.transaction() as transaction:
+            current = transaction.execute(
+                "SELECT discord_thread_id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if current is None:
+                return None
+            if current["discord_thread_id"] is None:
+                transaction.execute(
+                    "UPDATE sessions SET discord_thread_id = ? WHERE id = ? AND discord_thread_id IS NULL",
+                    (str(thread.id), session_id),
+                )
+                return str(thread.id)
+            return str(current["discord_thread_id"])
+
     async def _fetch_channel(self, destination: str) -> Any:
+        if destination.startswith("session:"):
+            session_id = destination.split(":", 1)[1]
+            if session_id == "active" and self.store is not None:
+                with self.store.connection_lock:
+                    active = self.store._require_connection().execute(
+                        "SELECT id FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
+                    ).fetchone()
+                session_id = str(active["id"]) if active else ""
+            if session_id:
+                thread_id = await self._ensure_session_thread(session_id)
+                if thread_id:
+                    try:
+                        return await self.bot.fetch_channel(int(thread_id))
+                    except discord.NotFound:
+                        with self.store.transaction() as transaction:
+                            transaction.execute(
+                                "UPDATE sessions SET discord_thread_id = NULL WHERE discord_thread_id = ?",
+                                (thread_id,),
+                            )
+                        thread_id = await self._ensure_session_thread(session_id)
+                        if thread_id:
+                            return await self.bot.fetch_channel(int(thread_id))
         try:
             return await self.bot.fetch_channel(int(self._channel_id_for(destination)))
         except discord.HTTPException as error:
@@ -92,8 +162,10 @@ class DiscordProjectionTransport:
             if message_id is not None:
                 message = await channel.fetch_message(int(message_id))
                 await message.edit(content=content)
+                await self._ensure_pinned(target_id, message)
                 return message_id
             message = await channel.send(content)
+            await self._ensure_pinned(target_id, message)
             return str(message.id)
         except discord.NotFound:
             message = await channel.send(content)
@@ -102,6 +174,11 @@ class DiscordProjectionTransport:
             if error.status == 429:
                 raise RateLimitedError(getattr(error, "retry_after", 1.0)) from error
             raise
+
+    async def _ensure_pinned(self, target_id: str, message: Any) -> None:
+        if target_id != "party-stash" or getattr(message, "pinned", False):
+            return
+        await message.pin(reason="Quartermaster permanent Party Stash projection")
 
     async def deliver_event(self, destination: str, event_type: str, payload: dict[str, Any]) -> None:
         channel = await self._fetch_channel(destination)
@@ -114,15 +191,40 @@ class DiscordProjectionTransport:
 
 
 class ProjectionRunner:
-    def __init__(self, store: SQLiteStore, transport: DiscordProjectionTransport) -> None:
+    def __init__(
+        self,
+        store: SQLiteStore,
+        transport: DiscordProjectionTransport,
+        *,
+        maintenance_interval_seconds: float = 60.0,
+        receipt_retention_seconds: int = 86_400,
+        handle_retention_seconds: int = 600,
+    ) -> None:
+        if maintenance_interval_seconds <= 0:
+            raise ValueError("maintenance interval must be positive")
         self.store = store
         self.transport = transport
         self.state = StateProjectionScheduler(store, transport)
         self.events = EventOutboxWorker(store, transport)
+        self.maintenance_interval_seconds = maintenance_interval_seconds
+        self.receipt_retention_seconds = receipt_retention_seconds
+        self.handle_retention_seconds = handle_retention_seconds
 
     async def run(self, stop_event: asyncio.Event) -> None:
+        next_maintenance = monotonic()
         while not stop_event.is_set():
-            expire_due_drops(self.store)
+            await asyncio.to_thread(expire_due_drops, self.store)
+            if monotonic() >= next_maintenance:
+                try:
+                    await asyncio.to_thread(
+                        run_maintenance,
+                        self.store,
+                        receipt_retention_seconds=self.receipt_retention_seconds,
+                        handle_retention_seconds=self.handle_retention_seconds,
+                    )
+                except Exception:
+                    logger.exception("transient-state maintenance failed")
+                next_maintenance = monotonic() + self.maintenance_interval_seconds
             delivered_state = await self.state.run_once_async(self.transport)
             delivered_event = await self.events.run_once_async(self.transport)
             if not delivered_state and not delivered_event:

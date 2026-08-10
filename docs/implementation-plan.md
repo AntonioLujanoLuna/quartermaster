@@ -1,6 +1,6 @@
 # Quartermaster Implementation Plan
 
-This plan implements the frozen v2.6 specification in the smallest useful increments. The workspace is currently empty, so the first phase establishes the application and operational foundation before adding shared-state mutations.
+This plan implements the frozen v2.6 specification in the smallest useful increments. The initial application and operational foundation now exists as a Python 3.11+ service using `discord.py`, SQLite, and `uv`; the architectural boundaries below remain the governing design.
 
 ## Delivery boundary
 
@@ -20,7 +20,7 @@ Your Pack, Journal, Parking Lot, Downtime, faction clocks, rich continuity, and 
 
 ## Initial technical shape
 
-Use a small TypeScript/Node service with a Discord adapter and SQLite persistence. Lock the exact Node, Discord library, SQLite driver, and component-support versions during the implementation spike; do not let library conventions leak into domain logic.
+Use a small Python service with a Discord adapter and SQLite persistence. Lock the exact Python, `discord.py`, SQLite, and component-support versions during the implementation spike; do not let library conventions leak into domain logic.
 
 Suggested boundaries:
 

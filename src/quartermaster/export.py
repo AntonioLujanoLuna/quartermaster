@@ -8,6 +8,11 @@ from .db import SCHEMA_VERSION, SQLiteStore
 
 
 def render_export(store: SQLiteStore) -> str:
+    with store.connection_lock:
+        return _render_export(store)
+
+
+def _render_export(store: SQLiteStore) -> str:
     connection = store._require_connection()
     active = connection.execute(
         "SELECT session_number, started_at FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"

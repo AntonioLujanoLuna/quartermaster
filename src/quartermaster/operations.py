@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -15,16 +16,25 @@ from .loot import expire_due_drops
 from .receipts import ReceiptRepository
 
 
-def _record_maintenance(store: SQLiteStore, *, status: str, error: str | None = None) -> None:
+def _record_maintenance(
+    store: SQLiteStore,
+    *,
+    name: str = "transient-state",
+    status: str,
+    error: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    serialized_details = json.dumps(details, sort_keys=True, separators=(",", ":")) if details is not None else None
     with store.transaction() as connection:
         connection.execute(
-            """INSERT INTO maintenance_runs(name, last_run_at, last_status, last_error)
-               VALUES ('transient-state', ?, ?, ?)
+            """INSERT INTO maintenance_runs(name, last_run_at, last_status, last_error, last_details)
+               VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET
                    last_run_at = excluded.last_run_at,
                    last_status = excluded.last_status,
-                   last_error = excluded.last_error""",
-            (iso_now(), status, error),
+                   last_error = excluded.last_error,
+                   last_details = excluded.last_details""",
+            (name, iso_now(), status, error, serialized_details),
         )
 
 
@@ -55,8 +65,10 @@ def run_maintenance(
         raise
 
 
-def health_report(store: SQLiteStore) -> dict[str, Any]:
+def health_report(store: SQLiteStore, *, backup_max_age_seconds: int = 86_400) -> dict[str, Any]:
     """Return a small, machine-readable health snapshot without contacting Discord."""
+    if backup_max_age_seconds <= 0:
+        raise ValueError("backup max age must be positive")
     connection = store._require_connection()
     integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
     schema_version = connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
@@ -73,6 +85,38 @@ def health_report(store: SQLiteStore) -> dict[str, Any]:
     due_drops = connection.execute(
         "SELECT COUNT(*) FROM loot_drops WHERE status = 'OPEN' AND expires_at <= ?", (iso_now(),)
     ).fetchone()[0]
+    maintenance = connection.execute(
+        "SELECT last_status FROM maintenance_runs WHERE name = 'transient-state'"
+    ).fetchone()
+    backup = connection.execute(
+        "SELECT last_run_at, last_status, last_details FROM maintenance_runs WHERE name = 'backup'"
+    ).fetchone()
+    backup_age = None
+    if backup is not None and backup["last_run_at"] is not None:
+        backup_age = connection.execute(
+            "SELECT (julianday(?) - julianday(?)) * 86400.0",
+            (iso_now(), backup["last_run_at"]),
+        ).fetchone()[0]
+    backup_details: dict[str, Any] | None = None
+    if backup is not None and backup["last_details"]:
+        try:
+            parsed_details = json.loads(backup["last_details"])
+            if isinstance(parsed_details, dict):
+                backup_details = parsed_details
+        except json.JSONDecodeError:
+            backup_details = None
+    primary_backup_path = Path(backup_details["primary_path"]) if backup_details and backup_details.get("primary_path") else None
+    off_device_backup_path = Path(backup_details["off_device_path"]) if backup_details and backup_details.get("off_device_path") else None
+    primary_backup_exists = primary_backup_path is not None and primary_backup_path.is_file()
+    off_device_backup_exists = off_device_backup_path is None or off_device_backup_path.is_file()
+    backup_ok = (
+        backup is not None
+        and backup["last_status"] == "OK"
+        and backup_age is not None
+        and backup_age <= backup_max_age_seconds
+        and primary_backup_exists
+        and off_device_backup_exists
+    )
 
     checks = {
         "database": "OK" if integrity == "ok" else "FAILED",
@@ -82,6 +126,8 @@ def health_report(store: SQLiteStore) -> dict[str, Any]:
         "event_outbox": "OK" if pending_events == 0 else "DEGRADED",
         "state_projections": "OK" if dirty_projections == 0 else "DEGRADED",
         "expired_drops": "OK" if due_drops == 0 else "DEGRADED",
+        "maintenance": "OK" if maintenance is None or maintenance["last_status"] == "OK" else "DEGRADED",
+        "backup": "OK" if backup_ok else "DEGRADED",
     }
     status = "HEALTHY"
     if "FAILED" in checks.values():
@@ -99,6 +145,9 @@ def health_report(store: SQLiteStore) -> dict[str, Any]:
             "pending_events": pending_events,
             "dirty_projections": dirty_projections,
             "expired_drops": due_drops,
+            "backup_age_seconds": backup_age,
+            "backup_primary_exists": primary_backup_exists,
+            "backup_off_device_exists": off_device_backup_exists,
         },
     }
 
@@ -125,10 +174,82 @@ def validate_backup(path: str | Path) -> dict[str, Any]:
     return {"path": str(backup_path), "integrity": integrity, "schema_version": schema_version, "export_bytes": len(export.encode("utf-8"))}
 
 
-def create_backup(store: SQLiteStore, destination: str | Path) -> dict[str, Any]:
-    """Create and validate a consistent online SQLite backup."""
-    target = store.snapshot(destination)
-    return validate_backup(target)
+def _copy_validated_snapshot(source: Path, destination_directory: Path) -> Path:
+    destination_directory.mkdir(parents=True, exist_ok=True)
+    destination = destination_directory / source.name
+    if destination.resolve() == source.resolve():
+        raise ValueError("off-device backup directory must differ from the primary backup directory")
+    shutil.copy2(source, destination)
+    validate_backup(destination)
+    return destination
+
+
+def _apply_backup_retention(directory: Path, *, keep: int, protected: set[Path]) -> list[str]:
+    if keep <= 0:
+        raise ValueError("backup retention count must be positive")
+    resolved_directory = directory.resolve()
+    candidates = sorted(
+        (path for path in resolved_directory.glob("quartermaster-*.sqlite") if path.is_file()),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    retained = set(candidates[:keep]) | {path.resolve() for path in protected}
+    removed: list[str] = []
+    for path in candidates:
+        if path.resolve() in retained:
+            continue
+        path.unlink()
+        removed.append(str(path.resolve()))
+    return removed
+
+
+def create_backup(
+    store: SQLiteStore,
+    destination: str | Path,
+    *,
+    off_device_directory: str | Path | None = None,
+    retention_count: int = 7,
+) -> dict[str, Any]:
+    """Create, validate, copy, and retain a consistent online SQLite backup."""
+    destination_path = Path(destination).expanduser()
+    if retention_count <= 0:
+        raise ValueError("backup retention count must be positive")
+    off_device_path = Path(off_device_directory).expanduser() if off_device_directory is not None else None
+    if off_device_path is not None and off_device_path.resolve() == destination_path.parent.resolve():
+        raise ValueError("off-device backup directory must differ from the primary backup directory")
+    try:
+        target = store.snapshot(destination_path)
+        result = validate_backup(target)
+        copied_target = _copy_validated_snapshot(target, off_device_path) if off_device_path is not None else None
+        removed_primary = _apply_backup_retention(
+            target.parent,
+            keep=retention_count,
+            protected={target},
+        )
+        removed_off_device = (
+            _apply_backup_retention(copied_target.parent, keep=retention_count, protected={copied_target})
+            if copied_target is not None
+            else []
+        )
+        details = {
+            "primary_path": str(target.resolve()),
+            "off_device_path": str(copied_target.resolve()) if copied_target is not None else None,
+            "retention_count": retention_count,
+            "removed_primary_paths": removed_primary,
+            "removed_off_device_paths": removed_off_device,
+        }
+        result.update(details)
+        _record_maintenance(store, name="backup", status="OK", details=details)
+        return result
+    except Exception as error:
+        _record_maintenance(
+            store,
+            name="backup",
+            status="FAILED",
+            error=str(error),
+            details={"primary_path": str(destination_path.resolve())},
+        )
+        raise
 
 
 def restore_backup(

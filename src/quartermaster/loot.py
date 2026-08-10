@@ -105,18 +105,53 @@ class LootDropService:
 
     def list_open(self) -> list[dict[str, Any]]:
         self.expire_due_drops()
-        connection = self.store._require_connection()
-        drops = connection.execute(
-            "SELECT id, session_id, expires_at, created_at FROM loot_drops WHERE status = 'OPEN' ORDER BY created_at"
-        ).fetchall()
-        result: list[dict[str, Any]] = []
-        for drop in drops:
-            items = connection.execute(
-                "SELECT id, item_name, quantity, remaining_quantity, provenance FROM loot_drop_items WHERE drop_id = ? AND remaining_quantity > 0 ORDER BY created_at",
-                (drop["id"],),
+        with self.store.connection_lock:
+            connection = self.store._require_connection()
+            drops = connection.execute(
+                "SELECT id, session_id, expires_at, created_at FROM loot_drops WHERE status = 'OPEN' ORDER BY created_at"
             ).fetchall()
-            result.append({"drop_id": drop["id"], "session_id": drop["session_id"], "expires_at": drop["expires_at"], "items": [dict(item) for item in items]})
+            result: list[dict[str, Any]] = []
+            for drop in drops:
+                items = connection.execute(
+                    "SELECT id, item_name, quantity, remaining_quantity, provenance FROM loot_drop_items WHERE drop_id = ? AND remaining_quantity > 0 ORDER BY created_at",
+                    (drop["id"],),
+                ).fetchall()
+                result.append({"drop_id": drop["id"], "session_id": drop["session_id"], "expires_at": drop["expires_at"], "items": [dict(item) for item in items]})
         return result
+
+    def prepare_claim_view(self, *, actor_id: str | None, limit: int = 25) -> dict[str, Any]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        self.expire_due_drops()
+        with self.store.transaction() as connection:
+            drops = connection.execute(
+                "SELECT id, session_id, expires_at, created_at FROM loot_drops WHERE status = 'OPEN' ORDER BY created_at"
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            handle_ids: dict[str, str] = {}
+            created_handles = 0
+            for drop in drops:
+                items = connection.execute(
+                    "SELECT id, item_name, quantity, remaining_quantity, provenance FROM loot_drop_items WHERE drop_id = ? AND remaining_quantity > 0 ORDER BY created_at",
+                    (drop["id"],),
+                ).fetchall()
+                item_payload = [dict(item) for item in items]
+                result.append({"drop_id": drop["id"], "session_id": drop["session_id"], "expires_at": drop["expires_at"], "items": item_payload})
+                for item in items:
+                    if created_handles >= limit:
+                        break
+                    handle_ids[item["id"]] = self.handles.create_in_transaction(
+                        connection,
+                        workflow_type="loot-drop",
+                        action="claim",
+                        actor_id=actor_id,
+                        payload={"drop_item_id": item["id"], "drop_id": drop["id"], "amount": 1},
+                        read_set_snapshot={"remaining_quantity": item["remaining_quantity"]},
+                        single_use=True,
+                        ttl_seconds=300,
+                    )
+                    created_handles += 1
+            return {"drops": result, "handles": handle_ids}
 
     def create_claim_handle(self, *, drop_item_id: str, actor_id: str | None, amount: int = 1) -> str:
         if amount <= 0:

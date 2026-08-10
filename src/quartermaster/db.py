@@ -5,10 +5,11 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
+from threading import RLock
 from typing import Iterator
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 
 class MigrationError(RuntimeError):
@@ -175,6 +176,12 @@ MIGRATIONS: dict[int, str] = {
     );
     CREATE INDEX loot_drop_items_drop_idx ON loot_drop_items(drop_id, remaining_quantity);
     """,
+    5: """
+    ALTER TABLE sessions ADD COLUMN discord_thread_id TEXT;
+    """,
+    6: """
+    ALTER TABLE maintenance_runs ADD COLUMN last_details TEXT;
+    """,
 }
 
 
@@ -183,6 +190,8 @@ class SQLiteStore:
         self.path = str(path)
         self.uri = uri
         self.connection: sqlite3.Connection | None = None
+        self.connection_lock = RLock()
+        self._write_transaction_count = 0
 
     def open(self) -> "SQLiteStore":
         if self.connection is not None:
@@ -204,15 +213,22 @@ class SQLiteStore:
         return self
 
     def close(self) -> None:
-        if self.connection is not None:
-            # Checkpoint before closing so Windows can remove WAL sidecars
-            # promptly during maintenance, tests, and clean shutdown.
-            try:
-                self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.Error:
-                pass
-            self.connection.close()
-            self.connection = None
+        with self.connection_lock:
+            if self.connection is not None:
+                # Checkpoint before closing so Windows can remove WAL sidecars
+                # promptly during maintenance, tests, and clean shutdown.
+                try:
+                    self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.Error:
+                    pass
+                self.connection.close()
+                self.connection = None
+
+    @property
+    def write_transaction_active(self) -> bool:
+        # The counter is read by the event loop while a worker may hold the
+        # connection lock; taking that lock here would block acknowledgement.
+        return self._write_transaction_count > 0
 
     def __enter__(self) -> "SQLiteStore":
         return self.open()
@@ -256,15 +272,20 @@ class SQLiteStore:
 
     @contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
-        connection = self._require_connection()
-        connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
-        try:
-            yield connection
-        except BaseException:
-            connection.rollback()
-            raise
-        else:
-            connection.commit()
+        with self.connection_lock:
+            connection = self._require_connection()
+            self._write_transaction_count += 1
+            try:
+                connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+                try:
+                    yield connection
+                except BaseException:
+                    connection.rollback()
+                    raise
+                else:
+                    connection.commit()
+            finally:
+                self._write_transaction_count -= 1
 
     def snapshot(self, destination: str | Path) -> Path:
         """Create a consistent SQLite backup without copying a live file."""

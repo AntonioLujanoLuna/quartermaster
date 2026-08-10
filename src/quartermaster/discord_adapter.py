@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 from dataclasses import dataclass
 from typing import Callable
@@ -14,10 +15,19 @@ from discord.ext import commands
 from .config import Settings
 from .db import SQLiteStore
 from .discord_projection import DiscordProjectionTransport, ProjectionRunner
+from .export import render_export
 from .handles import HandleError, HandleRepository
 from .inventory import InventoryError, InventoryService, SemanticStaleness
 from .loot import LootDropError, LootDropService
+from .recovery import recover_startup
 from .receipts import ReceiptRepository
+from .response import (
+    DeferredExecutionError,
+    DeferredExecutionResult,
+    FastExecutionResult,
+    execute_deferred,
+    execute_fast,
+)
 from .sessions import SessionError, SessionService
 
 logger = logging.getLogger(__name__)
@@ -67,6 +77,80 @@ async def _send_error(interaction: discord.Interaction, message: str) -> None:
         await interaction.response.send_message(message, ephemeral=True)
 
 
+async def _run_fast(
+    interaction: discord.Interaction,
+    store: SQLiteStore,
+    settings: Settings,
+    operation: Callable[[], object],
+    *,
+    ephemeral: bool = False,
+) -> FastExecutionResult:
+    return await execute_fast(
+        interaction,
+        operation,
+        soft_deadline_seconds=settings.soft_deadline_seconds,
+        write_active=lambda: store.write_transaction_active,
+        ephemeral=ephemeral,
+    )
+
+
+async def _send_execution(
+    interaction: discord.Interaction,
+    execution: FastExecutionResult,
+    message: str,
+    *,
+    ephemeral: bool = False,
+    view: discord.ui.View | None = None,
+) -> None:
+    if execution.deferred:
+        await interaction.followup.send(message, ephemeral=ephemeral, view=view)
+    else:
+        await interaction.response.send_message(message, ephemeral=ephemeral, view=view)
+
+
+async def _run_deferred(
+    interaction: discord.Interaction,
+    services: BotServices,
+    operation: Callable[[], object],
+    *,
+    response_kind: str,
+    ephemeral: bool = False,
+) -> DeferredExecutionResult:
+    return await execute_deferred(
+        interaction,
+        services.receipts,
+        operation,
+        actor_id=_actor_id(interaction),
+        response_kind=response_kind,
+        ephemeral=ephemeral,
+    )
+
+
+async def _send_deferred_export(
+    interaction: discord.Interaction,
+    execution: DeferredExecutionResult,
+) -> None:
+    receipt = execution.receipt
+    if receipt.status == "PROCESSING":
+        await _send_error(interaction, "An export for this interaction is already in progress.")
+        return
+    if receipt.status == "FAILED":
+        await _send_error(
+            interaction,
+            receipt.logical_response.get("message", "The export could not be completed."),
+        )
+        return
+    export = receipt.logical_response.get("export")
+    if not isinstance(export, str):
+        await _send_error(interaction, "The stored export result is invalid.")
+        return
+    file = discord.File(io.BytesIO(export.encode("utf-8")), filename="quartermaster-export.md")
+    if execution.deferred:
+        await interaction.followup.send("Quartermaster export", file=file, ephemeral=True)
+    else:
+        await interaction.response.send_message("Quartermaster export", file=file, ephemeral=True)
+
+
 def _render_stash(items: list[dict]) -> str:
     lines = ["**PARTY STASH**", ""]
     if not items:
@@ -87,14 +171,14 @@ def _render_loot(drops: list[dict]) -> str:
 
 
 class TakeView(discord.ui.View):
-    def __init__(self, inventory: InventoryService, actor_id: str, items: list[dict]) -> None:
+    def __init__(self, inventory: InventoryService, settings: Settings, actor_id: str, items: list[dict], handles: dict[str, str]) -> None:
         super().__init__(timeout=300)
         self.inventory = inventory
+        self.settings = settings
         self.actor_id = actor_id
         for item in items[:25]:
-            try:
-                handle_id = inventory.create_take_handle(stack_id=item["id"], actor_id=actor_id, amount=1)
-            except InventoryError:
+            handle_id = handles.get(item["id"])
+            if handle_id is None:
                 continue
             button = discord.ui.Button(
                 label=f"Take {item['item_name'][:65]}",
@@ -107,43 +191,110 @@ class TakeView(discord.ui.View):
     def _callback_for(self, handle_id: str) -> Callable[[discord.Interaction], object]:
         async def callback(interaction: discord.Interaction) -> None:
             try:
-                result = self.inventory.take_interaction(
-                    str(interaction.id), handle_id=handle_id, actor_id=_actor_id(interaction)
+                execution = await _run_fast(
+                    interaction,
+                    self.inventory.store,
+                    self.settings,
+                    lambda: self.inventory.take_interaction(
+                        str(interaction.id), handle_id=handle_id, actor_id=_actor_id(interaction)
+                    ),
+                    ephemeral=True,
                 )
+                result = execution.value
                 response = result.logical_response
-                await interaction.response.send_message(
+                await _send_execution(
+                    interaction,
+                    execution,
                     f"You took {response['quantity']} {response['item_name']}. {response['remaining']} remain.",
                     ephemeral=True,
                 )
             except SemanticStaleness:
-                await _send_error(interaction, "The quantity changed. Open Party Stash again before taking it.")
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        "The quantity changed. Confirm taking the current quantity if that is still what you intend.",
+                        ephemeral=True,
+                        view=TakeConfirmationView(self.inventory, self.settings, handle_id),
+                    )
+                else:
+                    await interaction.response.send_message(
+                        "The quantity changed. Confirm taking the current quantity if that is still what you intend.",
+                        ephemeral=True,
+                        view=TakeConfirmationView(self.inventory, self.settings, handle_id),
+                    )
             except (HandleError, InventoryError) as error:
                 await _send_error(interaction, f"That action could not be completed: {error}")
 
         return callback
 
 
-class PartyStashView(discord.ui.View):
-    def __init__(self, inventory: InventoryService) -> None:
+class TakeConfirmationView(discord.ui.View):
+    def __init__(self, inventory: InventoryService, settings: Settings, handle_id: str) -> None:
         super().__init__(timeout=300)
         self.inventory = inventory
+        self.settings = settings
+        self.handle_id = handle_id
+
+    @discord.ui.button(label="Confirm current quantity", style=discord.ButtonStyle.danger, custom_id="qm:confirm-take")
+    async def confirm(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        try:
+            execution = await _run_fast(
+                interaction,
+                self.inventory.store,
+                self.settings,
+                lambda: self.inventory.confirm_take_interaction(
+                    str(interaction.id), handle_id=self.handle_id, actor_id=_actor_id(interaction)
+                ),
+                ephemeral=True,
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
+                f"You took {response['quantity']} {response['item_name']}. {response['remaining']} remain.",
+                ephemeral=True,
+            )
+        except (HandleError, InventoryError) as error:
+            await _send_error(interaction, f"That confirmation could not be completed: {error}")
+
+
+class PartyStashView(discord.ui.View):
+    def __init__(self, inventory: InventoryService, settings: Settings) -> None:
+        super().__init__(timeout=300)
+        self.inventory = inventory
+        self.settings = settings
 
     @discord.ui.button(label="Browse", style=discord.ButtonStyle.primary, custom_id="qm:browse")
     async def browse(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        items = self.inventory.browse()
-        view = TakeView(self.inventory, _actor_id(interaction), items)
-        await interaction.response.send_message(_render_stash(items), ephemeral=True, view=view)
+        try:
+            execution = await _run_fast(
+                interaction,
+                self.inventory.store,
+                self.settings,
+                lambda: self.inventory.prepare_take_view(actor_id=_actor_id(interaction)),
+                ephemeral=True,
+            )
+            prepared = execution.value
+            view = TakeView(self.inventory, self.settings, _actor_id(interaction), prepared["items"], prepared["handles"])
+            await _send_execution(
+                interaction,
+                execution,
+                _render_stash(prepared["items"]),
+                ephemeral=True,
+                view=view,
+            )
+        except InventoryError as error:
+            await _send_error(interaction, f"Party Stash could not be opened: {error}")
 
 
 class LootDropView(discord.ui.View):
-    def __init__(self, loot: LootDropService, actor_id: str, drops: list[dict]) -> None:
+    def __init__(self, loot: LootDropService, settings: Settings, actor_id: str, drops: list[dict], handles: dict[str, str]) -> None:
         super().__init__(timeout=300)
         self.loot = loot
+        self.settings = settings
         for drop in drops:
             for item in drop["items"][:25]:
-                try:
-                    handle_id = loot.create_claim_handle(drop_item_id=item["id"], actor_id=actor_id, amount=1)
-                except LootDropError:
+                handle_id = handles.get(item["id"])
+                if handle_id is None:
                     continue
                 button = discord.ui.Button(
                     label=f"Take {item['item_name'][:65]}",
@@ -156,17 +307,28 @@ class LootDropView(discord.ui.View):
     def _callback_for(self, handle_id: str) -> Callable[[discord.Interaction], object]:
         async def callback(interaction: discord.Interaction) -> None:
             try:
-                result = self.loot.claim_interaction(
-                    str(interaction.id), handle_id=handle_id, actor_id=_actor_id(interaction)
+                execution = await _run_fast(
+                    interaction,
+                    self.loot.store,
+                    self.settings,
+                    lambda: self.loot.claim_interaction(
+                        str(interaction.id), handle_id=handle_id, actor_id=_actor_id(interaction)
+                    ),
+                    ephemeral=True,
                 )
+                result = execution.value
                 response = result.logical_response
                 if response["status"] == "CLAIMED":
-                    await interaction.response.send_message(
+                    await _send_execution(
+                        interaction,
+                        execution,
                         f"You claimed {response['quantity']} {response['item_name']}. {response['remaining']} remain.",
                         ephemeral=True,
                     )
                 else:
-                    await interaction.response.send_message(
+                    await _send_execution(
+                        interaction,
+                        execution,
                         "That Loot Drop is no longer active. Open Party Stash to see the remaining items.",
                         ephemeral=True,
                     )
@@ -190,9 +352,21 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
         if not _in_configured_guild(interaction, settings):
             await _send_error(interaction, "This bot is configured for a different guild.")
             return
-        await interaction.response.send_message(
-            _render_stash(services.inventory.browse()), view=PartyStashView(services.inventory)
-        )
+        try:
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                services.inventory.browse,
+            )
+            await _send_execution(
+                interaction,
+                execution,
+                _render_stash(execution.value),
+                view=PartyStashView(services.inventory, settings),
+            )
+        except InventoryError as error:
+            await _send_error(interaction, f"Party Stash could not be opened: {error}")
 
     @bot.tree.command(name="loot", description="View open Loot Drops")
     @app_commands.guilds(guild)
@@ -200,10 +374,42 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
         if not _in_configured_guild(interaction, settings):
             await _send_error(interaction, "This bot is configured for a different guild.")
             return
-        drops = loot.list_open()
-        await interaction.response.send_message(
-            _render_loot(drops), ephemeral=True, view=LootDropView(loot, _actor_id(interaction), drops)
-        )
+        try:
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                lambda: loot.prepare_claim_view(actor_id=_actor_id(interaction)),
+                ephemeral=True,
+            )
+            prepared = execution.value
+            await _send_execution(
+                interaction,
+                execution,
+                _render_loot(prepared["drops"]),
+                ephemeral=True,
+                view=LootDropView(loot, settings, _actor_id(interaction), prepared["drops"], prepared["handles"]),
+            )
+        except LootDropError as error:
+            await _send_error(interaction, f"Loot Drops could not be opened: {error}")
+
+    @bot.tree.command(name="export", description="Export canonical Quartermaster state")
+    @app_commands.guilds(guild)
+    async def export_command(interaction: discord.Interaction) -> None:
+        if not _in_configured_guild(interaction, settings) or not await _is_dm(interaction, settings):
+            await _send_error(interaction, "Only configured DM administrators can export Quartermaster state.")
+            return
+        try:
+            execution = await _run_deferred(
+                interaction,
+                services,
+                lambda: {"export": render_export(services.store)},
+                response_kind="export",
+                ephemeral=True,
+            )
+            await _send_deferred_export(interaction, execution)
+        except DeferredExecutionError as error:
+            await _send_error(interaction, str(error))
 
     @bot.tree.command(name="loot-drop", description="Create a transient Loot Drop")
     @app_commands.guilds(guild)
@@ -219,14 +425,21 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
             await _send_error(interaction, "Only configured DM administrators can create Loot Drops.")
             return
         try:
-            result = loot.create_drop_interaction(
-                str(interaction.id),
-                actor_id=_actor_id(interaction),
-                items=[(item, quantity, provenance)],
-                expiry_hours=expiry_hours,
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                lambda: loot.create_drop_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    items=[(item, quantity, provenance)],
+                    expiry_hours=expiry_hours,
+                ),
             )
-            response = result.logical_response
-            await interaction.response.send_message(
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
                 f"Loot Drop `{response['drop_id'][:8]}` created with {quantity} {item.strip()}."
             )
         except LootDropError as error:
@@ -240,10 +453,15 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
             await _send_error(interaction, "Only configured DM administrators can close Loot Drops.")
             return
         try:
-            result = loot.close_drop_interaction(
-                str(interaction.id), drop_id=drop_id, actor_id=_actor_id(interaction)
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                lambda: loot.close_drop_interaction(
+                    str(interaction.id), drop_id=drop_id, actor_id=_actor_id(interaction)
+                ),
             )
-            await interaction.response.send_message(f"Loot Drop `{drop_id[:8]}` closed.")
+            await _send_execution(interaction, execution, f"Loot Drop `{drop_id[:8]}` closed.")
         except LootDropError as error:
             await _send_error(interaction, str(error))
 
@@ -255,11 +473,18 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
             await _send_error(interaction, "Only configured DM administrators can grant Party Stash items.")
             return
         try:
-            result = services.inventory.grant_interaction(
-                str(interaction.id), actor_id=_actor_id(interaction), item_name=item, quantity=quantity, provenance=provenance
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                lambda: services.inventory.grant_interaction(
+                    str(interaction.id), actor_id=_actor_id(interaction), item_name=item, quantity=quantity, provenance=provenance
+                ),
             )
-            response = result.logical_response
-            await interaction.response.send_message(
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
                 f"Granted {response['quantity']} {response['item_name']}. Total: {response['new_quantity']}."
             )
         except InventoryError as error:
@@ -272,15 +497,22 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
             await _send_error(interaction, "Only configured DM administrators can start sessions.")
             return
         try:
-            result = services.sessions.start_interaction(str(interaction.id), actor_id=_actor_id(interaction))
-            response = result.logical_response
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                lambda: services.sessions.start_interaction(str(interaction.id), actor_id=_actor_id(interaction)),
+            )
+            response = execution.value.logical_response
             if response["status"] == "ACTIVE_EXISTS":
-                await interaction.response.send_message(
+                await _send_execution(
+                    interaction,
+                    execution,
                     f"Session {response['active_session_number']} is still active. Close it explicitly before starting another.",
                     ephemeral=True,
                 )
             else:
-                await interaction.response.send_message(f"Session {response['session_number']} started.")
+                await _send_execution(interaction, execution, f"Session {response['session_number']} started.")
         except SessionError as error:
             await _send_error(interaction, str(error))
 
@@ -292,15 +524,19 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
             await _send_error(interaction, "Only configured DM administrators can end sessions.")
             return
         try:
-            result = services.sessions.end_interaction(
-                str(interaction.id), actor_id=_actor_id(interaction), where_ended=where_ended
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                lambda: services.sessions.end_interaction(
+                    str(interaction.id), actor_id=_actor_id(interaction), where_ended=where_ended
+                ),
             )
-            if result.logical_response["status"] == "NO_ACTIVE_SESSION":
-                await _send_error(interaction, "There is no active session.")
+            response = execution.value.logical_response
+            if response["status"] == "NO_ACTIVE_SESSION":
+                await _send_execution(interaction, execution, "There is no active session.", ephemeral=True)
             else:
-                await interaction.response.send_message(
-                    f"Session {result.logical_response['session_number']} closed."
-                )
+                await _send_execution(interaction, execution, f"Session {response['session_number']} closed.")
         except SessionError as error:
             await _send_error(interaction, str(error))
 
@@ -309,7 +545,12 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
         await bot.tree.sync(guild=guild)
         logger.info("synced Quartermaster commands to guild %s", settings.guild_id)
         if settings.party_inventory_channel_id and settings.session_log_channel_id:
-            runner = ProjectionRunner(services.store, DiscordProjectionTransport(bot, settings))
+            runner = ProjectionRunner(
+                services.store,
+                DiscordProjectionTransport(bot, settings, services.store),
+                receipt_retention_seconds=settings.receipt_retention_seconds,
+                handle_retention_seconds=settings.handle_retention_seconds,
+            )
             projection_task = asyncio.create_task(runner.run(stop_event))
         else:
             logger.warning("projection delivery disabled: configure QM_PARTY_INVENTORY_CHANNEL_ID and QM_SESSION_LOG_CHANNEL_ID")
@@ -333,11 +574,28 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
 
 
 def run_bot(settings: Settings) -> None:
+    settings.require_discord_token()
+    settings.require_projection_channels()
     store = SQLiteStore(settings.database_path).open()
     receipts = ReceiptRepository(store)
     from .handles import HandleRepository
 
     handles = HandleRepository(store)
+    recovery = recover_startup(
+        receipts,
+        handles,
+        receipt_retention_seconds=settings.receipt_retention_seconds,
+        handle_retention_seconds=settings.handle_retention_seconds,
+    )
+    logger.info("startup recovery completed: %s", recovery)
+    from .operations import run_maintenance
+
+    maintenance = run_maintenance(
+        store,
+        receipt_retention_seconds=settings.receipt_retention_seconds,
+        handle_retention_seconds=settings.handle_retention_seconds,
+    )
+    logger.info("startup maintenance completed: %s", maintenance)
     loot = LootDropService(store, receipts, handles)
     services = BotServices(
         store=store,
