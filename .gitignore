@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite-*
+.pytest_cache/
+*.egg-info/
+logs/
+*.log
+*.pid
+quartermaster.pid
+backups/
+quartermaster-export.md
+.env
+.env.*
