@@ -211,6 +211,12 @@ class LootDropService:
         if row["expires_at"] <= iso_now():
             self._close_drop_in_transaction(connection, operation_id, row["drop_id"], "EXPIRED")
             return {"status": "EXPIRED", "drop_id": row["drop_id"]}
+        claimant = connection.execute(
+            "SELECT id, name FROM characters WHERE discord_user_id = ? AND lifecycle = 'ACTIVE'",
+            (actor_id,),
+        ).fetchone()
+        if claimant is None:
+            raise LootDropError("an active registered character is required to claim Loot Drops")
         amount = int(handle.payload["amount"])
         remaining = int(row["remaining_quantity"])
         if remaining < amount:
@@ -221,7 +227,7 @@ class LootDropService:
             "UPDATE loot_drop_items SET remaining_quantity = ?, updated_at = ? WHERE id = ?",
             (new_remaining, now, drop_item_id),
         )
-        owner_id = actor_id or "anonymous"
+        owner_id = str(claimant["id"])
         character = connection.execute(
             "SELECT * FROM inventory_stacks WHERE owner_type = 'CHARACTER' AND owner_id = ? AND normalized_name = ? AND variant_metadata = '{}'",
             (owner_id, row["normalized_name"]),

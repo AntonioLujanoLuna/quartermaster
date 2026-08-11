@@ -353,7 +353,7 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
     stop_event = asyncio.Event()
     loot = services.loot or LootDropService(services.store, services.receipts, HandleRepository(services.store))
     characters = services.characters or CharacterService(services.store, services.receipts)
-    currency = services.currency or CurrencyService(services.store, services.receipts)
+    currency = services.currency or CurrencyService(services.store, services.receipts, handles=HandleRepository(services.store))
 
     @bot.tree.command(name="stash", description="View the Party Stash")
     @app_commands.guilds(guild)
@@ -827,7 +827,7 @@ def run_bot(settings: Settings) -> None:
         inventory=InventoryService(store, receipts, handles),
         sessions=SessionService(store, receipts, loot),
         characters=CharacterService(store, receipts),
-        currency=CurrencyService(store, receipts),
+        currency=CurrencyService(store, receipts, handles=handles),
         loot=loot,
     )
     bot = create_bot(settings, services)

@@ -13,12 +13,12 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from quartermaster.config import ConfigurationError, Settings
 from quartermaster.characters import CharacterError, CharacterService
-from quartermaster.currency import CurrencyError, CurrencyService
+from quartermaster.currency import CurrencyError, CurrencySemanticStaleness, CurrencyService
 from quartermaster.db import SCHEMA_VERSION, SQLiteStore
 from quartermaster.export import render_export
 from quartermaster.handles import HandleError, HandleRepository
 from quartermaster.inventory import InventoryService, SemanticStaleness
-from quartermaster.loot import LootDropService
+from quartermaster.loot import LootDropError, LootDropService
 from quartermaster.operations import (
     create_backup,
     create_scheduled_backup,
@@ -50,6 +50,11 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tempdir.name) / "quartermaster.sqlite"
         self.store = SQLiteStore(self.db_path).open()
+        with self.store.transaction() as connection:
+            connection.execute(
+                """INSERT INTO characters(id, name, discord_user_id, lifecycle, created_at, updated_at)
+                   VALUES ('player-character', 'Player Character', 'player', 'ACTIVE', '2026-08-11T00:00:00Z', '2026-08-11T00:00:00Z')"""
+            )
         self.receipts = ReceiptRepository(self.store)
         self.handles = HandleRepository(self.store)
         self.inventory = InventoryService(self.store, self.receipts, self.handles)
@@ -392,20 +397,23 @@ class QuartermasterCoreTests(unittest.TestCase):
         self._insert_character("c2", "Borin")
         self._insert_character("c3", "Cleo")
         self._insert_character("c4", "Departed", lifecycle="DEPARTED")
-        self.currency.adjust_treasury_interaction("split-seed", actor_id="dm", deltas={"gp": 80})
+        self.currency.adjust_treasury_interaction("split-seed", actor_id="dm", deltas={"gp": 81})
 
         result = self.currency.split_treasury_interaction(
             "split-1",
             actor_id="dm",
-            amounts={"gp": 80},
+            amounts={"gp": 81},
         )
-        self.assertEqual(result.logical_response["remainder"]["gp"], 2)
-        self.assertEqual(len(result.logical_response["recipients"]), 3)
+        self.assertEqual(result.logical_response["remainder"]["gp"], 1)
+        self.assertEqual(len(result.logical_response["recipients"]), 4)
         self.assertEqual(self.currency.view_treasury()["gp"], 0)
         balances = self.store.connection.execute(
             "SELECT owner_id, gp FROM currency_balances WHERE owner_type = 'CHARACTER' ORDER BY owner_id"
         ).fetchall()
-        self.assertEqual([(row["owner_id"], row["gp"]) for row in balances], [("c1", 26), ("c2", 26), ("c3", 26)])
+        self.assertEqual(
+            [(row["owner_id"], row["gp"]) for row in balances],
+            [("c1", 20), ("c2", 20), ("c3", 20), ("player-character", 20)],
+        )
 
     def test_treasury_give_is_atomic_and_rejects_non_active_characters(self) -> None:
         self._insert_character("active", "Active Hero")
@@ -481,7 +489,30 @@ class QuartermasterCoreTests(unittest.TestCase):
                 character_id=character_id,
                 lifecycle="RETIRED",
             )
-        self.assertEqual(self.characters.list_characters()[0]["lifecycle"], "DEAD")
+        edrin = next(row for row in self.characters.list_characters() if row["id"] == character_id)
+        self.assertEqual(edrin["lifecycle"], "DEAD")
+
+    def test_relative_treasury_split_requires_confirmation_after_read_set_changes(self) -> None:
+        self._insert_character("split-c1", "Split One")
+        self._insert_character("split-c2", "Split Two")
+        self.currency.adjust_treasury_interaction("relative-seed", actor_id="dm", deltas={"gp": 80})
+        handle_id = self.currency.create_relative_split_handle(actor_id="dm", amounts={"gp": 80})
+        self.currency.adjust_treasury_interaction("relative-change", actor_id="dm", deltas={"gp": 1})
+        with self.assertRaises(CurrencySemanticStaleness):
+            self.currency.split_relative_interaction(
+                "relative-stale",
+                handle_id=handle_id,
+                actor_id="dm",
+            )
+        confirmed = self.currency.split_relative_interaction(
+            "relative-confirmed",
+            handle_id=handle_id,
+            actor_id="dm",
+            confirm_current=True,
+        )
+        self.assertEqual(confirmed.logical_response["split"]["gp"], 80)
+        self.assertEqual(confirmed.logical_response["remainder"]["gp"], 2)
+        self.assertEqual(self.currency.view_treasury()["gp"], 1)
 
     def test_export_and_party_stash_projection_include_treasury(self) -> None:
         self.currency.adjust_treasury_interaction("treasury-export", actor_id="dm", deltas={"gp": 80})
@@ -891,9 +922,25 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertEqual(closed.logical_response["status"], "CLOSED")
         self.assertEqual({item["item_name"]: item["quantity"] for item in self.inventory.browse()}, {"Potion": 1, "Gem": 1})
         character = self.store.connection.execute(
-            "SELECT quantity FROM inventory_stacks WHERE owner_type = 'CHARACTER' AND owner_id = 'player' AND normalized_name = 'potion'"
+            "SELECT quantity FROM inventory_stacks WHERE owner_type = 'CHARACTER' AND owner_id = 'player-character' AND normalized_name = 'potion'"
         ).fetchone()
         self.assertEqual(character["quantity"], 1)
+
+    def test_loot_claim_requires_an_active_registered_character(self) -> None:
+        created = self.loot.create_drop_interaction(
+            "unregistered-drop",
+            actor_id="dm",
+            items=[("Unregistered Token", 1, None)],
+        )
+        drop = self.loot.list_open()[0]
+        item = drop["items"][0]
+        handle = self.loot.create_claim_handle(drop_item_id=item["id"], actor_id="unregistered", amount=1)
+        with self.assertRaisesRegex(LootDropError, "active registered character"):
+            self.loot.claim_interaction("unregistered-claim", handle_id=handle, actor_id="unregistered")
+        remaining = self.store.connection.execute(
+            "SELECT remaining_quantity FROM loot_drop_items WHERE id = ?", (item["id"],)
+        ).fetchone()
+        self.assertEqual(remaining["remaining_quantity"], 1)
 
     def test_expired_loot_drop_closes_and_returns_items(self) -> None:
         created = self.loot.create_drop_interaction("loot-create-2", actor_id="dm", items=[("Arrow", 3, None)])

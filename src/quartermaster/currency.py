@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from .clock import iso_now
 from .db import SQLiteStore
 from .events import append_event, mark_projection_dirty, session_event_destination
+from .handles import HandleRepository
 from .receipts import ReceiptRepository, ReceiptResult
 
 
@@ -17,6 +18,10 @@ VISIBLE_DENOMINATIONS = ("cp", "sp", "gp", "pp")
 
 class CurrencyError(RuntimeError):
     """Raised for invalid or impossible currency operations."""
+
+
+class CurrencySemanticStaleness(CurrencyError):
+    """Raised when a relative split no longer has the meaning the user observed."""
 
 
 def empty_currency() -> dict[str, int]:
@@ -67,10 +72,12 @@ class CurrencyService:
         receipts: ReceiptRepository,
         *,
         electrum_enabled: bool = False,
+        handles: HandleRepository | None = None,
     ) -> None:
         self.store = store
         self.receipts = receipts
         self.electrum_enabled = electrum_enabled
+        self.handles = handles or HandleRepository(store)
 
     def view_treasury(self) -> dict[str, int]:
         with self.store.connection_lock:
@@ -149,6 +156,94 @@ class CurrencyService:
             mutation=lambda connection, operation_id: self._split_in_transaction(
                 connection, operation_id, actor_id, normalized
             ),
+        )
+
+    def create_relative_split_handle(
+        self,
+        *,
+        actor_id: str | None,
+        amounts: Mapping[str, int],
+    ) -> str:
+        normalized = _validate_nonnegative_amounts(amounts, electrum_enabled=self.electrum_enabled)
+        with self.store.transaction() as connection:
+            treasury = connection.execute(
+                "SELECT version FROM currency_balances WHERE owner_type = 'PARTY' AND owner_id = 'party'"
+            ).fetchone()
+            if treasury is None:
+                raise CurrencyError("treasury balance is missing")
+            recipients = [
+                str(row["id"])
+                for row in connection.execute(
+                    "SELECT id FROM characters WHERE lifecycle = 'ACTIVE' ORDER BY name, id"
+                ).fetchall()
+            ]
+            if not recipients:
+                raise CurrencyError("at least one active character is required")
+            return self.handles.create_in_transaction(
+                connection,
+                workflow_type="treasury",
+                action="split-relative",
+                actor_id=actor_id,
+                payload={"amounts": normalized},
+                read_set_snapshot={"treasury_version": int(treasury["version"]), "recipients": recipients},
+                single_use=True,
+                ttl_seconds=300,
+            )
+
+    def split_relative_interaction(
+        self,
+        interaction_id: str,
+        *,
+        handle_id: str,
+        actor_id: str | None,
+        confirm_current: bool = False,
+    ) -> ReceiptResult:
+        return self.receipts.execute_fast(
+            interaction_id,
+            actor_id=actor_id,
+            response_kind="treasury-split",
+            mutation=lambda connection, operation_id: self.handles.consume_and_mutate_in_transaction(
+                connection,
+                handle_id,
+                actor_id=actor_id,
+                mutation=lambda transaction, handle: self._split_relative_in_transaction(
+                    transaction, operation_id, actor_id, handle, confirm_current
+                ),
+            ),
+        )
+
+    def _split_relative_in_transaction(
+        self,
+        connection: Any,
+        operation_id: str,
+        actor_id: str | None,
+        handle: Any,
+        confirm_current: bool,
+    ) -> dict[str, Any]:
+        if handle.workflow_type != "treasury" or handle.action != "split-relative":
+            raise CurrencyError("handle is not a treasury split handle")
+        treasury = connection.execute(
+            "SELECT version FROM currency_balances WHERE owner_type = 'PARTY' AND owner_id = 'party'"
+        ).fetchone()
+        recipients = [
+            str(row["id"])
+            for row in connection.execute(
+                "SELECT id FROM characters WHERE lifecycle = 'ACTIVE' ORDER BY name, id"
+            ).fetchall()
+        ]
+        current_snapshot = {
+            "treasury_version": int(treasury["version"]) if treasury else None,
+            "recipients": recipients,
+        }
+        if not confirm_current and current_snapshot != handle.read_set_snapshot:
+            raise CurrencySemanticStaleness(
+                "treasury or active recipient set changed; confirm the split against current state"
+            )
+        return self._split_in_transaction(
+            connection,
+            operation_id,
+            actor_id,
+            handle.payload["amounts"],
         )
 
     def _split_in_transaction(

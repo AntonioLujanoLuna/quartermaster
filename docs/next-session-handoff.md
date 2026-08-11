@@ -23,11 +23,12 @@ Updated: 2026-08-11
 - The first treasury/currency slice is implemented: schema-backed integer balances, DM-only treasury adjustments with FAST receipts, non-negative validation, ledger/events, Party Stash/export visibility, and guild-scoped `/treasury` plus `/treasury-adjust` commands. Electrum remains schema-supported but disabled by default.
 - Absolute treasury split and treasury-to-active-character transfers are implemented atomically, preserving per-denomination remainders and rejecting non-active recipients; `/treasury-split` and `/treasury-give` are now registered.
 - Explicit character registration and lifecycle transitions are implemented with ACTIVE/DEAD/RETIRED/DEPARTED invariants; `/characters`, `/character-add`, and `/character-lifecycle` are now registered. Lifecycle changes do not move inventory or currency.
+- Loot Drop claims now require an active registered character mapped to the Discord actor. Relative treasury split handles snapshot treasury version and active recipient IDs, and require explicit confirmation after either changes.
 - Session state and event destinations now remain bound to the correct durable session thread across session transitions; recreated Party Stash projections are re-pinned.
 - Operational commands now cover `health`, `maintenance`, `backup`, and safe restore validation.
 - Managed Windows process wrappers are in `scripts/start-quartermaster.ps1` and `scripts/stop-quartermaster.ps1`.
 - Operator procedures for backup/restore and degraded operation are documented in `docs/runbook.md`.
-- 49 automated tests pass with `uv`.
+- 51 automated tests pass with `uv`.
 
 ## Live Discord setup
 
@@ -98,7 +99,7 @@ The post-restart runtime and routing pass completed successfully:
 
 The local operational acceptance checks are complete:
 
-- `uv run pytest -q` -> 49 passed.
+- `uv run pytest -q` -> 51 passed.
 - `python -m compileall -q src tests` and `git diff --check` passed.
 - `health` -> `HEALTHY`; database, schema, backup, receipts, outbox, session, and state-projection checks all pass.
 - Online backup -> integrity and schema validation passed.
@@ -113,7 +114,7 @@ After the completed live verification:
 
 1. Perform target-host measurements for acknowledgement latency and live permission/pin reachability; the local adapter acceptance coverage is now in place.
 2. Decide whether backup should also receive a Discord-facing durable `PROCESSING -> COMMITTED/FAILED` workflow; `/export` is covered and backup now has scheduled and operator-initiated validated paths.
-3. Complete the remaining currency and character semantics: relative split/read-set confirmation, active-character identity enforcement for claims/spending, and explicit possession-resolution workflows.
+3. Complete explicit possession-resolution workflows for non-active characters, then add target-host measurements for acknowledgement latency and live permission/pin reachability.
 
 The larger optional domains - Your Pack, Journal, Parking Lot, Downtime, faction clocks, rich continuity, and Undo - remain evidence-gated and should not be started yet.
 
