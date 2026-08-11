@@ -1,6 +1,6 @@
 # Quartermaster and Avrae Integration Plan
 
-Status: planning only. No implementation is authorized by this document.
+Status: implementation in progress. The first Quartermaster-side boundary is implemented; Avrae-side execution remains gated on the extension spike.
 
 Updated: 2026-08-11
 
@@ -15,6 +15,12 @@ The plan deliberately separates three ambitions:
 3. One-click execution of Avrae mechanics from Quartermaster controls.
 
 The first two are Quartermaster work. The third requires an Avrae-side integration surface and must not be assumed to exist in the hosted Avrae bot.
+
+## Implementation slice 1: durable provider boundary
+
+Quartermaster now has a schema-9 `provider_operations` record linked by operation and interaction IDs to the existing receipt protocol. It records the authenticated actor, guild, channel, session, operation kind, provider reference, correlation ID, integration/provider versions, request payload, and one of `REQUESTED`, `COMMITTED`, `FAILED`, or `UNKNOWN`.
+
+Provider request reservation is atomic with the DEFERRED receipt, and provider finalization is atomic with the receipt outcome. Startup recovery marks an interrupted provider request `UNKNOWN`; it does not authorize an automatic retry of an attack, spell, save, or turn advance. The implementation exposes an `AvraeGateway` protocol, but it does not pretend that Quartermaster can invoke the hosted Avrae bot or calculate mechanics.
 
 ## Research findings
 
@@ -243,12 +249,12 @@ The integration is not ready for table use until all of the following are true:
 - A restored Quartermaster database retains continuity and integration references without pretending to contain Avrae mechanics.
 - The group can still play manually if Quartermaster is offline.
 
-## Immediate next work, still without application code
+## Immediate next implementation work
 
 1. Confirm whether self-hosting a maintained Avrae fork is acceptable.
 2. Decide whether the desired single front door should be the current Quartermaster bot or a Quartermaster Cog within a self-hosted Avrae process.
-3. Inventory the table's actual Avrae commands and combat habits.
-4. Build a small integration decision record from the four gates above.
-5. Only after those decisions, authorize an Avrae extension spike and update the Quartermaster product specification to include the chosen boundary.
+3. Build the disposable Avrae extension spike against the `AvraeGateway` contract, preserving the real Discord actor and native Avrae combat context.
+4. Inventory the table's actual Avrae commands and combat habits, then add only the first pilot operations with verified idempotency/timeout semantics.
+5. Update the product specification after the deployment and provider boundary are accepted; do not add mirrored HP, initiative, or mechanics state to Quartermaster.
 
 Until then, the current Quartermaster implementation remains the continuity core and should not gain speculative combat tables or mirrored mechanics state.

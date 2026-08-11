@@ -3,6 +3,7 @@
 from .config import Settings
 from .db import SQLiteStore
 from .handles import HandleRepository
+from .integration import AvraeGateway, ProviderIntegrationService, ProviderRequest, ProviderResult
 from .inventory import InventoryService
 from .loot import LootDropError, LootDropService
 from .projections import EventOutboxWorker, StateProjectionScheduler
@@ -12,6 +13,10 @@ from .sessions import SessionService
 
 __all__ = [
     "HandleRepository",
+    "AvraeGateway",
+    "ProviderIntegrationService",
+    "ProviderRequest",
+    "ProviderResult",
     "InventoryService",
     "LootDropError",
     "LootDropService",

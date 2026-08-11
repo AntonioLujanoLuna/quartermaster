@@ -67,6 +67,7 @@ class ReceiptRepository:
         *,
         actor_id: str | None,
         response_kind: str,
+        prepare: Callable[[Any, str], None] | None = None,
     ) -> ReceiptResult:
         """Durably reserve a DEFERRED operation before acknowledgement."""
         operation_id = str(uuid.uuid4())
@@ -86,15 +87,36 @@ class ReceiptRepository:
                 ) VALUES (?, ?, ?, 'DEFERRED', 'PROCESSING', ?, ?, ?)""",
                 (interaction_id, operation_id, actor_id, response_kind, json.dumps(pending), now),
             )
+            if prepare is not None:
+                prepare(connection, operation_id)
             return ReceiptResult(interaction_id, operation_id, "PROCESSING", response_kind, pending)
 
-    def commit_deferred(self, interaction_id: str, logical_response: Any) -> ReceiptResult:
-        return self._finish_deferred(interaction_id, "COMMITTED", logical_response)
+    def commit_deferred(
+        self,
+        interaction_id: str,
+        logical_response: Any,
+        *,
+        finalize: Callable[[Any, str, str, Any], None] | None = None,
+    ) -> ReceiptResult:
+        return self._finish_deferred(interaction_id, "COMMITTED", logical_response, finalize=finalize)
 
-    def fail_deferred(self, interaction_id: str, logical_response: Any) -> ReceiptResult:
-        return self._finish_deferred(interaction_id, "FAILED", logical_response)
+    def fail_deferred(
+        self,
+        interaction_id: str,
+        logical_response: Any,
+        *,
+        finalize: Callable[[Any, str, str, Any], None] | None = None,
+    ) -> ReceiptResult:
+        return self._finish_deferred(interaction_id, "FAILED", logical_response, finalize=finalize)
 
-    def _finish_deferred(self, interaction_id: str, status: str, logical_response: Any) -> ReceiptResult:
+    def _finish_deferred(
+        self,
+        interaction_id: str,
+        status: str,
+        logical_response: Any,
+        *,
+        finalize: Callable[[Any, str, str, Any], None] | None = None,
+    ) -> ReceiptResult:
         serialized = json.dumps(logical_response, sort_keys=True, separators=(",", ":"))
         now = iso_now()
         with self.store.transaction() as connection:
@@ -106,6 +128,8 @@ class ReceiptRepository:
                 raise ReceiptError(f"unknown DEFERRED interaction {interaction_id}")
             if row["status"] != "PROCESSING":
                 return self._result(row)
+            if finalize is not None:
+                finalize(connection, row["operation_id"], status, logical_response)
             column = "committed_at" if status == "COMMITTED" else "failed_at"
             connection.execute(
                 f"UPDATE interaction_receipts SET status = ?, logical_response = ?, serialized_response = ?, {column} = ? WHERE interaction_id = ?",
@@ -121,6 +145,21 @@ class ReceiptRepository:
         payload = {"error": "DEFERRED_OPERATION_FAILED", "message": reason, "retryable": True}
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         with self.store.transaction() as connection:
+            unknown = json.dumps(
+                {"status": "UNKNOWN", "error": "DEFERRED_OPERATION_FAILED", "message": reason, "retryable": True},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            connection.execute(
+                """UPDATE provider_operations
+                   SET status = 'UNKNOWN', result_payload = ?, updated_at = ?
+                   WHERE status = 'REQUESTED'
+                     AND operation_id IN (
+                         SELECT operation_id FROM interaction_receipts
+                         WHERE execution_class = 'DEFERRED' AND status = 'PROCESSING'
+                     )""",
+                (unknown, now),
+            )
             cursor = connection.execute(
                 """UPDATE interaction_receipts
                    SET status = 'FAILED', logical_response = ?, serialized_response = ?, failed_at = ?

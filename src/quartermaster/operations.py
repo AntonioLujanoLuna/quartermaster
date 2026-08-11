@@ -101,6 +101,12 @@ def health_report(
     processing_receipts = connection.execute(
         "SELECT COUNT(*) FROM interaction_receipts WHERE status = 'PROCESSING'"
     ).fetchone()[0]
+    provider_operations_unknown = connection.execute(
+        "SELECT COUNT(*) FROM provider_operations WHERE status = 'UNKNOWN'"
+    ).fetchone()[0]
+    provider_operations_requested = connection.execute(
+        "SELECT COUNT(*) FROM provider_operations WHERE status = 'REQUESTED'"
+    ).fetchone()[0]
     pending_events = connection.execute(
         "SELECT COUNT(*) FROM event_outbox WHERE status = 'PENDING'"
     ).fetchone()[0]
@@ -163,6 +169,9 @@ def health_report(
         "schema": "OK" if schema_version == SCHEMA_VERSION else "FAILED",
         "session_invariant": "OK" if active_sessions <= 1 else "FAILED",
         "processing_receipts": "OK" if processing_receipts == 0 else "DEGRADED",
+        "provider_operations": "OK"
+        if provider_operations_unknown == 0 and provider_operations_requested == 0
+        else "DEGRADED",
         "event_outbox": "OK" if pending_events == 0 else "DEGRADED",
         "state_projections": "OK" if dirty_projections == 0 else "DEGRADED",
         "expired_drops": "OK" if due_drops == 0 else "DEGRADED",
@@ -183,6 +192,8 @@ def health_report(
         "counts": {
             "active_sessions": active_sessions,
             "processing_receipts": processing_receipts,
+            "provider_operations_unknown": provider_operations_unknown,
+            "provider_operations_requested": provider_operations_requested,
             "pending_events": pending_events,
             "dirty_projections": dirty_projections,
             "expired_drops": due_drops,

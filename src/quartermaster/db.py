@@ -9,7 +9,7 @@ from threading import RLock
 from typing import Iterator
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class MigrationError(RuntimeError):
@@ -211,6 +211,31 @@ MIGRATIONS: dict[int, str] = {
     );
     CREATE INDEX local_metric_buckets_window_idx
         ON local_metric_buckets(metric_name, dimension, bucket_start);
+    """,
+    9: """
+    CREATE TABLE provider_operations (
+        operation_id TEXT PRIMARY KEY,
+        interaction_id TEXT NOT NULL UNIQUE,
+        provider TEXT NOT NULL,
+        operation_kind TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        provider_reference TEXT,
+        provider_version TEXT,
+        integration_version TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('REQUESTED', 'COMMITTED', 'FAILED', 'UNKNOWN')),
+        correlation_id TEXT NOT NULL UNIQUE,
+        request_payload TEXT NOT NULL,
+        result_payload TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX provider_operations_status_idx
+        ON provider_operations(provider, status, updated_at);
+    CREATE INDEX provider_operations_context_idx
+        ON provider_operations(session_id, guild_id, channel_id, updated_at);
     """,
 }
 

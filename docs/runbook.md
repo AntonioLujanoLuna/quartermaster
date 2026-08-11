@@ -75,6 +75,8 @@ Only use `restore --replace` when the destination has been explicitly chosen and
 
 ## Degraded operation
 
+The bot can be stopped without losing canonical state. While Discord delivery is unavailable, continue with `export` and a local `backup`; after restart, the projection runner recreates or edits the disposable Discord surfaces. A stale Discord surface check degrades health only after the configured freshness window; database, receipts, outbox, and backup checks remain independently visible.
+
 If `health` is `DEGRADED` or `FAILED`:
 
 1. Stop the bot if it is repeatedly failing or the database check is not `OK`.

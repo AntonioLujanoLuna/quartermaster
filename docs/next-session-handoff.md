@@ -5,7 +5,7 @@ Updated: 2026-08-11
 ## Verified current state
 
 - Python project managed with `uv` and `.venv`.
-- SQLite canonical state is at schema version 8.
+- SQLite canonical state is at schema version 8 in the current live database; source migrations now target schema version 9.
 - FAST and DEFERRED interaction receipts are implemented.
 - Opaque single-use mutation handles are implemented.
 - Bot startup now recovers interrupted DEFERRED receipts and runs transient-state maintenance before accepting interactions.
@@ -21,6 +21,7 @@ Updated: 2026-08-11
 - The projection runner now creates a validated timestamped backup immediately at startup and repeats it on the configurable `QM_BACKUP_INTERVAL_SECONDS` schedule, using the configured primary/off-device directories and retention count.
 - Runtime health now records Discord surface reachability for the configured Party Inventory and Session Log channels; missing, failed, or stale checks report `DEGRADED`.
 - Local aggregate metrics are implemented in schema 8: hourly bounded histograms report ACK p50/p95/max by execution class and projection dirty-duration p50/p95/max by target. They retain no actor or interaction identity and are available through the CLI `metrics` command and launcher Metrics action.
+- The first Avrae integration slice is implemented in schema 9 source: provider operations are reserved atomically with DEFERRED receipts, finalized with provider outcomes, and interrupted requests become visible `UNKNOWN` outcomes. No HP, initiative, attack, spell, save, or other mechanics are mirrored in Quartermaster, and the live database will apply this migration on the next restart.
 - Adapter acceptance coverage now includes configured DM-role/manage-guild authorization, pin-permission failures, Discord 429 retry translation, and the adapter FAST-to-DEFERRED acknowledgement path.
 - The first treasury/currency slice is implemented: schema-backed integer balances, DM-only treasury adjustments with FAST receipts, non-negative validation, ledger/events, Party Stash/export visibility, and guild-scoped `/treasury` plus `/treasury-adjust` commands. Electrum remains schema-supported but disabled by default.
 - Absolute treasury split and treasury-to-active-character transfers are implemented atomically, preserving per-denomination remainders and rejecting non-active recipients; `/treasury-split` and `/treasury-give` are now registered.
@@ -32,7 +33,7 @@ Updated: 2026-08-11
 - Operational commands now cover `health`, `maintenance`, `backup`, and safe restore validation.
 - Managed Windows process wrappers are in `scripts/start-quartermaster.ps1` and `scripts/stop-quartermaster.ps1`.
 - Operator procedures for backup/restore and degraded operation are documented in `docs/runbook.md`.
-- 55 automated tests pass with `uv`.
+- 61 automated tests pass with `uv`.
 
 ## Live Discord setup
 
@@ -77,6 +78,8 @@ Managed-process resilience verification completed on 2026-08-11: killing the val
 Signed-in browser verification completed on 2026-08-11: `/quartermaster` appeared in the guild command picker, returned the expected ephemeral launcher, and `More…` opened the Stash, Open Loot, Treasury, Characters, Export, Backup, and Health actions.
 
 Schema-8 live verification completed on 2026-08-11: the managed restart applied the local metrics migration, health returned `HEALTHY`, `/quartermaster` returned after the deadline-safe acknowledgement change, and the CLI metrics report contained deferred launcher and fast action ACK samples.
+
+Degraded-fallback verification completed on 2026-08-11: with supervised Discord delivery stopped, canonical SQLite still produced a 40-line/2,490-byte export and a validated local schema-8 backup at `backups/quartermaster-fallback-20260811.sqlite`. Health reported `DEGRADED` when the Discord freshness budget was forced to one second, while database, schema, receipts, outbox, projections, and backup checks remained healthy. Restarting the supervisor restored `HEALTHY` with zero pending events, zero dirty projections, and a fresh Discord surface check.
 
 ## Deliberate test state still present
 
@@ -126,11 +129,13 @@ The live test data intentionally remains visible for cleanup/audit: Party Stash 
 
 The core implementation and live acceptance checks are complete. The current deployment decision is local-only backup storage: leave `QM_BACKUP_OFF_DEVICE_DIRECTORY` unset. Off-device backup support remains available for a later deployment, but it is not a blocker for this local setup.
 
-Remaining work is operational evidence and evidence-gated product evaluation:
+The next combat implementation gate is the Avrae-side extension spike. The Quartermaster boundary is ready, but the current live runtime has not yet been restarted onto schema 9 and no hosted-Avrae command execution is claimed:
 
-1. Exercise the degraded fallback path end-to-end: stop Discord delivery, continue through CLI/export/backup, restart, and verify projection convergence.
-2. Repeat the local metrics collection during ordinary use and choose evidence-based latency/freshness budgets if the current estimates need refinement.
-3. Evaluate any further evidence-gated character/currency UX using the live command and latency evidence now collected.
+1. Decide whether self-hosting/forking Avrae is acceptable and choose the Avrae-side extension shape.
+2. Restart the managed runtime during a controlled window so the schema-9 provider-operation migration applies, then verify health and backup/restore validation.
+3. In a disposable guild, prove one authenticated, harmless Avrae-side operation through the `AvraeGateway` boundary before adding launcher combat controls.
+4. Repeat the local metrics collection during ordinary use and choose evidence-based latency/freshness budgets if the current estimates need refinement.
+5. Evaluate any further evidence-gated character/currency UX using the live command and latency evidence now collected.
 
 The larger optional domains - Your Pack, Journal, Parking Lot, Downtime, faction clocks, rich continuity, and Undo - remain evidence-gated and should not be started yet.
 
