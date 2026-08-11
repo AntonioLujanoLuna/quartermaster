@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from .clock import iso_now
+from .currency import currency_from_row
 from .db import SQLiteStore
 from .transport import DiscordTransport, RateLimitedError
 
@@ -40,8 +41,12 @@ def render_state(store: SQLiteStore, target_id: str) -> dict[str, Any]:
                 drop_payload.setdefault(drop["id"], []).append(
                     {"item_name": drop["item_name"], "remaining": drop["remaining_quantity"], "expires_at": drop["expires_at"]}
                 )
+            treasury = connection.execute(
+                "SELECT cp, sp, ep, gp, pp FROM currency_balances WHERE owner_type = 'PARTY' AND owner_id = 'party'"
+            ).fetchone()
             return {
                 "surface": "PARTY STASH",
+                "treasury": currency_from_row(treasury) if treasury else None,
                 "items": [
                     {"item_name": row["item_name"], "quantity": row["quantity"], "provenance": row["provenance"]}
                     for row in rows

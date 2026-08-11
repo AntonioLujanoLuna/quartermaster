@@ -9,7 +9,7 @@ from threading import RLock
 from typing import Iterator
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class MigrationError(RuntimeError):
@@ -181,6 +181,22 @@ MIGRATIONS: dict[int, str] = {
     """,
     6: """
     ALTER TABLE maintenance_runs ADD COLUMN last_details TEXT;
+    """,
+    7: """
+    CREATE TABLE currency_balances (
+        owner_type TEXT NOT NULL CHECK (owner_type IN ('PARTY', 'CHARACTER')),
+        owner_id TEXT NOT NULL,
+        cp INTEGER NOT NULL DEFAULT 0 CHECK (cp >= 0),
+        sp INTEGER NOT NULL DEFAULT 0 CHECK (sp >= 0),
+        ep INTEGER NOT NULL DEFAULT 0 CHECK (ep >= 0),
+        gp INTEGER NOT NULL DEFAULT 0 CHECK (gp >= 0),
+        pp INTEGER NOT NULL DEFAULT 0 CHECK (pp >= 0),
+        version INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (owner_type, owner_id)
+    );
+    INSERT INTO currency_balances(owner_type, owner_id, updated_at)
+    VALUES ('PARTY', 'party', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
     """,
 }
 

@@ -5,7 +5,7 @@ Updated: 2026-08-11
 ## Verified current state
 
 - Python project managed with `uv` and `.venv`.
-- SQLite canonical state is at schema version 6.
+- SQLite canonical state is at schema version 7.
 - FAST and DEFERRED interaction receipts are implemented.
 - Opaque single-use mutation handles are implemented.
 - Bot startup now recovers interrupted DEFERRED receipts and runs transient-state maintenance before accepting interactions.
@@ -20,11 +20,12 @@ Updated: 2026-08-11
 - The projection runner now creates a validated timestamped backup immediately at startup and repeats it on the configurable `QM_BACKUP_INTERVAL_SECONDS` schedule, using the configured primary/off-device directories and retention count.
 - Runtime health now records Discord surface reachability for the configured Party Inventory and Session Log channels; missing, failed, or stale checks report `DEGRADED`.
 - Adapter acceptance coverage now includes configured DM-role/manage-guild authorization, pin-permission failures, Discord 429 retry translation, and the adapter FAST-to-DEFERRED acknowledgement path.
+- The first treasury/currency slice is implemented: schema-backed integer balances, DM-only treasury adjustments with FAST receipts, non-negative validation, ledger/events, Party Stash/export visibility, and guild-scoped `/treasury` plus `/treasury-adjust` commands. Electrum remains schema-supported but disabled by default.
 - Session state and event destinations now remain bound to the correct durable session thread across session transitions; recreated Party Stash projections are re-pinned.
 - Operational commands now cover `health`, `maintenance`, `backup`, and safe restore validation.
 - Managed Windows process wrappers are in `scripts/start-quartermaster.ps1` and `scripts/stop-quartermaster.ps1`.
 - Operator procedures for backup/restore and degraded operation are documented in `docs/runbook.md`.
-- 43 automated tests pass with `uv`.
+- 46 automated tests pass with `uv`.
 
 ## Live Discord setup
 
@@ -95,7 +96,7 @@ The post-restart runtime and routing pass completed successfully:
 
 The local operational acceptance checks are complete:
 
-- `uv run pytest -q` -> 43 passed.
+- `uv run pytest -q` -> 46 passed.
 - `python -m compileall -q src tests` and `git diff --check` passed.
 - `health` -> `HEALTHY`; database, schema, backup, receipts, outbox, session, and state-projection checks all pass.
 - Online backup -> integrity and schema validation passed.
@@ -110,7 +111,7 @@ After the completed live verification:
 
 1. Perform target-host measurements for acknowledgement latency and live permission/pin reachability; the local adapter acceptance coverage is now in place.
 2. Decide whether backup should also receive a Discord-facing durable `PROCESSING -> COMMITTED/FAILED` workflow; `/export` is covered and backup now has scheduled and operator-initiated validated paths.
-3. Then choose the next product slice: treasury/currency transfers or further character ownership support.
+3. Continue Phase 4 with absolute/relative treasury split semantics and atomic Give/transfer recipient-set validation; keep character lifecycle changes separate from possession movement.
 
 The larger optional domains - Your Pack, Journal, Parking Lot, Downtime, faction clocks, rich continuity, and Undo - remain evidence-gated and should not be started yet.
 

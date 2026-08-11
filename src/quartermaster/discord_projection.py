@@ -11,6 +11,7 @@ from typing import Any
 import discord
 
 from .config import Settings
+from .currency import format_currency
 from .db import SQLiteStore
 from .loot import expire_due_drops
 from .operations import create_scheduled_backup, record_discord_surface_health, run_maintenance
@@ -28,6 +29,8 @@ class ProjectionConfigurationError(RuntimeError):
 def _content_for_state(target_id: str, payload: dict[str, Any]) -> str:
     if target_id == "party-stash":
         lines = ["**PARTY STASH**", ""]
+        if payload.get("treasury") is not None:
+            lines.extend([f"Treasury: {format_currency(payload['treasury'])}", ""])
         items = payload.get("items", [])
         for drop in payload.get("loot_drops", []):
             lines.extend(["", f"**NEW LOOT** · `{drop['drop_id'][:8]}`"])
@@ -62,6 +65,8 @@ def _content_for_event(event_type: str, payload: dict[str, Any]) -> str:
         return f"A player claimed {payload['quantity']} {payload['item_name']} from a Loot Drop."
     if event_type == "LOOT_DROP_CLOSED":
         return f"Loot Drop closed ({payload['reason']})."
+    if event_type == "TREASURY_ADJUSTED":
+        return f"Treasury updated: {format_currency(payload['after'])}."
     return f"{event_type}: {json.dumps(payload, sort_keys=True)}"
 
 

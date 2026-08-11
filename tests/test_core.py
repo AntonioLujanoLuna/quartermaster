@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from quartermaster.config import ConfigurationError, Settings
+from quartermaster.currency import CurrencyError, CurrencyService
 from quartermaster.db import SCHEMA_VERSION, SQLiteStore
 from quartermaster.export import render_export
 from quartermaster.handles import HandleError, HandleRepository
@@ -53,6 +54,7 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.inventory = InventoryService(self.store, self.receipts, self.handles)
         self.loot = LootDropService(self.store, self.receipts, self.handles)
         self.sessions = SessionService(self.store, self.receipts, self.loot)
+        self.currency = CurrencyService(self.store, self.receipts)
 
     def tearDown(self) -> None:
         self.store.close()
@@ -324,6 +326,67 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertIn("Silvered Dagger x1", output)
         self.assertIn("Active session: 1", output)
 
+    def test_treasury_adjustment_is_integer_atomic_and_replayed(self) -> None:
+        first = self.currency.adjust_treasury_interaction(
+            "treasury-adjust-1",
+            actor_id="dm",
+            deltas={"gp": 80, "pp": 1},
+            reason="Found in the vault",
+        )
+        replay = self.currency.adjust_treasury_interaction(
+            "treasury-adjust-1",
+            actor_id="dm",
+            deltas={"gp": -80, "pp": -1},
+            reason="different retry",
+        )
+        self.assertEqual(first.logical_response, replay.logical_response)
+        self.assertEqual(self.currency.view_treasury(), {"cp": 0, "sp": 0, "ep": 0, "gp": 80, "pp": 1})
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM ledger_entries WHERE event_type = 'TREASURY_ADJUSTED'"
+            ).fetchone()[0],
+            1,
+        )
+        projection = self.store.connection.execute(
+            "SELECT dirty_since FROM projection_targets WHERE target_id = 'party-stash'"
+        ).fetchone()
+        self.assertIsNotNone(projection["dirty_since"])
+
+    def test_treasury_rejects_fractional_electrum_and_negative_result(self) -> None:
+        with self.assertRaisesRegex(CurrencyError, "must be an integer"):
+            self.currency.adjust_treasury_interaction(
+                "treasury-fractional",
+                actor_id="dm",
+                deltas={"gp": 1.5},
+            )
+        with self.assertRaisesRegex(CurrencyError, "electrum is disabled"):
+            self.currency.adjust_treasury_interaction(
+                "treasury-electrum",
+                actor_id="dm",
+                deltas={"ep": 1},
+            )
+        with self.assertRaisesRegex(CurrencyError, "cannot become negative"):
+            self.currency.adjust_treasury_interaction(
+                "treasury-negative",
+                actor_id="dm",
+                deltas={"gp": -1},
+            )
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM interaction_receipts WHERE interaction_id = 'treasury-negative'"
+            ).fetchone()
+        )
+
+    def test_export_and_party_stash_projection_include_treasury(self) -> None:
+        self.currency.adjust_treasury_interaction("treasury-export", actor_id="dm", deltas={"gp": 80})
+        output = render_export(self.store)
+        self.assertIn("## Treasury", output)
+        self.assertIn("0 cp · 0 sp · 0 ep · 80 gp · 0 pp", output)
+        from quartermaster.projections import render_state
+
+        state = render_state(self.store, "party-stash")
+        self.assertEqual(state["treasury"]["gp"], 80)
+
     def test_backup_creates_valid_snapshot(self) -> None:
         backup = self.store.snapshot(Path(self.tempdir.name) / "backup.sqlite")
         self.assertTrue(backup.exists())
@@ -440,7 +503,18 @@ class QuartermasterCoreTests(unittest.TestCase):
         commands = bot.tree.get_commands(guild=discord.Object(id=123))
         self.assertEqual(
             {command.name for command in commands},
-            {"stash", "grant", "loot", "loot-drop", "loot-close", "export", "session-start", "session-end"},
+            {
+                "stash",
+                "grant",
+                "loot",
+                "loot-drop",
+                "loot-close",
+                "export",
+                "treasury",
+                "treasury-adjust",
+                "session-start",
+                "session-end",
+            },
         )
 
     def test_discord_response_helper_omits_empty_view(self) -> None:

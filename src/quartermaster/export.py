@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from .currency import currency_from_row, format_currency
 from .db import SCHEMA_VERSION, SQLiteStore
 
 
@@ -23,6 +24,9 @@ def _render_export(store: SQLiteStore) -> str:
     stacks = connection.execute(
         "SELECT item_name, quantity, provenance, owner_type, owner_id FROM inventory_stacks ORDER BY item_name, id"
     ).fetchall()
+    treasury = connection.execute(
+        "SELECT cp, sp, ep, gp, pp FROM currency_balances WHERE owner_type = 'PARTY' AND owner_id = 'party'"
+    ).fetchone()
     receipt_counts = connection.execute(
         "SELECT status, COUNT(*) AS count FROM interaction_receipts GROUP BY status ORDER BY status"
     ).fetchall()
@@ -48,7 +52,9 @@ def _render_export(store: SQLiteStore) -> str:
         )
     else:
         lines.append("- No inventory recorded yet.")
-    lines.extend(["", "## Treasury", "", "- Treasury is not enabled in this implementation slice.", "", "## Session", ""])
+    lines.extend(["", "## Treasury", ""])
+    lines.append(f"- {format_currency(currency_from_row(treasury), include_electrum=True)}" if treasury else "- Treasury is not initialized.")
+    lines.extend(["", "## Session", ""])
     if active:
         lines.append(f"- Active session: {active['session_number']} (started {active['started_at']}).")
     else:

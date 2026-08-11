@@ -13,6 +13,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from .config import Settings
+from .currency import CurrencyError, CurrencyService, format_currency
 from .db import SQLiteStore
 from .discord_projection import DiscordProjectionTransport, ProjectionRunner
 from .export import render_export
@@ -39,6 +40,7 @@ class BotServices:
     receipts: ReceiptRepository
     inventory: InventoryService
     sessions: SessionService
+    currency: CurrencyService | None = None
     loot: LootDropService | None = None
 
 
@@ -348,6 +350,7 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
     projection_task: asyncio.Task | None = None
     stop_event = asyncio.Event()
     loot = services.loot or LootDropService(services.store, services.receipts, HandleRepository(services.store))
+    currency = services.currency or CurrencyService(services.store, services.receipts)
 
     @bot.tree.command(name="stash", description="View the Party Stash")
     @app_commands.guilds(guild)
@@ -395,6 +398,64 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
             )
         except LootDropError as error:
             await _send_error(interaction, f"Loot Drops could not be opened: {error}")
+
+    @bot.tree.command(name="treasury", description="View the shared treasury")
+    @app_commands.guilds(guild)
+    async def treasury(interaction: discord.Interaction) -> None:
+        if not _in_configured_guild(interaction, settings):
+            await _send_error(interaction, "This bot is configured for a different guild.")
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                currency.view_treasury,
+                ephemeral=True,
+            )
+            await _send_execution(
+                interaction,
+                execution,
+                f"Treasury: {format_currency(execution.value)}",
+                ephemeral=True,
+            )
+        except CurrencyError as error:
+            await _send_error(interaction, f"Treasury could not be read: {error}")
+
+    @bot.tree.command(name="treasury-adjust", description="Adjust the shared treasury")
+    @app_commands.guilds(guild)
+    @app_commands.describe(cp="Copper delta", sp="Silver delta", gp="Gold delta", pp="Platinum delta", reason="Optional reason")
+    async def treasury_adjust(
+        interaction: discord.Interaction,
+        cp: int = 0,
+        sp: int = 0,
+        gp: int = 0,
+        pp: int = 0,
+        reason: str | None = None,
+    ) -> None:
+        if not _in_configured_guild(interaction, settings) or not await _is_dm(interaction, settings):
+            await _send_error(interaction, "Only configured DM administrators can adjust the treasury.")
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                lambda: currency.adjust_treasury_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    deltas={"cp": cp, "sp": sp, "gp": gp, "pp": pp},
+                    reason=reason,
+                ),
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
+                f"Treasury updated: {format_currency(response['after'])}.",
+            )
+        except CurrencyError as error:
+            await _send_error(interaction, f"Treasury adjustment could not be completed: {error}")
 
     @bot.tree.command(name="export", description="Export canonical Quartermaster state")
     @app_commands.guilds(guild)
@@ -614,6 +675,7 @@ def run_bot(settings: Settings) -> None:
         receipts=receipts,
         inventory=InventoryService(store, receipts, handles),
         sessions=SessionService(store, receipts, loot),
+        currency=CurrencyService(store, receipts),
         loot=loot,
     )
     bot = create_bot(settings, services)
