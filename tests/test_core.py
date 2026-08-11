@@ -60,6 +60,14 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.store.close()
         self.tempdir.cleanup()
 
+    def _insert_character(self, character_id: str, name: str, lifecycle: str = "ACTIVE") -> None:
+        with self.store.transaction() as connection:
+            connection.execute(
+                """INSERT INTO characters(id, name, discord_user_id, lifecycle, created_at, updated_at)
+                   VALUES (?, ?, NULL, ?, '2026-08-11T00:00:00Z', '2026-08-11T00:00:00Z')""",
+                (character_id, name, lifecycle),
+            )
+
     def test_settings_require_guild_and_database(self) -> None:
         with self.assertRaises(ConfigurationError):
             Settings.from_env({})
@@ -377,6 +385,53 @@ class QuartermasterCoreTests(unittest.TestCase):
             ).fetchone()
         )
 
+    def test_treasury_split_preserves_remainders_and_active_recipient_set(self) -> None:
+        self._insert_character("c1", "Aria")
+        self._insert_character("c2", "Borin")
+        self._insert_character("c3", "Cleo")
+        self._insert_character("c4", "Departed", lifecycle="DEPARTED")
+        self.currency.adjust_treasury_interaction("split-seed", actor_id="dm", deltas={"gp": 80})
+
+        result = self.currency.split_treasury_interaction(
+            "split-1",
+            actor_id="dm",
+            amounts={"gp": 80},
+        )
+        self.assertEqual(result.logical_response["remainder"]["gp"], 2)
+        self.assertEqual(len(result.logical_response["recipients"]), 3)
+        self.assertEqual(self.currency.view_treasury()["gp"], 0)
+        balances = self.store.connection.execute(
+            "SELECT owner_id, gp FROM currency_balances WHERE owner_type = 'CHARACTER' ORDER BY owner_id"
+        ).fetchall()
+        self.assertEqual([(row["owner_id"], row["gp"]) for row in balances], [("c1", 26), ("c2", 26), ("c3", 26)])
+
+    def test_treasury_give_is_atomic_and_rejects_non_active_characters(self) -> None:
+        self._insert_character("active", "Active Hero")
+        self._insert_character("dead", "Dead Hero", lifecycle="DEAD")
+        self.currency.adjust_treasury_interaction("give-seed", actor_id="dm", deltas={"gp": 50})
+
+        result = self.currency.give_to_character_interaction(
+            "give-1",
+            actor_id="dm",
+            character_id="active",
+            amounts={"gp": 17},
+        )
+        self.assertEqual(result.logical_response["character_after"]["gp"], 17)
+        self.assertEqual(self.currency.view_treasury()["gp"], 33)
+        with self.assertRaisesRegex(CurrencyError, "only active"):
+            self.currency.give_to_character_interaction(
+                "give-dead",
+                actor_id="dm",
+                character_id="dead",
+                amounts={"gp": 1},
+            )
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM interaction_receipts WHERE interaction_id = 'give-dead'"
+            ).fetchone()
+        )
+        self.assertIn("Active Hero [ACTIVE]", render_export(self.store))
+
     def test_export_and_party_stash_projection_include_treasury(self) -> None:
         self.currency.adjust_treasury_interaction("treasury-export", actor_id="dm", deltas={"gp": 80})
         output = render_export(self.store)
@@ -512,6 +567,8 @@ class QuartermasterCoreTests(unittest.TestCase):
                 "export",
                 "treasury",
                 "treasury-adjust",
+                "treasury-split",
+                "treasury-give",
                 "session-start",
                 "session-end",
             },

@@ -457,6 +457,74 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
         except CurrencyError as error:
             await _send_error(interaction, f"Treasury adjustment could not be completed: {error}")
 
+    @bot.tree.command(name="treasury-split", description="Split treasury currency among active characters")
+    @app_commands.guilds(guild)
+    @app_commands.describe(cp="Copper amount", sp="Silver amount", gp="Gold amount", pp="Platinum amount")
+    async def treasury_split(
+        interaction: discord.Interaction,
+        cp: int = 0,
+        sp: int = 0,
+        gp: int = 0,
+        pp: int = 0,
+    ) -> None:
+        if not _in_configured_guild(interaction, settings) or not await _is_dm(interaction, settings):
+            await _send_error(interaction, "Only configured DM administrators can split the treasury.")
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                lambda: currency.split_treasury_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    amounts={"cp": cp, "sp": sp, "gp": gp, "pp": pp},
+                ),
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
+                f"Split among {len(response['recipients'])} active characters: {format_currency(response['per_recipient'])} each.",
+            )
+        except CurrencyError as error:
+            await _send_error(interaction, f"Treasury split could not be completed: {error}")
+
+    @bot.tree.command(name="treasury-give", description="Give treasury currency to an active character")
+    @app_commands.guilds(guild)
+    @app_commands.describe(character_id="Character ID", cp="Copper amount", sp="Silver amount", gp="Gold amount", pp="Platinum amount")
+    async def treasury_give(
+        interaction: discord.Interaction,
+        character_id: str,
+        cp: int = 0,
+        sp: int = 0,
+        gp: int = 0,
+        pp: int = 0,
+    ) -> None:
+        if not _in_configured_guild(interaction, settings) or not await _is_dm(interaction, settings):
+            await _send_error(interaction, "Only configured DM administrators can give treasury currency.")
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                lambda: currency.give_to_character_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    character_id=character_id,
+                    amounts={"cp": cp, "sp": sp, "gp": gp, "pp": pp},
+                ),
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
+                f"Gave {format_currency(response['amount'])} to {response['character_name']}.",
+            )
+        except CurrencyError as error:
+            await _send_error(interaction, f"Currency transfer could not be completed: {error}")
+
     @bot.tree.command(name="export", description="Export canonical Quartermaster state")
     @app_commands.guilds(guild)
     async def export_command(interaction: discord.Interaction) -> None:

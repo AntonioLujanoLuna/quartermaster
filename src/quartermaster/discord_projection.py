@@ -67,6 +67,10 @@ def _content_for_event(event_type: str, payload: dict[str, Any]) -> str:
         return f"Loot Drop closed ({payload['reason']})."
     if event_type == "TREASURY_ADJUSTED":
         return f"Treasury updated: {format_currency(payload['after'])}."
+    if event_type == "TREASURY_SPLIT":
+        return f"Treasury split among {len(payload['recipients'])} active characters."
+    if event_type == "CURRENCY_TRANSFERRED":
+        return f"Currency given to {payload['character_name']}."
     return f"{event_type}: {json.dumps(payload, sort_keys=True)}"
 
 

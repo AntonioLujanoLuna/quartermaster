@@ -27,6 +27,13 @@ def _render_export(store: SQLiteStore) -> str:
     treasury = connection.execute(
         "SELECT cp, sp, ep, gp, pp FROM currency_balances WHERE owner_type = 'PARTY' AND owner_id = 'party'"
     ).fetchone()
+    character_currency = connection.execute(
+        """SELECT characters.name, characters.lifecycle, balances.cp, balances.sp, balances.ep, balances.gp, balances.pp
+             FROM characters
+             JOIN currency_balances AS balances
+               ON balances.owner_type = 'CHARACTER' AND balances.owner_id = characters.id
+            ORDER BY characters.name, characters.id"""
+    ).fetchall()
     receipt_counts = connection.execute(
         "SELECT status, COUNT(*) AS count FROM interaction_receipts GROUP BY status ORDER BY status"
     ).fetchall()
@@ -54,6 +61,12 @@ def _render_export(store: SQLiteStore) -> str:
         lines.append("- No inventory recorded yet.")
     lines.extend(["", "## Treasury", ""])
     lines.append(f"- {format_currency(currency_from_row(treasury), include_electrum=True)}" if treasury else "- Treasury is not initialized.")
+    if character_currency:
+        lines.extend(["", "### Character currency", ""])
+        lines.extend(
+            f"- {row['name']} [{row['lifecycle']}]: {format_currency(currency_from_row(row), include_electrum=True)}"
+            for row in character_currency
+        )
     lines.extend(["", "## Session", ""])
     if active:
         lines.append(f"- Active session: {active['session_number']} (started {active['started_at']}).")
