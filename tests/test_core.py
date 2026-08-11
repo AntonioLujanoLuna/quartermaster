@@ -19,6 +19,7 @@ from quartermaster.export import render_export
 from quartermaster.handles import HandleError, HandleRepository
 from quartermaster.inventory import InventoryService, SemanticStaleness
 from quartermaster.loot import LootDropError, LootDropService
+from quartermaster.metrics import metric_report, record_metric, render_metrics
 from quartermaster.operations import (
     create_backup,
     create_scheduled_backup,
@@ -693,6 +694,7 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertEqual(
             {command.name for command in commands},
             {
+                "quartermaster",
                 "stash",
                 "grant",
                 "loot",
@@ -712,6 +714,59 @@ class QuartermasterCoreTests(unittest.TestCase):
                 "session-end",
             },
         )
+
+    def test_quartermaster_launcher_summarizes_state_and_exposes_actions(self) -> None:
+        from quartermaster.discord_adapter import (
+            BotServices,
+            LauncherMoreView,
+            QuartermasterLauncherView,
+            _launcher_snapshot,
+            _render_launcher,
+        )
+
+        self.inventory.grant_interaction(
+            "launcher-grant",
+            actor_id="dm",
+            item_name="Launcher Potion",
+            quantity=2,
+        )
+        self.sessions.start_session()
+        services = BotServices(
+            self.store,
+            self.receipts,
+            self.inventory,
+            self.sessions,
+            characters=self.characters,
+            currency=self.currency,
+            loot=self.loot,
+        )
+        settings = Settings(guild_id="123", database_path=self.db_path)
+
+        snapshot = _launcher_snapshot(services, self.characters)
+        rendered = _render_launcher(snapshot)
+        self.assertEqual(snapshot, {"stash_count": 1, "active_session_number": 1, "unresolved_estates": 0})
+        self.assertIn("Party Stash · 1 entries", rendered)
+        self.assertIn("Session 1 active", rendered)
+
+        view = QuartermasterLauncherView(services, settings, self.characters, self.currency, self.loot)
+        self.assertEqual({item.label for item in view.children}, {"Grant loot", "Session", "More…"})
+        more = LauncherMoreView(services, settings, self.characters, self.currency, self.loot)
+        self.assertEqual(
+            {item.label for item in more.children},
+            {"Stash", "Open Loot", "Treasury", "Characters", "Export", "Backup", "Health", "Metrics"},
+        )
+
+    def test_local_metrics_report_aggregates_histogram_percentiles(self) -> None:
+        for duration in (4, 20, 40, 300, 600, 2500):
+            record_metric(self.store, "interaction_ack_latency_ms", duration, dimension="FAST")
+
+        report = metric_report(self.store)
+        values = report["metrics"]["interaction_ack_latency_ms"]["FAST"]
+        self.assertEqual(values["count"], 6)
+        self.assertEqual(values["p50_ms"], 50.0)
+        self.assertEqual(values["p95_ms"], 5000.0)
+        self.assertEqual(values["max_ms"], 2500.0)
+        self.assertIn("interaction_ack_latency_ms [FAST]", render_metrics(report))
 
     def test_discord_response_helper_omits_empty_view(self) -> None:
         from quartermaster.discord_adapter import _send_execution
@@ -891,6 +946,12 @@ class QuartermasterCoreTests(unittest.TestCase):
                 return {"surfaces": {"party-inventory": {"reachable": True}}}
 
         primary = Path(self.tempdir.name) / "runner-backups"
+        self.inventory.grant_interaction(
+            "runner-metric-grant",
+            actor_id="dm",
+            item_name="Runner Metric Token",
+            quantity=1,
+        )
         runner = ProjectionRunner(
             self.store,
             Transport(),
@@ -914,6 +975,9 @@ class QuartermasterCoreTests(unittest.TestCase):
             ).fetchone()["last_status"],
             "OK",
         )
+        metric_values = metric_report(self.store)["metrics"]["projection_dirty_duration_ms"]
+        self.assertIn("party-stash", metric_values)
+        self.assertGreaterEqual(metric_values["party-stash"]["count"], 1)
 
     def test_session_projection_destination_moves_to_the_new_session(self) -> None:
         first = self.sessions.start_session()

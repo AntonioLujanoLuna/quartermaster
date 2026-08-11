@@ -7,6 +7,7 @@ import io
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Callable
 
 import discord
@@ -22,7 +23,8 @@ from .export import render_export
 from .handles import HandleError, HandleRepository
 from .inventory import InventoryError, InventoryService, SemanticStaleness
 from .loot import LootDropError, LootDropService
-from .operations import create_scheduled_backup
+from .metrics import metric_report, record_metric, render_metrics
+from .operations import create_scheduled_backup, health_report, render_health
 from .recovery import recover_startup
 from .receipts import ReceiptRepository
 from .response import (
@@ -97,6 +99,7 @@ async def _run_fast(
         soft_deadline_seconds=settings.soft_deadline_seconds,
         write_active=lambda: store.write_transaction_active,
         ephemeral=ephemeral,
+        metrics_store=store,
     )
 
 
@@ -115,6 +118,16 @@ async def _send_execution(
         await interaction.followup.send(message, **kwargs)
     else:
         await interaction.response.send_message(message, **kwargs)
+        if execution.metrics_store is not None and execution.started_at > 0:
+            asyncio.create_task(
+                asyncio.to_thread(
+                    record_metric,
+                    execution.metrics_store,
+                    "interaction_ack_latency_ms",
+                    (monotonic() - execution.started_at) * 1000,
+                    dimension="FAST",
+                )
+            )
 
 
 async def _run_deferred(
@@ -132,6 +145,7 @@ async def _run_deferred(
         actor_id=_actor_id(interaction),
         response_kind=response_kind,
         ephemeral=ephemeral,
+        metrics_store=services.store,
     )
 
 
@@ -378,6 +392,345 @@ class LootDropView(discord.ui.View):
         return callback
 
 
+def _launcher_snapshot(services: BotServices, characters: CharacterService) -> dict[str, int | None]:
+    items = services.inventory.browse()
+    character_rows = characters.list_characters()
+    with services.store.connection_lock:
+        active = services.store._require_connection().execute(
+            "SELECT session_number FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
+        ).fetchone()
+    return {
+        "stash_count": len(items),
+        "active_session_number": int(active["session_number"]) if active else None,
+        "unresolved_estates": sum(1 for row in character_rows if row["lifecycle"] != "ACTIVE"),
+    }
+
+
+def _render_launcher(snapshot: dict[str, int | None]) -> str:
+    session = (
+        f"Session {snapshot['active_session_number']} active"
+        if snapshot["active_session_number"] is not None
+        else "No active session"
+    )
+    lines = [
+        "**QUARTERMASTER**",
+        "",
+        f"Party Stash · {snapshot['stash_count']} entries",
+        session,
+    ]
+    estates = int(snapshot["unresolved_estates"] or 0)
+    if estates:
+        suffix = "estate" if estates == 1 else "estates"
+        lines.append(f"{estates} unresolved character {suffix}")
+    return "\n".join(lines)
+
+
+async def _launcher_admin(interaction: discord.Interaction, settings: Settings) -> bool:
+    if not _in_configured_guild(interaction, settings) or not await _is_dm(interaction, settings):
+        await _send_error(interaction, "Only configured DM administrators can use the Quartermaster launcher.")
+        return False
+    return True
+
+
+async def _launcher_stash(interaction: discord.Interaction, services: BotServices, settings: Settings) -> None:
+    if not _in_configured_guild(interaction, settings):
+        await _send_error(interaction, "This bot is configured for a different guild.")
+        return
+    try:
+        execution = await _run_fast(interaction, services.store, settings, services.inventory.browse, ephemeral=True)
+        await _send_execution(
+            interaction,
+            execution,
+            _render_stash(execution.value),
+            ephemeral=True,
+            view=PartyStashView(services.inventory, settings),
+        )
+    except InventoryError as error:
+        await _send_error(interaction, f"Party Stash could not be opened: {error}")
+
+
+async def _launcher_loot(
+    interaction: discord.Interaction,
+    services: BotServices,
+    loot: LootDropService,
+    settings: Settings,
+) -> None:
+    if not _in_configured_guild(interaction, settings):
+        await _send_error(interaction, "This bot is configured for a different guild.")
+        return
+    try:
+        execution = await _run_fast(
+            interaction,
+            services.store,
+            settings,
+            lambda: loot.prepare_claim_view(actor_id=_actor_id(interaction)),
+            ephemeral=True,
+        )
+        prepared = execution.value
+        await _send_execution(
+            interaction,
+            execution,
+            _render_loot(prepared["drops"]),
+            ephemeral=True,
+            view=LootDropView(loot, settings, _actor_id(interaction), prepared["drops"], prepared["handles"]),
+        )
+    except LootDropError as error:
+        await _send_error(interaction, f"Loot Drops could not be opened: {error}")
+
+
+async def _launcher_treasury(
+    interaction: discord.Interaction,
+    services: BotServices,
+    currency: CurrencyService,
+    settings: Settings,
+) -> None:
+    if not _in_configured_guild(interaction, settings):
+        await _send_error(interaction, "This bot is configured for a different guild.")
+        return
+    try:
+        execution = await _run_fast(interaction, services.store, settings, currency.view_treasury, ephemeral=True)
+        await _send_execution(
+            interaction,
+            execution,
+            f"Treasury: {format_currency(execution.value)}",
+            ephemeral=True,
+        )
+    except CurrencyError as error:
+        await _send_error(interaction, f"Treasury could not be read: {error}")
+
+
+async def _launcher_characters(
+    interaction: discord.Interaction,
+    characters: CharacterService,
+    settings: Settings,
+) -> None:
+    if not _in_configured_guild(interaction, settings):
+        await _send_error(interaction, "This bot is configured for a different guild.")
+        return
+    rows = await asyncio.to_thread(characters.list_characters)
+    if not rows:
+        message = "No characters are registered."
+    else:
+        message = "\n".join(f"{row['name']} · `{row['id']}` · {row['lifecycle']}" for row in rows)
+    await interaction.response.send_message(message, ephemeral=True)
+
+
+async def _launcher_export(interaction: discord.Interaction, services: BotServices) -> None:
+    try:
+        execution = await _run_deferred(
+            interaction,
+            services,
+            lambda: {"export": render_export(services.store)},
+            response_kind="export",
+            ephemeral=True,
+        )
+        await _send_deferred_export(interaction, execution)
+    except DeferredExecutionError as error:
+        await _send_error(interaction, str(error))
+
+
+async def _launcher_backup(interaction: discord.Interaction, services: BotServices, settings: Settings) -> None:
+    try:
+        execution = await _run_deferred(
+            interaction,
+            services,
+            lambda: create_scheduled_backup(
+                services.store,
+                settings.backup_directory,
+                off_device_directory=settings.backup_off_device_directory,
+                retention_count=settings.backup_retention_count,
+            ),
+            response_kind="backup",
+            ephemeral=True,
+        )
+        await _send_deferred_backup(interaction, execution)
+    except DeferredExecutionError as error:
+        await _send_error(interaction, str(error))
+
+
+class LauncherMoreView(discord.ui.View):
+    def __init__(
+        self,
+        services: BotServices,
+        settings: Settings,
+        characters: CharacterService,
+        currency: CurrencyService,
+        loot: LootDropService,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.services = services
+        self.settings = settings
+        self.characters = characters
+        self.currency = currency
+        self.loot = loot
+
+    @discord.ui.button(label="Stash", style=discord.ButtonStyle.secondary, custom_id="qm:launcher:stash")
+    async def stash(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if await _launcher_admin(interaction, self.settings):
+            await _launcher_stash(interaction, self.services, self.settings)
+
+    @discord.ui.button(label="Open Loot", style=discord.ButtonStyle.secondary, custom_id="qm:launcher:loot")
+    async def loot_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if await _launcher_admin(interaction, self.settings):
+            await _launcher_loot(interaction, self.services, self.loot, self.settings)
+
+    @discord.ui.button(label="Treasury", style=discord.ButtonStyle.secondary, custom_id="qm:launcher:treasury")
+    async def treasury(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if await _launcher_admin(interaction, self.settings):
+            await _launcher_treasury(interaction, self.services, self.currency, self.settings)
+
+    @discord.ui.button(label="Characters", style=discord.ButtonStyle.secondary, custom_id="qm:launcher:characters")
+    async def characters_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if await _launcher_admin(interaction, self.settings):
+            await _launcher_characters(interaction, self.characters, self.settings)
+
+    @discord.ui.button(label="Export", style=discord.ButtonStyle.primary, custom_id="qm:launcher:export")
+    async def export(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if await _launcher_admin(interaction, self.settings):
+            await _launcher_export(interaction, self.services)
+
+    @discord.ui.button(label="Backup", style=discord.ButtonStyle.primary, custom_id="qm:launcher:backup")
+    async def backup(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if await _launcher_admin(interaction, self.settings):
+            await _launcher_backup(interaction, self.services, self.settings)
+
+    @discord.ui.button(label="Health", style=discord.ButtonStyle.secondary, custom_id="qm:launcher:health")
+    async def health(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await _launcher_admin(interaction, self.settings):
+            return
+        execution = await _run_fast(
+            interaction,
+            self.services.store,
+            self.settings,
+            lambda: render_health(health_report(self.services.store)),
+            ephemeral=True,
+        )
+        await _send_execution(interaction, execution, execution.value, ephemeral=True)
+
+    @discord.ui.button(label="Metrics", style=discord.ButtonStyle.secondary, custom_id="qm:launcher:metrics")
+    async def metrics(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await _launcher_admin(interaction, self.settings):
+            return
+        execution = await _run_fast(
+            interaction,
+            self.services.store,
+            self.settings,
+            lambda: render_metrics(metric_report(self.services.store)),
+            ephemeral=True,
+        )
+        await _send_execution(interaction, execution, execution.value, ephemeral=True)
+
+
+class GrantLootModal(discord.ui.Modal, title="Grant loot"):
+    item_name = discord.ui.TextInput(label="Item", placeholder="Silvered dagger", max_length=100)
+    quantity = discord.ui.TextInput(label="Quantity", placeholder="1", max_length=7)
+    provenance = discord.ui.TextInput(label="Provenance", required=False, max_length=200)
+
+    def __init__(self, inventory: InventoryService, settings: Settings) -> None:
+        super().__init__()
+        self.inventory = inventory
+        self.settings = settings
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _launcher_admin(interaction, self.settings):
+            return
+        try:
+            quantity = int(str(self.quantity.value).strip())
+        except ValueError:
+            await _send_error(interaction, "Quantity must be a positive whole number.")
+            return
+        if quantity <= 0:
+            await _send_error(interaction, "Quantity must be a positive whole number.")
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                self.inventory.store,
+                self.settings,
+                lambda: self.inventory.grant_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    item_name=str(self.item_name.value),
+                    quantity=quantity,
+                    provenance=str(self.provenance.value).strip() or None,
+                ),
+                ephemeral=True,
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
+                f"Granted {response['quantity']} {response['item_name']}. Total: {response['new_quantity']}.",
+                ephemeral=True,
+            )
+        except InventoryError as error:
+            await _send_error(interaction, f"Loot could not be granted: {error}")
+
+
+class QuartermasterLauncherView(discord.ui.View):
+    def __init__(
+        self,
+        services: BotServices,
+        settings: Settings,
+        characters: CharacterService,
+        currency: CurrencyService,
+        loot: LootDropService,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.services = services
+        self.settings = settings
+        self.characters = characters
+        self.currency = currency
+        self.loot = loot
+
+    @discord.ui.button(label="Grant loot", style=discord.ButtonStyle.primary, custom_id="qm:launcher:grant")
+    async def grant(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if await _launcher_admin(interaction, self.settings):
+            await interaction.response.send_modal(GrantLootModal(self.services.inventory, self.settings))
+
+    @discord.ui.button(label="Session", style=discord.ButtonStyle.primary, custom_id="qm:launcher:session")
+    async def session(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await _launcher_admin(interaction, self.settings):
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                self.services.store,
+                self.settings,
+                lambda: self.services.sessions.start_interaction(
+                    str(interaction.id), actor_id=_actor_id(interaction)
+                ),
+                ephemeral=True,
+            )
+            response = execution.value.logical_response
+            if response["status"] == "ACTIVE_EXISTS":
+                message = (
+                    f"Session {response['active_session_number']} is still active. "
+                    "End it explicitly with /session-end before starting another."
+                )
+            else:
+                message = f"Session {response['session_number']} started."
+            await _send_execution(interaction, execution, message, ephemeral=True)
+        except SessionError as error:
+            await _send_error(interaction, f"Session could not be started: {error}")
+
+    @discord.ui.button(label="More…", style=discord.ButtonStyle.secondary, custom_id="qm:launcher:more")
+    async def more(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await _launcher_admin(interaction, self.settings):
+            return
+        await interaction.response.send_message(
+            "Quartermaster admin actions",
+            ephemeral=True,
+            view=LauncherMoreView(
+                self.services,
+                self.settings,
+                self.characters,
+                self.currency,
+                self.loot,
+            ),
+        )
+
+
 def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
     intents = discord.Intents.none()
     bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
@@ -387,6 +740,29 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
     loot = services.loot or LootDropService(services.store, services.receipts, HandleRepository(services.store))
     characters = services.characters or CharacterService(services.store, services.receipts)
     currency = services.currency or CurrencyService(services.store, services.receipts, handles=HandleRepository(services.store))
+
+    @bot.tree.command(name="quartermaster", description="Open the Quartermaster admin launcher")
+    @app_commands.guilds(guild)
+    async def quartermaster(interaction: discord.Interaction) -> None:
+        started_at = monotonic()
+        await interaction.response.defer(ephemeral=True)
+        asyncio.create_task(
+            asyncio.to_thread(
+                record_metric,
+                services.store,
+                "interaction_ack_latency_ms",
+                (monotonic() - started_at) * 1000,
+                dimension="DEFERRED",
+            )
+        )
+        if not await _launcher_admin(interaction, settings):
+            return
+        snapshot = await asyncio.to_thread(_launcher_snapshot, services, characters)
+        await interaction.followup.send(
+            _render_launcher(snapshot),
+            ephemeral=True,
+            view=QuartermasterLauncherView(services, settings, characters, currency, loot),
+        )
 
     @bot.tree.command(name="stash", description="View the Party Stash")
     @app_commands.guilds(guild)

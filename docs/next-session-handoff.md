@@ -5,7 +5,7 @@ Updated: 2026-08-11
 ## Verified current state
 
 - Python project managed with `uv` and `.venv`.
-- SQLite canonical state is at schema version 7.
+- SQLite canonical state is at schema version 8.
 - FAST and DEFERRED interaction receipts are implemented.
 - Opaque single-use mutation handles are implemented.
 - Bot startup now recovers interrupted DEFERRED receipts and runs transient-state maintenance before accepting interactions.
@@ -15,10 +15,12 @@ Updated: 2026-08-11
 - Minimal Session lifecycle is implemented.
 - State projection scheduling and FIFO event delivery are implemented; session projections bind to durable per-session Discord threads.
 - The `discord.py` adapter exposes guild-scoped `/stash`, `/grant`, `/session-start`, `/session-end`, `/loot`, `/loot-drop`, `/loot-close`, and DM-admin `/export`.
-- Discord projection delivery and bounded local interaction work run asynchronously after database commit, with deadline-aware response deferral at the configured soft deadline. `/export` uses the adapter-level durable `PROCESSING -> COMMITTED/FAILED` workflow; backup remains an operator CLI path.
+- The `discord.py` adapter also exposes DM/admin `/quartermaster`, an ephemeral launcher summarizing Party Stash/session state with Grant loot, Session, Stash, Loot, Treasury, Characters, Export, Backup, Health, and Metrics actions backed by the existing workflows.
+- Discord projection delivery and bounded local interaction work run asynchronously after database commit, with deadline-aware response deferral at the configured soft deadline. `/export` and admin-only `/backup` use durable `PROCESSING -> COMMITTED/FAILED` workflows; the CLI remains available for operator-triggered backups.
 - Online backups create timestamped validated snapshots, optionally copy them to a secondary directory, apply retention, and record their paths and outcome for health checks.
 - The projection runner now creates a validated timestamped backup immediately at startup and repeats it on the configurable `QM_BACKUP_INTERVAL_SECONDS` schedule, using the configured primary/off-device directories and retention count.
 - Runtime health now records Discord surface reachability for the configured Party Inventory and Session Log channels; missing, failed, or stale checks report `DEGRADED`.
+- Local aggregate metrics are implemented in schema 8: hourly bounded histograms report ACK p50/p95/max by execution class and projection dirty-duration p50/p95/max by target. They retain no actor or interaction identity and are available through the CLI `metrics` command and launcher Metrics action.
 - Adapter acceptance coverage now includes configured DM-role/manage-guild authorization, pin-permission failures, Discord 429 retry translation, and the adapter FAST-to-DEFERRED acknowledgement path.
 - The first treasury/currency slice is implemented: schema-backed integer balances, DM-only treasury adjustments with FAST receipts, non-negative validation, ledger/events, Party Stash/export visibility, and guild-scoped `/treasury` plus `/treasury-adjust` commands. Electrum remains schema-supported but disabled by default.
 - Absolute treasury split and treasury-to-active-character transfers are implemented atomically, preserving per-denomination remainders and rejecting non-active recipients; `/treasury-split` and `/treasury-give` are now registered.
@@ -30,7 +32,7 @@ Updated: 2026-08-11
 - Operational commands now cover `health`, `maintenance`, `backup`, and safe restore validation.
 - Managed Windows process wrappers are in `scripts/start-quartermaster.ps1` and `scripts/stop-quartermaster.ps1`.
 - Operator procedures for backup/restore and degraded operation are documented in `docs/runbook.md`.
-- 53 automated tests pass with `uv`.
+- 55 automated tests pass with `uv`.
 
 ## Live Discord setup
 
@@ -40,7 +42,7 @@ Updated: 2026-08-11
 - Session log channel: `#session-log` (`1536122560322863224`)
 - Quartermaster application/bot ID: `1536120052871602256`
 - The bot can view, send, edit, read, and pin the configured Party Stash projection in `#party-inventory`; the permanent projection is currently pinned.
-- The bot is currently being run as an ad-hoc background `uv run` process; its PID is not stable.
+- The bot is currently being run through the managed Windows supervisor wrapper; the wrapper records the supervisor PID, restarts an unexpected bot exit, and stops the full supervised process tree cleanly.
 - The bot token remains only in the user-level environment variable `QM_DISCORD_TOKEN`.
 - Guild, channel, and database configuration is persisted as user-level environment variables.
 - `QM_DM_ROLE_IDS` is currently unset. The server owner is accepted as a DM administrator; additional DMs need configured role IDs.
@@ -68,11 +70,19 @@ The scheduled-operations verification completed on 2026-08-11: the managed proce
 
 Signed-in browser verification completed on 2026-08-11: `/treasury` was offered by the guild command picker and returned the current treasury response in about 7 seconds end-to-end; the permanent Party Stash pin was visible through Discord's pinned-messages view.
 
+Signed-in browser verification completed on 2026-08-11: after restarting the managed process, admin-only `/backup` returned `Backup completed` with schema 7 validation; the durable receipt was `COMMITTED` and the timestamped snapshot `quartermaster-20260811-085908Z.sqlite` exists. The first attempt occurred while the recorded PID was stale and correctly exposed that the bot was not running.
+
+Managed-process resilience verification completed on 2026-08-11: killing the validated bot process caused the supervisor to restart a new `uv`/Python tree; the intentional stop path removed the supervisor and all descendants without leaving orphan Quartermaster processes, and a clean restart returned health to `HEALTHY`.
+
+Signed-in browser verification completed on 2026-08-11: `/quartermaster` appeared in the guild command picker, returned the expected ephemeral launcher, and `More…` opened the Stash, Open Loot, Treasury, Characters, Export, Backup, and Health actions.
+
+Schema-8 live verification completed on 2026-08-11: the managed restart applied the local metrics migration, health returned `HEALTHY`, `/quartermaster` returned after the deadline-safe acknowledgement change, and the CLI metrics report contained deferred launcher and fast action ACK samples.
+
 ## Deliberate test state still present
 
 - Party Stash contains `Smoke-Test Potion x2`.
 - The former smoke-test Loot Drop is closed; its `Live Loot Token x2` is back in Party Stash.
-- Treat these items as acceptance fixtures, not campaign data, until the live verification is complete.
+- Treat these items as acceptance fixtures retained for cleanup/audit, not campaign data.
 
 ## Acceptance checks completed
 
@@ -103,7 +113,7 @@ The post-restart runtime and routing pass completed successfully:
 
 The local operational acceptance checks are complete:
 
-- `uv run pytest -q` -> 52 passed.
+- `uv run pytest -q` -> 55 passed.
 - `python -m compileall -q src tests` and `git diff --check` passed.
 - `health` -> `HEALTHY`; database, schema, backup, receipts, outbox, session, and state-projection checks all pass.
 - Online backup -> integrity and schema validation passed.
@@ -114,10 +124,13 @@ The live test data intentionally remains visible for cleanup/audit: Party Stash 
 
 ## Next implementation priorities
 
-After the completed live verification:
+The core implementation and live acceptance checks are complete. The current deployment decision is local-only backup storage: leave `QM_BACKUP_OFF_DEVICE_DIRECTORY` unset. Off-device backup support remains available for a later deployment, but it is not a blocker for this local setup.
 
-1. Observe the new admin-only Discord `/backup` workflow on the target host and confirm the durable receipt and resulting snapshot path in a controlled maintenance window.
-2. Evaluate any further evidence-gated character/currency UX using the live command and latency evidence now collected.
+Remaining work is operational evidence and evidence-gated product evaluation:
+
+1. Exercise the degraded fallback path end-to-end: stop Discord delivery, continue through CLI/export/backup, restart, and verify projection convergence.
+2. Repeat the local metrics collection during ordinary use and choose evidence-based latency/freshness budgets if the current estimates need refinement.
+3. Evaluate any further evidence-gated character/currency UX using the live command and latency evidence now collected.
 
 The larger optional domains - Your Pack, Journal, Parking Lot, Downtime, faction clocks, rich continuity, and Undo - remain evidence-gated and should not be started yet.
 

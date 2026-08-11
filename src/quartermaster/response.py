@@ -9,6 +9,7 @@ from threading import Lock
 from time import monotonic
 from typing import Any, Callable
 
+from .metrics import record_metric
 from .receipts import ReceiptRepository, ReceiptResult
 
 
@@ -26,12 +27,18 @@ class ResponseStateError(RuntimeError):
 class FastExecutionResult:
     value: Any
     deferred: bool
+    started_at: float = 0.0
+    ack_latency_ms: float | None = None
+    metrics_store: Any | None = None
 
 
 @dataclass(frozen=True)
 class DeferredExecutionResult:
     receipt: ReceiptResult
     deferred: bool
+    started_at: float = 0.0
+    ack_latency_ms: float | None = None
+    metrics_store: Any | None = None
 
 
 class DeferredExecutionError(RuntimeError):
@@ -85,22 +92,41 @@ async def execute_fast(
     soft_deadline_seconds: float = 1.2,
     write_active: Callable[[], bool] | None = None,
     ephemeral: bool = False,
+    metrics_store: Any | None = None,
 ) -> FastExecutionResult:
     """Run bounded local work without blocking Discord's acknowledgement loop."""
     if soft_deadline_seconds <= 0:
         raise ValueError("soft deadline must be positive")
-    controller = ResponseController(soft_deadline_seconds=soft_deadline_seconds)
+    started_at = monotonic()
+    controller = ResponseController(started_at=started_at, soft_deadline_seconds=soft_deadline_seconds)
     task = asyncio.create_task(asyncio.to_thread(operation))
     done, _ = await asyncio.wait({task}, timeout=soft_deadline_seconds)
     active = write_active() if write_active is not None else False
     if not done and not active:
         controller.defer()
         await interaction.response.defer(ephemeral=ephemeral)
-        return FastExecutionResult(await task, True)
+        ack_latency_ms = (monotonic() - started_at) * 1000
+        if metrics_store is not None:
+            asyncio.create_task(
+                asyncio.to_thread(
+                    record_metric,
+                    metrics_store,
+                    "interaction_ack_latency_ms",
+                    ack_latency_ms,
+                    dimension="DEFERRED",
+                )
+            )
+        return FastExecutionResult(
+            await task,
+            True,
+            started_at=started_at,
+            ack_latency_ms=ack_latency_ms,
+            metrics_store=metrics_store,
+        )
 
     value = await task
     controller.respond(value)
-    return FastExecutionResult(value, False)
+    return FastExecutionResult(value, False, started_at=started_at, metrics_store=metrics_store)
 
 
 async def execute_deferred(
@@ -111,8 +137,10 @@ async def execute_deferred(
     actor_id: str | None,
     response_kind: str,
     ephemeral: bool = False,
+    metrics_store: Any | None = None,
 ) -> DeferredExecutionResult:
     """Persist PROCESSING before acknowledgement and finish in a worker thread."""
+    started_at = monotonic()
     interaction_id = str(interaction.id)
     initial = await asyncio.to_thread(
         receipts.begin_deferred,
@@ -121,9 +149,20 @@ async def execute_deferred(
         response_kind=response_kind,
     )
     if initial.status != "PROCESSING":
-        return DeferredExecutionResult(initial, False)
+        return DeferredExecutionResult(initial, False, started_at=started_at, metrics_store=metrics_store)
 
     await interaction.response.defer(ephemeral=ephemeral)
+    ack_latency_ms = (monotonic() - started_at) * 1000
+    if metrics_store is not None:
+        asyncio.create_task(
+            asyncio.to_thread(
+                record_metric,
+                metrics_store,
+                "interaction_ack_latency_ms",
+                ack_latency_ms,
+                dimension="DEFERRED",
+            )
+        )
     try:
         value = await asyncio.to_thread(operation)
     except Exception as error:
@@ -134,4 +173,10 @@ async def execute_deferred(
         )
         raise DeferredExecutionError(failure) from error
     committed = await asyncio.to_thread(receipts.commit_deferred, interaction_id, value)
-    return DeferredExecutionResult(committed, True)
+    return DeferredExecutionResult(
+        committed,
+        True,
+        started_at=started_at,
+        ack_latency_ms=ack_latency_ms,
+        metrics_store=metrics_store,
+    )

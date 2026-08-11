@@ -9,7 +9,7 @@ from threading import RLock
 from typing import Iterator
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class MigrationError(RuntimeError):
@@ -197,6 +197,20 @@ MIGRATIONS: dict[int, str] = {
     );
     INSERT INTO currency_balances(owner_type, owner_id, updated_at)
     VALUES ('PARTY', 'party', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+    """,
+    8: """
+    CREATE TABLE local_metric_buckets (
+        bucket_start TEXT NOT NULL,
+        metric_name TEXT NOT NULL,
+        dimension TEXT NOT NULL DEFAULT '',
+        sample_count INTEGER NOT NULL CHECK (sample_count >= 0),
+        total_ms REAL NOT NULL CHECK (total_ms >= 0),
+        max_ms REAL NOT NULL CHECK (max_ms >= 0),
+        histogram TEXT NOT NULL,
+        PRIMARY KEY (bucket_start, metric_name, dimension)
+    );
+    CREATE INDEX local_metric_buckets_window_idx
+        ON local_metric_buckets(metric_name, dimension, bucket_start);
     """,
 }
 

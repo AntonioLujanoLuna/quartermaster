@@ -11,6 +11,7 @@ from typing import Any, Callable
 from .clock import iso_now
 from .currency import currency_from_row
 from .db import SQLiteStore
+from .metrics import record_metric
 from .transport import DiscordTransport, RateLimitedError
 
 
@@ -121,6 +122,12 @@ class StateProjectionScheduler:
 
     def _record_success(self, target: Any, message_id: str) -> None:
         target_id = target["target_id"]
+        dirty_duration_ms: float | None = None
+        now = self.now()
+        if target["dirty_since"]:
+            dirty_at = datetime.fromisoformat(str(target["dirty_since"]).replace("Z", "+00:00"))
+            now_at = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            dirty_duration_ms = max(0.0, (now_at - dirty_at).total_seconds() * 1000)
         with self.store.transaction() as connection:
             current = connection.execute("SELECT desired_revision FROM projection_targets WHERE target_id = ?", (target_id,)).fetchone()
             delivered = int(current["desired_revision"]) if current else int(target["desired_revision"])
@@ -130,7 +137,15 @@ class StateProjectionScheduler:
                        dirty_since = CASE WHEN desired_revision <= ? THEN NULL ELSE dirty_since END,
                        in_flight = 0, next_attempt_at = NULL, last_error = NULL, updated_at = ?
                  WHERE target_id = ?""",
-                (message_id, delivered, delivered, self.now(), target_id),
+                (message_id, delivered, delivered, now, target_id),
+            )
+        if dirty_duration_ms is not None:
+            record_metric(
+                self.store,
+                "projection_dirty_duration_ms",
+                dirty_duration_ms,
+                dimension=str(target_id),
+                at=now,
             )
 
     def _claim_next_target(self) -> Any:
