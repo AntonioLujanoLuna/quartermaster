@@ -169,6 +169,7 @@ class DiscordProjectionTransport:
             return str(message.id)
         except discord.NotFound:
             message = await channel.send(content)
+            await self._ensure_pinned(target_id, message)
             return str(message.id)
         except discord.HTTPException as error:
             if error.status == 429:

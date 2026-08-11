@@ -102,10 +102,13 @@ async def _send_execution(
     ephemeral: bool = False,
     view: discord.ui.View | None = None,
 ) -> None:
+    kwargs: dict[str, object] = {"ephemeral": ephemeral}
+    if view is not None:
+        kwargs["view"] = view
     if execution.deferred:
-        await interaction.followup.send(message, ephemeral=ephemeral, view=view)
+        await interaction.followup.send(message, **kwargs)
     else:
-        await interaction.response.send_message(message, ephemeral=ephemeral, view=view)
+        await interaction.response.send_message(message, **kwargs)
 
 
 async def _run_deferred(

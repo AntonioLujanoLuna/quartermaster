@@ -45,6 +45,16 @@ def append_event(
     return sequence
 
 
+def session_event_destination(connection: Any, session_id: str | None = None) -> str:
+    """Resolve an event destination to a durable session identity."""
+    if session_id is None:
+        active = connection.execute(
+            "SELECT id FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
+        ).fetchone()
+        session_id = str(active["id"]) if active is not None else None
+    return f"session:{session_id}" if session_id is not None else "session:unassigned"
+
+
 def mark_projection_dirty(connection: Any, *, target_id: str, target_type: str, destination: str) -> None:
     now = iso_now()
     freshness_budget, priority = _PROJECTION_DEFAULTS.get(target_id, (5.0, 0))
@@ -55,6 +65,7 @@ def mark_projection_dirty(connection: Any, *, target_id: str, target_type: str, 
             freshness_budget_seconds, priority, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(target_id) DO UPDATE SET
+            destination = excluded.destination,
             dirty_since = COALESCE(projection_targets.dirty_since, excluded.dirty_since),
             desired_revision = MAX(projection_targets.desired_revision, excluded.desired_revision),
             updated_at = excluded.updated_at""",

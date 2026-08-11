@@ -8,7 +8,7 @@ from typing import Any
 
 from .clock import iso_now
 from .db import SQLiteStore
-from .events import append_event, mark_projection_dirty
+from .events import append_event, mark_projection_dirty, session_event_destination
 from .handles import Handle, HandleError, HandleRepository
 from .receipts import ReceiptRepository, ReceiptResult
 
@@ -69,7 +69,7 @@ class InventoryService:
                 "UPDATE inventory_stacks SET quantity = ?, version = version + 1, provenance = COALESCE(?, provenance), last_acquired_at = ?, updated_at = ? WHERE id = ?",
                 (new_quantity, provenance, now, now, stack_id),
             )
-        append_event(connection, operation_id=operation_id, actor_id=actor_id, event_type="ITEM_GRANTED", payload={"stack_id": stack_id, "item_name": item_name.strip(), "quantity": quantity, "new_quantity": new_quantity, "provenance": provenance}, destination="session:active")
+        append_event(connection, operation_id=operation_id, actor_id=actor_id, event_type="ITEM_GRANTED", payload={"stack_id": stack_id, "item_name": item_name.strip(), "quantity": quantity, "new_quantity": new_quantity, "provenance": provenance}, destination=session_event_destination(connection))
         mark_projection_dirty(connection, target_id="party-stash", target_type="STATE", destination="party-inventory")
         return {"status": "GRANTED", "stack_id": stack_id, "item_name": item_name.strip(), "quantity": quantity, "new_quantity": new_quantity}
 
@@ -184,7 +184,7 @@ class InventoryService:
             connection.execute("DELETE FROM inventory_stacks WHERE id = ?", (stack_id,))
         else:
             connection.execute("UPDATE inventory_stacks SET quantity = ?, version = version + 1, updated_at = ? WHERE id = ?", (remaining, now, stack_id))
-        append_event(connection, operation_id=operation_id, actor_id=actor_id, event_type="ITEM_TAKEN", payload={"stack_id": stack_id, "item_name": row["item_name"], "quantity": amount, "remaining": remaining}, destination="session:active")
+        append_event(connection, operation_id=operation_id, actor_id=actor_id, event_type="ITEM_TAKEN", payload={"stack_id": stack_id, "item_name": row["item_name"], "quantity": amount, "remaining": remaining}, destination=session_event_destination(connection))
         mark_projection_dirty(connection, target_id="party-stash", target_type="STATE", destination="party-inventory")
         return {"status": "TAKEN", "stack_id": stack_id, "item_name": row["item_name"], "quantity": amount, "remaining": remaining}
 

@@ -23,6 +23,7 @@ from quartermaster.receipts import ReceiptRepository
 from quartermaster.recovery import recover_startup
 from quartermaster.response import (
     DeferredExecutionError,
+    FastExecutionResult,
     ResponseController,
     ResponseState,
     ResponseStateError,
@@ -339,6 +340,27 @@ class QuartermasterCoreTests(unittest.TestCase):
             {"stash", "grant", "loot", "loot-drop", "loot-close", "export", "session-start", "session-end"},
         )
 
+    def test_discord_response_helper_omits_empty_view(self) -> None:
+        from quartermaster.discord_adapter import _send_execution
+
+        class Response:
+            def __init__(self) -> None:
+                self.kwargs: dict[str, object] | None = None
+
+            def is_done(self) -> bool:
+                return False
+
+            async def send_message(self, _message: str, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        class Interaction:
+            def __init__(self) -> None:
+                self.response = Response()
+
+        interaction = Interaction()
+        asyncio.run(_send_execution(interaction, FastExecutionResult({}, False), "ok"))
+        self.assertEqual(interaction.response.kwargs, {"ephemeral": False})
+
     def test_session_projection_binds_and_reuses_a_discord_thread(self) -> None:
         session = self.sessions.start_session()
 
@@ -378,6 +400,69 @@ class QuartermasterCoreTests(unittest.TestCase):
             "SELECT discord_thread_id FROM sessions WHERE id = ?", (session["session_id"],)
         ).fetchone()
         self.assertEqual(stored["discord_thread_id"], "987")
+
+    def test_session_projection_destination_moves_to_the_new_session(self) -> None:
+        first = self.sessions.start_session()
+        self.sessions.end_session(first["session_id"], where_ended="First endpoint")
+        second = self.sessions.start_session()
+
+        destination = self.store.connection.execute(
+            "SELECT destination FROM projection_targets WHERE target_id = 'session-surface'"
+        ).fetchone()["destination"]
+        self.assertEqual(destination, f"session:{second['session_id']}")
+
+    def test_inventory_events_bind_to_the_session_at_mutation_time(self) -> None:
+        first = self.sessions.start_session()
+        self.inventory.grant_interaction("session-bound-grant-1", actor_id="dm", item_name="Session Token", quantity=1)
+        self.sessions.end_session(first["session_id"], where_ended="First endpoint")
+        second = self.sessions.start_session()
+        self.inventory.grant_interaction("session-bound-grant-2", actor_id="dm", item_name="Session Token", quantity=1)
+
+        destinations = [
+            row["destination"]
+            for row in self.store.connection.execute(
+                "SELECT destination FROM event_outbox WHERE event_type = 'ITEM_GRANTED' ORDER BY id"
+            ).fetchall()
+        ]
+        self.assertEqual(destinations, [f"session:{first['session_id']}", f"session:{second['session_id']}"])
+
+    def test_deleted_party_stash_projection_is_recreated_and_pinned(self) -> None:
+        import discord
+        from types import SimpleNamespace
+
+        class Message:
+            id = 456
+            pinned = False
+
+            async def pin(self, *, reason: str) -> None:
+                self.pinned = True
+
+        class Channel:
+            def __init__(self) -> None:
+                self.message = Message()
+
+            async def fetch_message(self, _message_id: int) -> object:
+                raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "missing")
+
+            async def send(self, _content: str) -> Message:
+                return self.message
+
+        class Bot:
+            async def fetch_channel(self, _channel_id: int) -> Channel:
+                return channel
+
+        channel = Channel()
+        transport = DiscordProjectionTransport(
+            Bot(),
+            Settings(guild_id="123", database_path=self.db_path, party_inventory_channel_id="789"),
+            self.store,
+        )
+
+        message_id = asyncio.run(
+            transport.upsert_state("party-stash", "party-inventory", {"items": []}, "123")
+        )
+        self.assertEqual(message_id, "456")
+        self.assertTrue(channel.message.pinned)
 
     def test_session_start_is_explicit_when_an_active_session_exists(self) -> None:
         first = self.sessions.start_session()

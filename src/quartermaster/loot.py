@@ -23,7 +23,7 @@ def _expiry_after(hours: int) -> str:
 
 
 def _event_destination(session_id: str | None) -> str:
-    return f"session:{session_id}" if session_id else "session:active"
+    return f"session:{session_id}" if session_id else "session:unassigned"
 
 
 class LootDropService:
