@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from quartermaster.db import SCHEMA_VERSION, SQLiteStore
-from quartermaster.integration import ProviderIntegrationService, ProviderResult, ProviderTimeout
+from quartermaster.integration import AvraeInteractionContext, ProviderIntegrationError, ProviderIntegrationService, ProviderResult, ProviderTimeout
 from quartermaster.operations import health_report
 from quartermaster.receipts import ReceiptRepository
 
@@ -45,6 +45,34 @@ class ProviderIntegrationTests(unittest.TestCase):
         }
         self.assertIn("provider_reference", columns)
         self.assertIn("result_payload", columns)
+
+    def test_avrae_context_preserves_real_actor_and_native_channel_identity(self) -> None:
+        from types import SimpleNamespace
+
+        context = AvraeInteractionContext.from_interaction(
+            SimpleNamespace(
+                author=SimpleNamespace(id=17),
+                guild=SimpleNamespace(id=23),
+                channel=SimpleNamespace(id=29),
+            ),
+            session_id="session-1",
+        )
+        self.assertEqual(context.begin_kwargs(), {
+            "actor_id": "17",
+            "guild_id": "23",
+            "channel_id": "29",
+            "session_id": "session-1",
+            "provider_reference": "channel:29",
+        })
+
+    def test_avrae_context_rejects_dm_or_missing_session(self) -> None:
+        from types import SimpleNamespace
+
+        with self.assertRaises(ProviderIntegrationError):
+            AvraeInteractionContext.from_interaction(
+                SimpleNamespace(author=SimpleNamespace(id=17), guild=None, channel=SimpleNamespace(id=29)),
+                session_id="session-1",
+            )
 
     def test_request_and_receipt_are_created_atomically_and_replayed(self) -> None:
         first = self._begin()

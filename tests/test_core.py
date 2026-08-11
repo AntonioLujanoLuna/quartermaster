@@ -695,6 +695,7 @@ class QuartermasterCoreTests(unittest.TestCase):
             {command.name for command in commands},
             {
                 "quartermaster",
+                "combat",
                 "stash",
                 "grant",
                 "loot",

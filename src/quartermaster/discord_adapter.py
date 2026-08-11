@@ -14,6 +14,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from .avrae_handoff import AvraeHandoffError, AvraeHandoffService
 from .config import Settings
 from .characters import CharacterError, CharacterService
 from .currency import CurrencyError, CurrencyService, format_currency
@@ -48,6 +49,7 @@ class BotServices:
     characters: CharacterService | None = None
     currency: CurrencyService | None = None
     loot: LootDropService | None = None
+    avrae_handoff: AvraeHandoffService | None = None
 
 
 def _actor_id(interaction: discord.Interaction) -> str:
@@ -425,6 +427,30 @@ def _render_launcher(snapshot: dict[str, int | None]) -> str:
     return "\n".join(lines)
 
 
+async def _send_avrae_handoff(
+    interaction: discord.Interaction,
+    services: BotServices,
+    settings: Settings,
+    handoff: AvraeHandoffService,
+    operation_kind: str,
+) -> None:
+    if not _in_configured_guild(interaction, settings):
+        await _send_error(interaction, "This bot is configured for a different guild.")
+        return
+    try:
+        execution = await _run_fast(
+            interaction,
+            services.store,
+            settings,
+            lambda: handoff.build(operation_kind, channel_id=str(interaction.channel_id)),
+            ephemeral=True,
+        )
+        card = execution.value
+        await _send_execution(interaction, execution, card.render(), ephemeral=True)
+    except AvraeHandoffError as error:
+        await _send_error(interaction, f"Avrae handoff could not be prepared: {error}")
+
+
 async def _launcher_admin(interaction: discord.Interaction, settings: Settings) -> bool:
     if not _in_configured_guild(interaction, settings) or not await _is_dm(interaction, settings):
         await _send_error(interaction, "Only configured DM administrators can use the Quartermaster launcher.")
@@ -735,6 +761,7 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
     intents = discord.Intents.none()
     bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
     guild = discord.Object(id=int(settings.guild_id))
+    handoff = services.avrae_handoff or AvraeHandoffService(services.store)
     projection_task: asyncio.Task | None = None
     stop_event = asyncio.Event()
     loot = services.loot or LootDropService(services.store, services.receipts, HandleRepository(services.store))
@@ -763,6 +790,25 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
             ephemeral=True,
             view=QuartermasterLauncherView(services, settings, characters, currency, loot),
         )
+
+    @bot.tree.command(name="combat", description="Open the Quartermaster to Avrae combat handoff")
+    @app_commands.guilds(guild)
+    @app_commands.describe(action="The native Avrae combat action to prepare")
+    @app_commands.choices(
+        action=[
+            app_commands.Choice(name="Start combat", value="start"),
+            app_commands.Choice(name="Join combat", value="join"),
+            app_commands.Choice(name="Advance turn", value="next"),
+            app_commands.Choice(name="Attack", value="attack"),
+            app_commands.Choice(name="Cast spell", value="cast"),
+            app_commands.Choice(name="Skill check", value="check"),
+            app_commands.Choice(name="Saving throw", value="save"),
+            app_commands.Choice(name="End combat", value="end"),
+            app_commands.Choice(name="Combat status", value="status"),
+        ]
+    )
+    async def combat(interaction: discord.Interaction, action: app_commands.Choice[str]) -> None:
+        await _send_avrae_handoff(interaction, services, settings, handoff, action.value)
 
     @bot.tree.command(name="stash", description="View the Party Stash")
     @app_commands.guilds(guild)

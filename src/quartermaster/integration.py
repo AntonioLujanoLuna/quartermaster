@@ -45,6 +45,44 @@ class ProviderRequest:
 
 
 @dataclass(frozen=True)
+class AvraeInteractionContext:
+    """Identity copied from a real Avrae interaction, never inferred by Qm."""
+
+    actor_id: str
+    guild_id: str
+    channel_id: str
+    session_id: str
+    provider_reference: str
+
+    @classmethod
+    def from_interaction(cls, interaction: Any, *, session_id: str) -> "AvraeInteractionContext":
+        author = getattr(interaction, "author", None) or getattr(interaction, "user", None)
+        guild = getattr(interaction, "guild", None)
+        channel = getattr(interaction, "channel", None)
+        actor_id = getattr(author, "id", None)
+        guild_id = getattr(guild, "id", None)
+        channel_id = getattr(channel, "id", None)
+        if actor_id is None or guild_id is None or channel_id is None or not session_id.strip():
+            raise ProviderIntegrationError("Avrae interaction must include actor, guild, channel, and session")
+        return cls(
+            actor_id=str(actor_id),
+            guild_id=str(guild_id),
+            channel_id=str(channel_id),
+            session_id=session_id,
+            provider_reference=f"channel:{channel_id}",
+        )
+
+    def begin_kwargs(self) -> dict[str, str]:
+        return {
+            "actor_id": self.actor_id,
+            "guild_id": self.guild_id,
+            "channel_id": self.channel_id,
+            "session_id": self.session_id,
+            "provider_reference": self.provider_reference,
+        }
+
+
+@dataclass(frozen=True)
 class ProviderResult:
     status: str
     provider_reference: str | None = None

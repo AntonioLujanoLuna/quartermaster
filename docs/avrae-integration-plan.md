@@ -1,6 +1,6 @@
 # Quartermaster and Avrae Integration Plan
 
-Status: implementation in progress. The first Quartermaster-side boundary is implemented; Avrae-side execution remains gated on the extension spike.
+Status: implementation in progress. The Quartermaster boundary, hosted handoff, and self-hosted Avrae context-probe scaffold are implemented; live Avrae execution remains gated on a disposable deployment.
 
 Updated: 2026-08-11
 
@@ -22,6 +22,18 @@ Quartermaster now has a schema-9 `provider_operations` record linked by operatio
 
 Provider request reservation is atomic with the DEFERRED receipt, and provider finalization is atomic with the receipt outcome. Startup recovery marks an interrupted provider request `UNKNOWN`; it does not authorize an automatic retry of an attack, spell, save, or turn advance. The implementation exposes an `AvraeGateway` protocol, but it does not pretend that Quartermaster can invoke the hosted Avrae bot or calculate mechanics.
 
+## Implementation slice 2: hosted-Avrae handoff
+
+Quartermaster now exposes guild-scoped `/combat` with choices for starting, joining, advancing, attacking, casting, checking, saving, ending, and viewing combat status. It requires an active Quartermaster session, identifies the current Discord channel, and renders the native Avrae command card for that action. The handoff is deliberately read-only: it creates no provider receipt because Quartermaster has not executed a provider call.
+
+The current cards use the documented native forms such as `!i begin`, `!i join`, `!i next`, `!attack`, `!cast`, `!check`, `!save`, and `!i end`. This is a genuine hosted-Avrae wrapper for discovery and context, but not yet one-click execution; that still requires the Avrae-side extension gate.
+
+## Implementation slice 3: self-hosted Avrae context probe
+
+`integrations/avrae/quartermaster_cog.py` is a disposable Avrae-side extension scaffold. Its `/qm-combat-probe` command receives a real Avrae interaction, preserves the actor/guild/channel identity, loads native combat with `Combat.from_ctx(inter)`, and records a Quartermaster provider receipt and correlation ID. It reports native combat presence only; it does not copy HP, initiative, conditions, resources, or combatants into Quartermaster.
+
+The scaffold is intentionally not loaded by the current hosted Quartermaster process and has not yet been run inside an Avrae deployment. The next gate is to install the Quartermaster core into a self-hosted Avrae environment, load the Cog in a disposable guild, and verify both the no-combat and active-combat paths. Only after that should the Cog perform one explicitly selected, harmless native state change through Avrae's own model commit path.
+
 ## Research findings
 
 Research performed against official Avrae documentation and the public Avrae repository on 2026-08-11.
@@ -31,7 +43,7 @@ Research performed against official Avrae documentation and the public Avrae rep
 - The Avrae repository describes a fully featured modding API for writing custom commands.
 - Avrae loads a fixed set of Python Cogs during startup. A Quartermaster-specific Cog would therefore require a self-hosted Avrae build, a maintained fork, or an upstream-supported extension mechanism.
 - The current Avrae combat implementation uses `disnake` command contexts and an internal `Combat` model. Combat state is persisted by channel and includes the summary message, combat DM, combatants, round, turn, current combatant, options, and metadata.
-- The combat model exposes internal operations such as loading combat by channel, committing changes, advancing turns, changing combatants, and ending combat. These are useful implementation seams inside a self-hosted Avrae process; they are not a public HTTP API for another Discord bot.
+- The combat model exposes internal operations such as loading combat by channel, committing changes, advancing turns, changing combatants, and ending combat. `Combat.from_ctx(inter)` and `Combat.commit(ctx)` are therefore useful implementation seams inside a self-hosted Avrae process; they are not a public HTTP API for another Discord bot.
 - Avrae supports both prefix command groups and some slash commands. The combat surface should not assume that every Avrae operation is available as a slash command.
 
 Sources:
@@ -253,8 +265,8 @@ The integration is not ready for table use until all of the following are true:
 
 1. Confirm whether self-hosting a maintained Avrae fork is acceptable.
 2. Decide whether the desired single front door should be the current Quartermaster bot or a Quartermaster Cog within a self-hosted Avrae process.
-3. Build the disposable Avrae extension spike against the `AvraeGateway` contract, preserving the real Discord actor and native Avrae combat context.
-4. Inventory the table's actual Avrae commands and combat habits, then add only the first pilot operations with verified idempotency/timeout semantics.
-5. Update the product specification after the deployment and provider boundary are accepted; do not add mirrored HP, initiative, or mechanics state to Quartermaster.
+3. Load `integrations/avrae/quartermaster_cog.py` in a disposable Avrae guild and verify the native context probe end to end.
+4. Prove one explicitly selected harmless native state change through Avrae's own model commit path, then inventory the table's actual Avrae commands and combat habits.
+5. Add only the first pilot operations with verified actor authorization, idempotency, timeout, and recovery semantics; update the product specification after that boundary is accepted.
 
 Until then, the current Quartermaster implementation remains the continuity core and should not gain speculative combat tables or mirrored mechanics state.
