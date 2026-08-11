@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -65,10 +66,34 @@ def run_maintenance(
         raise
 
 
-def health_report(store: SQLiteStore, *, backup_max_age_seconds: int = 86_400) -> dict[str, Any]:
+def record_discord_surface_health(
+    store: SQLiteStore,
+    *,
+    reachable: bool,
+    details: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    """Record the most recent runtime reachability check for Discord surfaces."""
+    _record_maintenance(
+        store,
+        name="discord-surfaces",
+        status="OK" if reachable else "FAILED",
+        error=error,
+        details=details,
+    )
+
+
+def health_report(
+    store: SQLiteStore,
+    *,
+    backup_max_age_seconds: int = 86_400,
+    discord_surface_max_age_seconds: int = 300,
+) -> dict[str, Any]:
     """Return a small, machine-readable health snapshot without contacting Discord."""
     if backup_max_age_seconds <= 0:
         raise ValueError("backup max age must be positive")
+    if discord_surface_max_age_seconds <= 0:
+        raise ValueError("Discord surface max age must be positive")
     connection = store._require_connection()
     integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
     schema_version = connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
@@ -88,6 +113,21 @@ def health_report(store: SQLiteStore, *, backup_max_age_seconds: int = 86_400) -
     maintenance = connection.execute(
         "SELECT last_status FROM maintenance_runs WHERE name = 'transient-state'"
     ).fetchone()
+    discord_surfaces = connection.execute(
+        "SELECT last_run_at, last_status, last_details FROM maintenance_runs WHERE name = 'discord-surfaces'"
+    ).fetchone()
+    discord_surface_age = None
+    if discord_surfaces is not None and discord_surfaces["last_run_at"] is not None:
+        discord_surface_age = connection.execute(
+            "SELECT (julianday(?) - julianday(?)) * 86400.0",
+            (iso_now(), discord_surfaces["last_run_at"]),
+        ).fetchone()[0]
+    discord_surfaces_ok = (
+        discord_surfaces is not None
+        and discord_surfaces["last_status"] == "OK"
+        and discord_surface_age is not None
+        and discord_surface_age <= discord_surface_max_age_seconds
+    )
     backup = connection.execute(
         "SELECT last_run_at, last_status, last_details FROM maintenance_runs WHERE name = 'backup'"
     ).fetchone()
@@ -128,6 +168,7 @@ def health_report(store: SQLiteStore, *, backup_max_age_seconds: int = 86_400) -
         "expired_drops": "OK" if due_drops == 0 else "DEGRADED",
         "maintenance": "OK" if maintenance is None or maintenance["last_status"] == "OK" else "DEGRADED",
         "backup": "OK" if backup_ok else "DEGRADED",
+        "discord_surfaces": "OK" if discord_surfaces_ok else "DEGRADED",
     }
     status = "HEALTHY"
     if "FAILED" in checks.values():
@@ -148,6 +189,7 @@ def health_report(store: SQLiteStore, *, backup_max_age_seconds: int = 86_400) -
             "backup_age_seconds": backup_age,
             "backup_primary_exists": primary_backup_exists,
             "backup_off_device_exists": off_device_backup_exists,
+            "discord_surface_age_seconds": discord_surface_age,
         },
     }
 
@@ -250,6 +292,24 @@ def create_backup(
             details={"primary_path": str(destination_path.resolve())},
         )
         raise
+
+
+def create_scheduled_backup(
+    store: SQLiteStore,
+    directory: str | Path,
+    *,
+    off_device_directory: str | Path | None = None,
+    retention_count: int = 7,
+) -> dict[str, Any]:
+    """Create a timestamped backup using the same validated path as the CLI."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    destination = Path(directory).expanduser() / f"quartermaster-{timestamp}.sqlite"
+    return create_backup(
+        store,
+        destination,
+        off_device_directory=off_device_directory,
+        retention_count=retention_count,
+    )
 
 
 def restore_backup(

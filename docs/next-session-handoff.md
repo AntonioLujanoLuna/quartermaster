@@ -1,6 +1,6 @@
 # Next-session handoff
 
-Updated: 2026-08-10
+Updated: 2026-08-11
 
 ## Verified current state
 
@@ -17,11 +17,13 @@ Updated: 2026-08-10
 - The `discord.py` adapter exposes guild-scoped `/stash`, `/grant`, `/session-start`, `/session-end`, `/loot`, `/loot-drop`, `/loot-close`, and DM-admin `/export`.
 - Discord projection delivery and bounded local interaction work run asynchronously after database commit, with deadline-aware response deferral at the configured soft deadline. `/export` uses the adapter-level durable `PROCESSING -> COMMITTED/FAILED` workflow; backup remains an operator CLI path.
 - Online backups create timestamped validated snapshots, optionally copy them to a secondary directory, apply retention, and record their paths and outcome for health checks.
+- The projection runner now creates a validated timestamped backup immediately at startup and repeats it on the configurable `QM_BACKUP_INTERVAL_SECONDS` schedule, using the configured primary/off-device directories and retention count.
+- Runtime health now records Discord surface reachability for the configured Party Inventory and Session Log channels; missing, failed, or stale checks report `DEGRADED`.
 - Session state and event destinations now remain bound to the correct durable session thread across session transitions; recreated Party Stash projections are re-pinned.
 - Operational commands now cover `health`, `maintenance`, `backup`, and safe restore validation.
 - Managed Windows process wrappers are in `scripts/start-quartermaster.ps1` and `scripts/stop-quartermaster.ps1`.
 - Operator procedures for backup/restore and degraded operation are documented in `docs/runbook.md`.
-- 34 automated tests pass with `uv`.
+- 39 automated tests pass with `uv`.
 
 ## Live Discord setup
 
@@ -54,6 +56,8 @@ Updated: 2026-08-10
 - Current live session state: no active session.
 
 The post-restart command, session-thread, and pin checks are complete in the signed-in `Quartermaster Test` server. The adapter response helper was corrected after `discord.py` raised on an explicit `view=None`; the patched flow now responds normally. Operational health is `HEALTHY` after the projection retry.
+
+The scheduled-operations verification completed on 2026-08-11: the managed process restarted with the new runner, Gateway connection and guild command synchronization succeeded, an automatic timestamped backup was created, and `health` reported `HEALTHY` with `discord_surfaces: OK`.
 
 ## Deliberate test state still present
 
@@ -90,7 +94,8 @@ The post-restart runtime and routing pass completed successfully:
 
 The local operational acceptance checks are complete:
 
-- `uv run pytest -q` -> 34 passed.
+- `uv run pytest -q` -> 39 passed.
+- `python -m compileall -q src tests` and `git diff --check` passed.
 - `health` -> `HEALTHY`; database, schema, backup, receipts, outbox, session, and state-projection checks all pass.
 - Online backup -> integrity and schema validation passed.
 - Restore to a new database -> integrity, schema, health, and export validation passed.
@@ -102,10 +107,9 @@ The live test data intentionally remains visible for cleanup/audit: Party Stash 
 
 After the completed live verification:
 
-1. Extend health to cover Discord surface reachability and establish a scheduled backup invocation for the validated backup/retention path.
-2. Add adapter acceptance coverage for permissions, pins, rate limits, and acknowledgement latency on the target host.
-3. Decide whether backup should remain an operator CLI path or receive a Discord-facing durable `PROCESSING -> COMMITTED/FAILED` workflow; `/export` is covered and backup now has validated secondary-copy support.
-4. Then choose the next product slice: treasury/currency transfers or further character ownership support.
+1. Add adapter acceptance coverage for permissions, pins, rate limits, and acknowledgement latency on the target host.
+2. Decide whether backup should also receive a Discord-facing durable `PROCESSING -> COMMITTED/FAILED` workflow; `/export` is covered and backup now has scheduled and operator-initiated validated paths.
+3. Then choose the next product slice: treasury/currency transfers or further character ownership support.
 
 The larger optional domains - Your Pack, Journal, Parking Lot, Downtime, faction clocks, rich continuity, and Undo - remain evidence-gated and should not be started yet.
 

@@ -17,7 +17,15 @@ from quartermaster.export import render_export
 from quartermaster.handles import HandleError, HandleRepository
 from quartermaster.inventory import InventoryService, SemanticStaleness
 from quartermaster.loot import LootDropService
-from quartermaster.operations import create_backup, health_report, restore_backup, run_maintenance, validate_backup
+from quartermaster.operations import (
+    create_backup,
+    create_scheduled_backup,
+    health_report,
+    record_discord_surface_health,
+    restore_backup,
+    run_maintenance,
+    validate_backup,
+)
 from quartermaster.projections import EventOutboxWorker, StateProjectionScheduler
 from quartermaster.receipts import ReceiptRepository
 from quartermaster.recovery import recover_startup
@@ -57,6 +65,24 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertEqual(settings.guild_id, "123")
         with self.assertRaises(ConfigurationError):
             settings.require_discord_token()
+
+    def test_settings_load_backup_and_surface_health_configuration(self) -> None:
+        settings = Settings.from_env(
+            {
+                "QM_GUILD_ID": "123",
+                "QM_DATABASE_PATH": "db.sqlite",
+                "QM_BACKUP_DIRECTORY": "backup-store",
+                "QM_BACKUP_OFF_DEVICE_DIRECTORY": "D:/off-device",
+                "QM_BACKUP_RETENTION_COUNT": "3",
+                "QM_BACKUP_INTERVAL_SECONDS": "3600",
+                "QM_DISCORD_SURFACE_HEALTH_MAX_AGE_SECONDS": "120",
+            }
+        )
+        self.assertEqual(settings.backup_directory, Path("backup-store"))
+        self.assertEqual(settings.backup_off_device_directory, Path("D:/off-device"))
+        self.assertEqual(settings.backup_retention_count, 3)
+        self.assertEqual(settings.backup_interval_seconds, 3600)
+        self.assertEqual(settings.discord_surface_health_max_age_seconds, 120)
 
     def test_server_owner_is_a_dm_administrator(self) -> None:
         from types import SimpleNamespace
@@ -295,13 +321,42 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertEqual(degraded["status"], "DEGRADED")
         self.assertEqual(degraded["checks"]["backup"], "DEGRADED")
 
+    def test_scheduled_backup_uses_timestamped_validated_path(self) -> None:
+        primary = Path(self.tempdir.name) / "scheduled"
+        off_device = Path(self.tempdir.name) / "scheduled-off-device"
+        result = create_scheduled_backup(
+            self.store,
+            primary,
+            off_device_directory=off_device,
+            retention_count=1,
+        )
+        self.assertRegex(Path(result["primary_path"]).name, r"^quartermaster-\d{8}-\d{6}Z\.sqlite$")
+        self.assertTrue(Path(result["primary_path"]).is_file())
+        self.assertTrue(Path(result["off_device_path"]).is_file())
+        self.assertEqual(json.loads(
+            self.store.connection.execute(
+                "SELECT last_details FROM maintenance_runs WHERE name = 'backup'"
+            ).fetchone()["last_details"]
+        )["retention_count"], 1)
+
     def test_health_report_is_healthy_for_clean_database(self) -> None:
         create_backup(self.store, Path(self.tempdir.name) / "health-backup.sqlite")
+        record_discord_surface_health(
+            self.store,
+            reachable=True,
+            details={"surfaces": {"party-inventory": {"reachable": True}}},
+        )
         report = health_report(self.store)
         self.assertEqual(report["status"], "HEALTHY")
         self.assertEqual(report["checks"]["database"], "OK")
         self.assertEqual(report["checks"]["schema"], "OK")
         self.assertEqual(report["checks"]["backup"], "OK")
+
+    def test_health_report_degrades_for_failed_discord_surface_check(self) -> None:
+        record_discord_surface_health(self.store, reachable=False, error="channel unavailable")
+        report = health_report(self.store)
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertEqual(report["checks"]["discord_surfaces"], "DEGRADED")
 
     def test_maintenance_expires_drops_and_removes_retained_state(self) -> None:
         receipt = self.inventory.grant_interaction("maintenance-receipt", actor_id="dm", item_name="Old Token", quantity=1)
@@ -400,6 +455,63 @@ class QuartermasterCoreTests(unittest.TestCase):
             "SELECT discord_thread_id FROM sessions WHERE id = ?", (session["session_id"],)
         ).fetchone()
         self.assertEqual(stored["discord_thread_id"], "987")
+
+    def test_discord_surface_reachability_checks_configured_channels(self) -> None:
+        class Bot:
+            def __init__(self) -> None:
+                self.fetched: list[int] = []
+
+            async def fetch_channel(self, channel_id: int) -> object:
+                self.fetched.append(channel_id)
+                return object()
+
+        bot = Bot()
+        transport = DiscordProjectionTransport(
+            bot,
+            Settings(
+                guild_id="123",
+                database_path=self.db_path,
+                party_inventory_channel_id="456",
+                session_log_channel_id="789",
+                dm_channel_id="101112",
+            ),
+            self.store,
+        )
+        result = asyncio.run(transport.check_surface_reachability())
+        self.assertEqual(bot.fetched, [456, 789, 101112])
+        self.assertTrue(all(entry["reachable"] for entry in result["surfaces"].values()))
+
+    def test_projection_runner_performs_scheduled_backup_and_surface_check(self) -> None:
+        from quartermaster.discord_projection import ProjectionRunner
+
+        class Transport(FakeDiscordTransport):
+            async def check_surface_reachability(self) -> dict[str, object]:
+                return {"surfaces": {"party-inventory": {"reachable": True}}}
+
+        primary = Path(self.tempdir.name) / "runner-backups"
+        runner = ProjectionRunner(
+            self.store,
+            Transport(),
+            maintenance_interval_seconds=0.01,
+            backup_directory=str(primary),
+            backup_interval_seconds=60,
+        )
+
+        async def run_runner() -> None:
+            stop_event = asyncio.Event()
+            task = asyncio.create_task(runner.run(stop_event))
+            await asyncio.sleep(0.05)
+            stop_event.set()
+            await task
+
+        asyncio.run(run_runner())
+        self.assertEqual(len(list(primary.glob("quartermaster-*.sqlite"))), 1)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT last_status FROM maintenance_runs WHERE name = 'discord-surfaces'"
+            ).fetchone()["last_status"],
+            "OK",
+        )
 
     def test_session_projection_destination_moves_to_the_new_session(self) -> None:
         first = self.sessions.start_session()

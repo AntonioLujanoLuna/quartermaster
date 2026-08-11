@@ -27,6 +27,7 @@ def main() -> int:
     parser.add_argument("--retention-count", type=int, default=7)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--replace", action="store_true")
+    parser.add_argument("--discord-surface-max-age-seconds", type=int, default=300)
     args = parser.parse_args()
     if args.command == "run":
         from .discord_adapter import run_bot
@@ -39,7 +40,12 @@ def main() -> int:
             print(render_export(store), end="")
     elif args.command == "health":
         with SQLiteStore(args.db).open() as store:
-            print(render_health(health_report(store)))
+            print(render_health(
+                health_report(
+                    store,
+                    discord_surface_max_age_seconds=args.discord_surface_max_age_seconds,
+                )
+            ))
     elif args.command == "maintenance":
         environment = dict(os.environ)
         settings = Settings.from_env(environment)

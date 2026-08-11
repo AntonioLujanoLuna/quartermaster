@@ -13,7 +13,7 @@ import discord
 from .config import Settings
 from .db import SQLiteStore
 from .loot import expire_due_drops
-from .operations import run_maintenance
+from .operations import create_scheduled_backup, record_discord_surface_health, run_maintenance
 from .projections import EventOutboxWorker, StateProjectionScheduler
 from .transport import RateLimitedError
 
@@ -83,6 +83,27 @@ class DiscordProjectionTransport:
         if channel_id is None:
             raise ProjectionConfigurationError(f"no Discord channel configured for {destination}")
         return channel_id
+
+    async def check_surface_reachability(self) -> dict[str, Any]:
+        """Fetch each configured permanent Discord surface without mutating it."""
+        surfaces = {
+            "party-inventory": self.settings.party_inventory_channel_id,
+            "session-log": self.settings.session_log_channel_id,
+        }
+        if self.settings.dm_channel_id is not None:
+            surfaces["dm-surface"] = self.settings.dm_channel_id
+        result: dict[str, Any] = {"surfaces": {}}
+        for name, channel_id in surfaces.items():
+            if channel_id is None:
+                raise ProjectionConfigurationError(f"no Discord channel configured for {name}")
+            try:
+                await self.bot.fetch_channel(int(channel_id))
+            except discord.HTTPException as error:
+                if error.status == 429:
+                    raise RateLimitedError(getattr(error, "retry_after", 1.0)) from error
+                raise
+            result["surfaces"][name] = {"channel_id": channel_id, "reachable": True}
+        return result
 
     async def _ensure_session_thread(self, session_id: str) -> str | None:
         if self.store is None:
@@ -200,9 +221,20 @@ class ProjectionRunner:
         maintenance_interval_seconds: float = 60.0,
         receipt_retention_seconds: int = 86_400,
         handle_retention_seconds: int = 600,
+        backup_directory: str = "backups",
+        backup_off_device_directory: str | None = None,
+        backup_retention_count: int = 7,
+        backup_interval_seconds: float = 86_400,
+        discord_surface_health_max_age_seconds: int = 300,
     ) -> None:
         if maintenance_interval_seconds <= 0:
             raise ValueError("maintenance interval must be positive")
+        if backup_interval_seconds <= 0:
+            raise ValueError("backup interval must be positive")
+        if backup_retention_count <= 0:
+            raise ValueError("backup retention count must be positive")
+        if discord_surface_health_max_age_seconds <= 0:
+            raise ValueError("Discord surface health max age must be positive")
         self.store = store
         self.transport = transport
         self.state = StateProjectionScheduler(store, transport)
@@ -210,12 +242,23 @@ class ProjectionRunner:
         self.maintenance_interval_seconds = maintenance_interval_seconds
         self.receipt_retention_seconds = receipt_retention_seconds
         self.handle_retention_seconds = handle_retention_seconds
+        self.backup_directory = backup_directory
+        self.backup_off_device_directory = backup_off_device_directory
+        self.backup_retention_count = backup_retention_count
+        self.backup_interval_seconds = backup_interval_seconds
+        self.discord_surface_health_max_age_seconds = discord_surface_health_max_age_seconds
+        self.surface_health_interval_seconds = min(
+            maintenance_interval_seconds, discord_surface_health_max_age_seconds / 2
+        )
 
     async def run(self, stop_event: asyncio.Event) -> None:
         next_maintenance = monotonic()
+        next_backup = monotonic()
+        next_surface_health = monotonic()
         while not stop_event.is_set():
+            now = monotonic()
             await asyncio.to_thread(expire_due_drops, self.store)
-            if monotonic() >= next_maintenance:
+            if now >= next_maintenance:
                 try:
                     await asyncio.to_thread(
                         run_maintenance,
@@ -226,6 +269,37 @@ class ProjectionRunner:
                 except Exception:
                     logger.exception("transient-state maintenance failed")
                 next_maintenance = monotonic() + self.maintenance_interval_seconds
+            if now >= next_backup:
+                try:
+                    result = await asyncio.to_thread(
+                        create_scheduled_backup,
+                        self.store,
+                        self.backup_directory,
+                        off_device_directory=self.backup_off_device_directory,
+                        retention_count=self.backup_retention_count,
+                    )
+                    logger.info("scheduled backup completed: %s", result["primary_path"])
+                except Exception:
+                    logger.exception("scheduled backup failed")
+                next_backup = monotonic() + self.backup_interval_seconds
+            if now >= next_surface_health:
+                try:
+                    details = await self.transport.check_surface_reachability()
+                    await asyncio.to_thread(
+                        record_discord_surface_health,
+                        self.store,
+                        reachable=True,
+                        details=details,
+                    )
+                except Exception as error:
+                    await asyncio.to_thread(
+                        record_discord_surface_health,
+                        self.store,
+                        reachable=False,
+                        error=str(error),
+                    )
+                    logger.exception("Discord surface reachability check failed")
+                next_surface_health = monotonic() + self.surface_health_interval_seconds
             delivered_state = await self.state.run_once_async(self.transport)
             delivered_event = await self.events.run_once_async(self.transport)
             if not delivered_state and not delivered_event:

@@ -33,6 +33,11 @@ class Settings:
     internal_hard_deadline_seconds: float = 2.5
     receipt_retention_seconds: int = 86_400
     handle_retention_seconds: int = 600
+    backup_directory: Path = Path("backups")
+    backup_off_device_directory: Path | None = None
+    backup_retention_count: int = 7
+    backup_interval_seconds: int = 86_400
+    discord_surface_health_max_age_seconds: int = 300
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str]) -> "Settings":
@@ -57,6 +62,13 @@ class Settings:
             ),
             receipt_retention_seconds=_positive_int(environment, "QM_RECEIPT_RETENTION_SECONDS", 86_400),
             handle_retention_seconds=_positive_int(environment, "QM_HANDLE_RETENTION_SECONDS", 600),
+            backup_directory=Path(environment.get("QM_BACKUP_DIRECTORY", "backups").strip() or "backups").expanduser(),
+            backup_off_device_directory=_optional_path(environment.get("QM_BACKUP_OFF_DEVICE_DIRECTORY", "")),
+            backup_retention_count=_positive_int(environment, "QM_BACKUP_RETENTION_COUNT", 7),
+            backup_interval_seconds=_positive_int(environment, "QM_BACKUP_INTERVAL_SECONDS", 86_400),
+            discord_surface_health_max_age_seconds=_positive_int(
+                environment, "QM_DISCORD_SURFACE_HEALTH_MAX_AGE_SECONDS", 300
+            ),
         )
 
     def require_discord_token(self) -> str:
@@ -112,3 +124,8 @@ def _optional_id(raw: str, name: str) -> str | None:
     if not value.isdigit() or int(value) <= 0:
         raise ConfigurationError(f"{name} must be a positive numeric Discord ID")
     return value
+
+
+def _optional_path(raw: str) -> Path | None:
+    value = raw.strip()
+    return Path(value).expanduser() if value else None

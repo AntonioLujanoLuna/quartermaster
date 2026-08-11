@@ -553,6 +553,15 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
                 DiscordProjectionTransport(bot, settings, services.store),
                 receipt_retention_seconds=settings.receipt_retention_seconds,
                 handle_retention_seconds=settings.handle_retention_seconds,
+                backup_directory=str(settings.backup_directory),
+                backup_off_device_directory=(
+                    str(settings.backup_off_device_directory)
+                    if settings.backup_off_device_directory is not None
+                    else None
+                ),
+                backup_retention_count=settings.backup_retention_count,
+                backup_interval_seconds=settings.backup_interval_seconds,
+                discord_surface_health_max_age_seconds=settings.discord_surface_health_max_age_seconds,
             )
             projection_task = asyncio.create_task(runner.run(stop_event))
         else:
