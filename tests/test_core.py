@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from quartermaster.config import ConfigurationError, Settings
+from quartermaster.characters import CharacterError, CharacterService
 from quartermaster.currency import CurrencyError, CurrencyService
 from quartermaster.db import SCHEMA_VERSION, SQLiteStore
 from quartermaster.export import render_export
@@ -54,6 +55,7 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.inventory = InventoryService(self.store, self.receipts, self.handles)
         self.loot = LootDropService(self.store, self.receipts, self.handles)
         self.sessions = SessionService(self.store, self.receipts, self.loot)
+        self.characters = CharacterService(self.store, self.receipts)
         self.currency = CurrencyService(self.store, self.receipts)
 
     def tearDown(self) -> None:
@@ -432,6 +434,55 @@ class QuartermasterCoreTests(unittest.TestCase):
         )
         self.assertIn("Active Hero [ACTIVE]", render_export(self.store))
 
+    def test_character_lifecycle_is_explicit_and_does_not_move_possessions(self) -> None:
+        created = self.characters.create_interaction(
+            "character-create-1",
+            actor_id="dm",
+            name="Edrin",
+            discord_user_id="player-1",
+        )
+        character_id = created.logical_response["character_id"]
+        with self.store.transaction() as connection:
+            connection.execute(
+                """INSERT INTO inventory_stacks(
+                    id, item_name, normalized_name, variant_metadata, quantity, owner_type, owner_id,
+                    version, last_acquired_at, updated_at
+                ) VALUES ('character-item', 'Herb', 'herb', '{}', 2, 'CHARACTER', ?, 1, '2026-08-11T00:00:00Z', '2026-08-11T00:00:00Z')""",
+                (character_id,),
+            )
+        self.currency.adjust_treasury_interaction("character-currency-seed", actor_id="dm", deltas={"gp": 10})
+        self.currency.give_to_character_interaction(
+            "character-currency-give",
+            actor_id="dm",
+            character_id=character_id,
+            amounts={"gp": 10},
+        )
+        changed = self.characters.transition_interaction(
+            "character-dead-1",
+            actor_id="dm",
+            character_id=character_id,
+            lifecycle="DEAD",
+        )
+        self.assertEqual(changed.logical_response["from"], "ACTIVE")
+        self.assertEqual(changed.logical_response["to"], "DEAD")
+        item = self.store.connection.execute(
+            "SELECT quantity FROM inventory_stacks WHERE id = 'character-item'"
+        ).fetchone()
+        balance = self.store.connection.execute(
+            "SELECT gp FROM currency_balances WHERE owner_type = 'CHARACTER' AND owner_id = ?",
+            (character_id,),
+        ).fetchone()
+        self.assertEqual(item["quantity"], 2)
+        self.assertEqual(balance["gp"], 10)
+        with self.assertRaisesRegex(CharacterError, "cannot transition DEAD to RETIRED"):
+            self.characters.transition_interaction(
+                "character-retired-invalid",
+                actor_id="dm",
+                character_id=character_id,
+                lifecycle="RETIRED",
+            )
+        self.assertEqual(self.characters.list_characters()[0]["lifecycle"], "DEAD")
+
     def test_export_and_party_stash_projection_include_treasury(self) -> None:
         self.currency.adjust_treasury_interaction("treasury-export", actor_id="dm", deltas={"gp": 80})
         output = render_export(self.store)
@@ -569,6 +620,9 @@ class QuartermasterCoreTests(unittest.TestCase):
                 "treasury-adjust",
                 "treasury-split",
                 "treasury-give",
+                "characters",
+                "character-add",
+                "character-lifecycle",
                 "session-start",
                 "session-end",
             },

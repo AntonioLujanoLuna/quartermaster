@@ -13,6 +13,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from .config import Settings
+from .characters import CharacterError, CharacterService
 from .currency import CurrencyError, CurrencyService, format_currency
 from .db import SQLiteStore
 from .discord_projection import DiscordProjectionTransport, ProjectionRunner
@@ -40,6 +41,7 @@ class BotServices:
     receipts: ReceiptRepository
     inventory: InventoryService
     sessions: SessionService
+    characters: CharacterService | None = None
     currency: CurrencyService | None = None
     loot: LootDropService | None = None
 
@@ -350,6 +352,7 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
     projection_task: asyncio.Task | None = None
     stop_event = asyncio.Event()
     loot = services.loot or LootDropService(services.store, services.receipts, HandleRepository(services.store))
+    characters = services.characters or CharacterService(services.store, services.receipts)
     currency = services.currency or CurrencyService(services.store, services.receipts)
 
     @bot.tree.command(name="stash", description="View the Party Stash")
@@ -421,6 +424,86 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
             )
         except CurrencyError as error:
             await _send_error(interaction, f"Treasury could not be read: {error}")
+
+    @bot.tree.command(name="characters", description="List campaign characters")
+    @app_commands.guilds(guild)
+    async def characters_command(interaction: discord.Interaction) -> None:
+        if not _in_configured_guild(interaction, settings):
+            await _send_error(interaction, "This bot is configured for a different guild.")
+            return
+        rows = await asyncio.to_thread(characters.list_characters)
+        if not rows:
+            message = "No characters are registered."
+        else:
+            message = "\n".join(
+                f"{row['name']} · `{row['id']}` · {row['lifecycle']}"
+                for row in rows
+            )
+        await interaction.response.send_message(message, ephemeral=True)
+
+    @bot.tree.command(name="character-add", description="Register a campaign character")
+    @app_commands.guilds(guild)
+    @app_commands.describe(name="Character name", discord_user_id="Optional Discord user ID")
+    async def character_add(
+        interaction: discord.Interaction,
+        name: str,
+        discord_user_id: str | None = None,
+    ) -> None:
+        if not _in_configured_guild(interaction, settings) or not await _is_dm(interaction, settings):
+            await _send_error(interaction, "Only configured DM administrators can register characters.")
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                lambda: characters.create_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    name=name,
+                    discord_user_id=discord_user_id,
+                ),
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
+                f"Registered {response['name']} with ID `{response['character_id']}`.",
+            )
+        except CharacterError as error:
+            await _send_error(interaction, f"Character could not be registered: {error}")
+
+    @bot.tree.command(name="character-lifecycle", description="Change a character lifecycle state")
+    @app_commands.guilds(guild)
+    @app_commands.describe(character_id="Character ID", lifecycle="ACTIVE, DEAD, RETIRED, or DEPARTED")
+    async def character_lifecycle(
+        interaction: discord.Interaction,
+        character_id: str,
+        lifecycle: str,
+    ) -> None:
+        if not _in_configured_guild(interaction, settings) or not await _is_dm(interaction, settings):
+            await _send_error(interaction, "Only configured DM administrators can change character lifecycle.")
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                lambda: characters.transition_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    character_id=character_id,
+                    lifecycle=lifecycle,
+                ),
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
+                f"{response['name']} moved from {response['from']} to {response['to']}.",
+            )
+        except CharacterError as error:
+            await _send_error(interaction, f"Character lifecycle could not be changed: {error}")
 
     @bot.tree.command(name="treasury-adjust", description="Adjust the shared treasury")
     @app_commands.guilds(guild)
@@ -743,6 +826,7 @@ def run_bot(settings: Settings) -> None:
         receipts=receipts,
         inventory=InventoryService(store, receipts, handles),
         sessions=SessionService(store, receipts, loot),
+        characters=CharacterService(store, receipts),
         currency=CurrencyService(store, receipts),
         loot=loot,
     )
