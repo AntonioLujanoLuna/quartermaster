@@ -505,6 +505,38 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
         except CharacterError as error:
             await _send_error(interaction, f"Character lifecycle could not be changed: {error}")
 
+    @bot.tree.command(name="character-resolve", description="Resolve belongings from a non-active character")
+    @app_commands.guilds(guild)
+    @app_commands.describe(character_id="Non-active character ID", destination="party or an active character ID")
+    async def character_resolve(
+        interaction: discord.Interaction,
+        character_id: str,
+        destination: str,
+    ) -> None:
+        if not _in_configured_guild(interaction, settings) or not await _is_dm(interaction, settings):
+            await _send_error(interaction, "Only configured DM administrators can resolve character belongings.")
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                services.store,
+                settings,
+                lambda: characters.resolve_belongings_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    character_id=character_id,
+                    destination=destination,
+                ),
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
+                f"Resolved {response['items_moved']} item stacks and currency from {response['source_character_name']} to {response['destination_name']}.",
+            )
+        except CharacterError as error:
+            await _send_error(interaction, f"Character belongings could not be resolved: {error}")
+
     @bot.tree.command(name="treasury-adjust", description="Adjust the shared treasury")
     @app_commands.guilds(guild)
     @app_commands.describe(cp="Copper delta", sp="Silver delta", gp="Gold delta", pp="Platinum delta", reason="Optional reason")

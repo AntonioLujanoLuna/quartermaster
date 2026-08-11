@@ -71,6 +71,8 @@ def _content_for_event(event_type: str, payload: dict[str, Any]) -> str:
         return f"Treasury split among {len(payload['recipients'])} active characters."
     if event_type == "CURRENCY_TRANSFERRED":
         return f"Currency given to {payload['character_name']}."
+    if event_type == "BELONGINGS_RESOLVED":
+        return f"Belongings resolved from {payload['source_character_name']} to {payload['destination_name']}."
     return f"{event_type}: {json.dumps(payload, sort_keys=True)}"
 
 

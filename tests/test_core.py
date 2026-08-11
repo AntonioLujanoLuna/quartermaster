@@ -492,6 +492,58 @@ class QuartermasterCoreTests(unittest.TestCase):
         edrin = next(row for row in self.characters.list_characters() if row["id"] == character_id)
         self.assertEqual(edrin["lifecycle"], "DEAD")
 
+    def test_non_active_belongings_resolution_moves_items_and_currency_atomically(self) -> None:
+        created = self.characters.create_interaction("resolve-create", actor_id="dm", name="Fallen Hero")
+        character_id = created.logical_response["character_id"]
+        self.currency.adjust_treasury_interaction("resolve-seed", actor_id="dm", deltas={"gp": 10})
+        self.currency.give_to_character_interaction(
+            "resolve-give",
+            actor_id="dm",
+            character_id=character_id,
+            amounts={"gp": 10},
+        )
+        with self.store.transaction() as connection:
+            connection.execute(
+                """INSERT INTO inventory_stacks(
+                    id, item_name, normalized_name, variant_metadata, quantity, owner_type, owner_id,
+                    version, last_acquired_at, updated_at
+                ) VALUES ('resolve-item', 'Relic', 'relic', '{}', 2, 'CHARACTER', ?, 1, '2026-08-11T00:00:00Z', '2026-08-11T00:00:00Z')""",
+                (character_id,),
+            )
+        self.characters.transition_interaction(
+            "resolve-dead",
+            actor_id="dm",
+            character_id=character_id,
+            lifecycle="DEAD",
+        )
+        resolved = self.characters.resolve_belongings_interaction(
+            "resolve-all",
+            actor_id="dm",
+            character_id=character_id,
+            destination="party",
+        )
+        self.assertEqual(resolved.logical_response["items_moved"], 1)
+        self.assertEqual(resolved.logical_response["currency_moved"]["gp"], 10)
+        source_item = self.store.connection.execute(
+            "SELECT 1 FROM inventory_stacks WHERE owner_type = 'CHARACTER' AND owner_id = ?",
+            (character_id,),
+        ).fetchone()
+        party_item = self.store.connection.execute(
+            "SELECT quantity FROM inventory_stacks WHERE owner_type = 'PARTY' AND normalized_name = 'relic'"
+        ).fetchone()
+        source_currency = self.store.connection.execute(
+            "SELECT gp FROM currency_balances WHERE owner_type = 'CHARACTER' AND owner_id = ?",
+            (character_id,),
+        ).fetchone()
+        self.assertIsNone(source_item)
+        self.assertEqual(party_item["quantity"], 2)
+        self.assertEqual(source_currency["gp"], 0)
+        self.assertEqual(self.currency.view_treasury()["gp"], 10)
+        lifecycle = self.store.connection.execute(
+            "SELECT lifecycle FROM characters WHERE id = ?", (character_id,)
+        ).fetchone()
+        self.assertEqual(lifecycle["lifecycle"], "DEAD")
+
     def test_relative_treasury_split_requires_confirmation_after_read_set_changes(self) -> None:
         self._insert_character("split-c1", "Split One")
         self._insert_character("split-c2", "Split Two")
@@ -654,6 +706,7 @@ class QuartermasterCoreTests(unittest.TestCase):
                 "characters",
                 "character-add",
                 "character-lifecycle",
+                "character-resolve",
                 "session-start",
                 "session-end",
             },
