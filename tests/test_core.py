@@ -93,6 +93,25 @@ class QuartermasterCoreTests(unittest.TestCase):
         interaction = SimpleNamespace(guild=SimpleNamespace(owner_id=42), user=SimpleNamespace(id=42))
         self.assertTrue(asyncio.run(_is_dm(interaction, settings)))
 
+    def test_dm_authorization_accepts_configured_role_and_rejects_other_members(self) -> None:
+        import discord
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        member = MagicMock(spec=discord.Member)
+        member.id = 7
+        member.guild_permissions.manage_guild = False
+        member.roles = [SimpleNamespace(id=44)]
+        interaction = SimpleNamespace(guild=SimpleNamespace(owner_id=99), user=member)
+        allowed = Settings(guild_id="123", database_path=self.db_path, dm_role_ids=("44",))
+        denied = Settings(guild_id="123", database_path=self.db_path, dm_role_ids=("55",))
+        from quartermaster.discord_adapter import _is_dm
+
+        self.assertTrue(asyncio.run(_is_dm(interaction, allowed)))
+        self.assertFalse(asyncio.run(_is_dm(interaction, denied)))
+        member.guild_permissions.manage_guild = True
+        self.assertTrue(asyncio.run(_is_dm(interaction, denied)))
+
     def test_fast_mutation_and_receipt_are_atomic_and_replayed(self) -> None:
         calls = 0
 
@@ -193,6 +212,35 @@ class QuartermasterCoreTests(unittest.TestCase):
             )
 
         result = asyncio.run(run())
+        self.assertTrue(result.deferred)
+        self.assertEqual(result.value, {"ok": True})
+        self.assertTrue(interaction.response.deferred)
+
+    def test_adapter_fast_path_uses_deadline_fallback(self) -> None:
+        from quartermaster.discord_adapter import _run_fast
+
+        release = threading.Event()
+
+        class Response:
+            def __init__(self) -> None:
+                self.deferred = False
+
+            async def defer(self, *, ephemeral: bool = False) -> None:
+                self.deferred = True
+                release.set()
+
+        class Interaction:
+            def __init__(self) -> None:
+                self.response = Response()
+
+        interaction = Interaction()
+        settings = Settings(guild_id="123", database_path=self.db_path, soft_deadline_seconds=0.01)
+
+        def operation() -> dict[str, bool]:
+            release.wait(1)
+            return {"ok": True}
+
+        result = asyncio.run(_run_fast(interaction, self.store, settings, operation))
         self.assertTrue(result.deferred)
         self.assertEqual(result.value, {"ok": True})
         self.assertTrue(interaction.response.deferred)
@@ -480,6 +528,55 @@ class QuartermasterCoreTests(unittest.TestCase):
         result = asyncio.run(transport.check_surface_reachability())
         self.assertEqual(bot.fetched, [456, 789, 101112])
         self.assertTrue(all(entry["reachable"] for entry in result["surfaces"].values()))
+
+    def test_discord_surface_reachability_converts_rate_limits(self) -> None:
+        import discord
+        from types import SimpleNamespace
+
+        class RateLimitHTTPException(discord.HTTPException):
+            def __init__(self) -> None:
+                super().__init__(SimpleNamespace(status=429, reason="Too Many Requests"), "rate limited")
+                self.retry_after = 4.5
+
+        class Bot:
+            async def fetch_channel(self, _channel_id: int) -> object:
+                raise RateLimitHTTPException()
+
+        transport = DiscordProjectionTransport(
+            Bot(),
+            Settings(guild_id="123", database_path=self.db_path, party_inventory_channel_id="456", session_log_channel_id="789"),
+            self.store,
+        )
+        with self.assertRaises(RateLimitedError) as raised:
+            asyncio.run(transport.check_surface_reachability())
+        self.assertEqual(raised.exception.retry_after_seconds, 4.5)
+
+    def test_party_stash_pin_permission_failure_is_not_silently_ignored(self) -> None:
+        import discord
+        from types import SimpleNamespace
+
+        class Message:
+            id = 456
+            pinned = False
+
+            async def pin(self, *, reason: str) -> None:
+                raise discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "pin denied")
+
+        class Channel:
+            async def send(self, _content: str) -> Message:
+                return Message()
+
+        class Bot:
+            async def fetch_channel(self, _channel_id: int) -> Channel:
+                return Channel()
+
+        transport = DiscordProjectionTransport(
+            Bot(),
+            Settings(guild_id="123", database_path=self.db_path, party_inventory_channel_id="789"),
+            self.store,
+        )
+        with self.assertRaises(discord.Forbidden):
+            asyncio.run(transport.upsert_state("party-stash", "party-inventory", {"items": []}, None))
 
     def test_projection_runner_performs_scheduled_backup_and_surface_check(self) -> None:
         from quartermaster.discord_projection import ProjectionRunner

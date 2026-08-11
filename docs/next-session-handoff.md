@@ -19,11 +19,12 @@ Updated: 2026-08-11
 - Online backups create timestamped validated snapshots, optionally copy them to a secondary directory, apply retention, and record their paths and outcome for health checks.
 - The projection runner now creates a validated timestamped backup immediately at startup and repeats it on the configurable `QM_BACKUP_INTERVAL_SECONDS` schedule, using the configured primary/off-device directories and retention count.
 - Runtime health now records Discord surface reachability for the configured Party Inventory and Session Log channels; missing, failed, or stale checks report `DEGRADED`.
+- Adapter acceptance coverage now includes configured DM-role/manage-guild authorization, pin-permission failures, Discord 429 retry translation, and the adapter FAST-to-DEFERRED acknowledgement path.
 - Session state and event destinations now remain bound to the correct durable session thread across session transitions; recreated Party Stash projections are re-pinned.
 - Operational commands now cover `health`, `maintenance`, `backup`, and safe restore validation.
 - Managed Windows process wrappers are in `scripts/start-quartermaster.ps1` and `scripts/stop-quartermaster.ps1`.
 - Operator procedures for backup/restore and degraded operation are documented in `docs/runbook.md`.
-- 39 automated tests pass with `uv`.
+- 43 automated tests pass with `uv`.
 
 ## Live Discord setup
 
@@ -94,7 +95,7 @@ The post-restart runtime and routing pass completed successfully:
 
 The local operational acceptance checks are complete:
 
-- `uv run pytest -q` -> 39 passed.
+- `uv run pytest -q` -> 43 passed.
 - `python -m compileall -q src tests` and `git diff --check` passed.
 - `health` -> `HEALTHY`; database, schema, backup, receipts, outbox, session, and state-projection checks all pass.
 - Online backup -> integrity and schema validation passed.
@@ -107,7 +108,7 @@ The live test data intentionally remains visible for cleanup/audit: Party Stash 
 
 After the completed live verification:
 
-1. Add adapter acceptance coverage for permissions, pins, rate limits, and acknowledgement latency on the target host.
+1. Perform target-host measurements for acknowledgement latency and live permission/pin reachability; the local adapter acceptance coverage is now in place.
 2. Decide whether backup should also receive a Discord-facing durable `PROCESSING -> COMMITTED/FAILED` workflow; `/export` is covered and backup now has scheduled and operator-initiated validated paths.
 3. Then choose the next product slice: treasury/currency transfers or further character ownership support.
 
