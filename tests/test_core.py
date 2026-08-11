@@ -699,6 +699,7 @@ class QuartermasterCoreTests(unittest.TestCase):
                 "loot-drop",
                 "loot-close",
                 "export",
+                "backup",
                 "treasury",
                 "treasury-adjust",
                 "treasury-split",
@@ -732,6 +733,41 @@ class QuartermasterCoreTests(unittest.TestCase):
         interaction = Interaction()
         asyncio.run(_send_execution(interaction, FastExecutionResult({}, False), "ok"))
         self.assertEqual(interaction.response.kwargs, {"ephemeral": False})
+
+    def test_discord_backup_response_reports_validated_filename(self) -> None:
+        from types import SimpleNamespace
+
+        from quartermaster.discord_adapter import _send_deferred_backup
+
+        class Response:
+            def __init__(self) -> None:
+                self.message: str | None = None
+                self.kwargs: dict[str, object] | None = None
+
+            async def send_message(self, message: str, **kwargs: object) -> None:
+                self.message = message
+                self.kwargs = kwargs
+
+        class Interaction:
+            def __init__(self) -> None:
+                self.response = Response()
+
+        interaction = Interaction()
+        receipt = SimpleNamespace(
+            status="COMMITTED",
+            logical_response={
+                "primary_path": "C:/backups/quartermaster-20260811-090000Z.sqlite",
+                "schema_version": SCHEMA_VERSION,
+                "off_device_path": None,
+            },
+        )
+        execution = SimpleNamespace(receipt=receipt, deferred=False)
+        asyncio.run(_send_deferred_backup(interaction, execution))
+        self.assertEqual(
+            interaction.response.message,
+            f"Backup completed: `quartermaster-20260811-090000Z.sqlite`. Integrity and schema {SCHEMA_VERSION} validation passed.",
+        )
+        self.assertEqual(interaction.response.kwargs, {"ephemeral": True})
 
     def test_session_projection_binds_and_reuses_a_discord_thread(self) -> None:
         session = self.sessions.start_session()

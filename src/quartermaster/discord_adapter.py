@@ -6,6 +6,7 @@ import asyncio
 import io
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import discord
@@ -21,6 +22,7 @@ from .export import render_export
 from .handles import HandleError, HandleRepository
 from .inventory import InventoryError, InventoryService, SemanticStaleness
 from .loot import LootDropError, LootDropService
+from .operations import create_scheduled_backup
 from .recovery import recover_startup
 from .receipts import ReceiptRepository
 from .response import (
@@ -156,6 +158,37 @@ async def _send_deferred_export(
         await interaction.followup.send("Quartermaster export", file=file, ephemeral=True)
     else:
         await interaction.response.send_message("Quartermaster export", file=file, ephemeral=True)
+
+
+async def _send_deferred_backup(
+    interaction: discord.Interaction,
+    execution: DeferredExecutionResult,
+) -> None:
+    receipt = execution.receipt
+    if receipt.status == "PROCESSING":
+        await _send_error(interaction, "A backup for this interaction is already in progress.")
+        return
+    if receipt.status == "FAILED":
+        await _send_error(
+            interaction,
+            receipt.logical_response.get("message", "The backup could not be completed."),
+        )
+        return
+    primary_path = receipt.logical_response.get("primary_path")
+    if not isinstance(primary_path, str) or not primary_path:
+        await _send_error(interaction, "The stored backup result is invalid.")
+        return
+    message = (
+        f"Backup completed: `{Path(primary_path).name}`. "
+        f"Integrity and schema {receipt.logical_response.get('schema_version', '?')} validation passed."
+    )
+    off_device_path = receipt.logical_response.get("off_device_path")
+    if isinstance(off_device_path, str) and off_device_path:
+        message += f" Off-device copy: `{Path(off_device_path).name}`."
+    if execution.deferred:
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 def _render_stash(items: list[dict]) -> str:
@@ -655,6 +688,29 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
                 ephemeral=True,
             )
             await _send_deferred_export(interaction, execution)
+        except DeferredExecutionError as error:
+            await _send_error(interaction, str(error))
+
+    @bot.tree.command(name="backup", description="Create a validated canonical backup")
+    @app_commands.guilds(guild)
+    async def backup_command(interaction: discord.Interaction) -> None:
+        if not _in_configured_guild(interaction, settings) or not await _is_dm(interaction, settings):
+            await _send_error(interaction, "Only configured DM administrators can create backups.")
+            return
+        try:
+            execution = await _run_deferred(
+                interaction,
+                services,
+                lambda: create_scheduled_backup(
+                    services.store,
+                    settings.backup_directory,
+                    off_device_directory=settings.backup_off_device_directory,
+                    retention_count=settings.backup_retention_count,
+                ),
+                response_kind="backup",
+                ephemeral=True,
+            )
+            await _send_deferred_backup(interaction, execution)
         except DeferredExecutionError as error:
             await _send_error(interaction, str(error))
 

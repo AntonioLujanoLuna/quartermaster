@@ -25,11 +25,12 @@ Updated: 2026-08-11
 - Explicit character registration and lifecycle transitions are implemented with ACTIVE/DEAD/RETIRED/DEPARTED invariants; `/characters`, `/character-add`, and `/character-lifecycle` are now registered. Lifecycle changes do not move inventory or currency.
 - Loot Drop claims now require an active registered character mapped to the Discord actor. Relative treasury split handles snapshot treasury version and active recipient IDs, and require explicit confirmation after either changes.
 - Explicit non-active belongings resolution now moves inventory and currency atomically to Party Stash or an active character without changing lifecycle; `/character-resolve` is registered.
+- Admin-only Discord `/backup` now runs the validated scheduled-backup path through a durable `PROCESSING -> COMMITTED/FAILED` receipt and reports the resulting snapshot filename ephemerally.
 - Session state and event destinations now remain bound to the correct durable session thread across session transitions; recreated Party Stash projections are re-pinned.
 - Operational commands now cover `health`, `maintenance`, `backup`, and safe restore validation.
 - Managed Windows process wrappers are in `scripts/start-quartermaster.ps1` and `scripts/stop-quartermaster.ps1`.
 - Operator procedures for backup/restore and degraded operation are documented in `docs/runbook.md`.
-- 52 automated tests pass with `uv`.
+- 53 automated tests pass with `uv`.
 
 ## Live Discord setup
 
@@ -64,6 +65,8 @@ Updated: 2026-08-11
 The post-restart command, session-thread, and pin checks are complete in the signed-in `Quartermaster Test` server. The adapter response helper was corrected after `discord.py` raised on an explicit `view=None`; the patched flow now responds normally. Operational health is `HEALTHY` after the projection retry.
 
 The scheduled-operations verification completed on 2026-08-11: the managed process restarted with the new runner, Gateway connection and guild command synchronization succeeded, an automatic timestamped backup was created, and `health` reported `HEALTHY` with `discord_surfaces: OK`.
+
+Signed-in browser verification completed on 2026-08-11: `/treasury` was offered by the guild command picker and returned the current treasury response in about 7 seconds end-to-end; the permanent Party Stash pin was visible through Discord's pinned-messages view.
 
 ## Deliberate test state still present
 
@@ -113,9 +116,8 @@ The live test data intentionally remains visible for cleanup/audit: Party Stash 
 
 After the completed live verification:
 
-1. Perform target-host measurements for acknowledgement latency and live permission/pin reachability; the local adapter acceptance coverage is now in place.
-2. Decide whether backup should also receive a Discord-facing durable `PROCESSING -> COMMITTED/FAILED` workflow; `/export` is covered and backup now has scheduled and operator-initiated validated paths.
-3. Add target-host measurements for acknowledgement latency and live permission/pin reachability, then evaluate any further evidence-gated character/currency UX.
+1. Observe the new admin-only Discord `/backup` workflow on the target host and confirm the durable receipt and resulting snapshot path in a controlled maintenance window.
+2. Evaluate any further evidence-gated character/currency UX using the live command and latency evidence now collected.
 
 The larger optional domains - Your Pack, Journal, Parking Lot, Downtime, faction clocks, rich continuity, and Undo - remain evidence-gated and should not be started yet.
 

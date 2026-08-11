@@ -34,6 +34,8 @@ The bot creates and validates a timestamped online backup immediately after its 
 uv run python -m quartermaster --db $env:QM_DATABASE_PATH backup
 ```
 
+Configured DM administrators can also invoke `/backup` in the Discord guild. It uses the same validated timestamped path, records a durable `PROCESSING -> COMMITTED/FAILED` receipt, and reports the resulting snapshot filename ephemerally. The Discord command does not attach the SQLite file; use the CLI or the configured backup directory to retrieve it.
+
 For a second mounted or network-backed destination, copy the validated snapshot there and apply the same retention count:
 
 ```powershell
