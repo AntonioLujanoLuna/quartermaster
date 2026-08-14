@@ -479,6 +479,37 @@ class GrantLootModal(discord.ui.Modal, title="Grant loot"):
             await _send_error(interaction, f"Loot could not be granted: {error}")
 
 
+class CombatCloseoutView(discord.ui.View):
+    """The end-of-combat controls: spoils into the stash, or the open drops.
+
+    Combat ending is the moment loot exists, and it was also the moment the
+    handoff used to stop — the DM read `!i end` and was left to remember which
+    command records what they just won. These two buttons are the existing
+    Party Stash and Loot Drop workflows reached from where the fight ended.
+    """
+
+    def __init__(
+        self,
+        services: BotServices,
+        settings: Settings,
+        loot: LootDropService,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.services = services
+        self.settings = settings
+        self.loot = loot
+
+    @discord.ui.button(label="Record spoils", style=discord.ButtonStyle.primary, custom_id="qm:combat:grant")
+    async def grant(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if await _launcher_admin(interaction, self.settings):
+            await interaction.response.send_modal(GrantLootModal(self.services.inventory, self.settings))
+
+    @discord.ui.button(label="Open Loot", style=discord.ButtonStyle.secondary, custom_id="qm:combat:loot")
+    async def loot_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if await _launcher_admin(interaction, self.settings):
+            await _launcher_loot(interaction, self.services, self.loot, self.settings)
+
+
 class QuartermasterLauncherView(discord.ui.View):
     def __init__(
         self,

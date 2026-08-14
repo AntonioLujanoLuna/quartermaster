@@ -211,6 +211,13 @@ def health_report(
         "schema": "OK" if schema_version == SCHEMA_VERSION else "FAILED",
         "session_invariant": "OK" if active_sessions <= 1 else "FAILED",
         "processing_receipts": "OK" if processing_receipts == 0 else "DEGRADED",
+        # Nothing in the running bot creates a provider operation today: the
+        # only writer is the parked Avrae Cog, which no Quartermaster process
+        # loads. This check therefore cannot fail on the current build. It is
+        # kept because the recovery path that produces UNKNOWN is real and the
+        # first live gateway must not ship without the health surface that
+        # watches it — but do not read a green result here as evidence that an
+        # Avrae integration is running.
         "provider_operations": "OK"
         if provider_operations_unknown == 0 and provider_operations_requested == 0
         else "DEGRADED",

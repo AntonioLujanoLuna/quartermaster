@@ -9,8 +9,9 @@ from pathlib import Path
 
 import discord
 
-from .avrae_handoff import AvraeHandoffService
+from .avrae_handoff import AvraeHandoffService, native_command
 from .characters import CharacterService
+from .combat import CombatService, format_duration
 from .config import Settings
 from .currency import CurrencyService
 from .db import SQLiteStore
@@ -37,6 +38,7 @@ class BotServices:
     currency: CurrencyService | None = None
     loot: LootDropService | None = None
     avrae_handoff: AvraeHandoffService | None = None
+    combat: CombatService | None = None
 
 
 def _actor_id(interaction: discord.Interaction) -> str:
@@ -232,6 +234,122 @@ def _render_loot(drops: list[dict], handles: dict[str, str] | None = None) -> st
             f"{unclaimable} {entries} above have no claim control here. "
             "Claim or close what is showing and open this again."
         )
+    return fit_discord_lines(lines, label="Loot Drop")
+
+
+_AVRAE_AUTHORITY = (
+    "Avrae holds initiative, HP, conditions, and every mechanical result. "
+    "Quartermaster tracks only that the fight is happening."
+)
+_NO_SESSION = "No active Quartermaster session. Start one with `/session-start` before opening combat."
+
+
+def _render_open_drops(drops: list[dict]) -> list[str]:
+    """The outstanding-loot lines shared by the status and closeout cards."""
+    if not drops:
+        return []
+    lines = ["", "Open Loot Drops in this session:"]
+    for drop in drops:
+        remaining = drop["remaining_quantity"]
+        if not remaining:
+            lines.append(f"• `{drop['drop_id'][:8]}` — nothing left unclaimed, still open")
+            continue
+        entries = "entry" if drop["item_count"] == 1 else "entries"
+        lines.append(f"• `{drop['drop_id'][:8]}` — {remaining} unclaimed across {drop['item_count']} {entries}")
+    return lines
+
+
+def _render_combat_opened(response: dict) -> str:
+    if response["status"] == "NO_ACTIVE_SESSION":
+        return f"**COMBAT**\n\n{_NO_SESSION}"
+    if response["status"] == "ALREADY_OPEN":
+        duration = format_duration(response["elapsed_seconds"])
+        running = f", running {duration}" if duration else ""
+        return (
+            "**COMBAT ALREADY OPEN**\n\n"
+            f"Session {response['session_number']} already has combat open in <#{response['channel_id']}>{running}.\n"
+            "Close it with `/combat` → End combat before opening another."
+        )
+    lines = [
+        "**COMBAT OPEN**",
+        "",
+        f"Session {response['session_number']} · Quartermaster is tracking combat in <#{response['channel_id']}>.",
+        "",
+        "Start it in Avrae:",
+        f"`{native_command('start')}`",
+        "",
+        "Players join with `/combat` → Join combat. Close it with `/combat` → End combat when the fight is done.",
+    ]
+    return "\n".join(lines)
+
+
+def _render_combat_closed(response: dict) -> str:
+    """The end-of-combat card: what closed, and where the spoils go next."""
+    if response["status"] == "NO_ACTIVE_SESSION":
+        return f"**COMBAT**\n\n{_NO_SESSION}"
+    if response["status"] == "NO_OPEN_COMBAT":
+        lines = [
+            "**COMBAT**",
+            "",
+            f"Session {response['session_number']} has no open Quartermaster combat to close.",
+            f"End the Avrae tracker with `{native_command('end')}` if it is still running.",
+        ]
+        lines.extend(_render_open_drops(response["open_drops"]))
+        return fit_discord_lines(lines, label="Loot Drop")
+    duration = format_duration(response["elapsed_seconds"])
+    ran = f" after {duration}" if duration else ""
+    lines = [
+        "**COMBAT CLOSED**",
+        "",
+        f"Session {response['session_number']} · combat in <#{response['channel_id']}> closed{ran}.",
+    ]
+    if response["outcome"]:
+        lines.append(f"Outcome: {response['outcome']}")
+    lines.extend(["", "End it in Avrae too, if you have not already:", f"`{native_command('end')}`"])
+    lines.extend(_render_open_drops(response["open_drops"]))
+    lines.extend(
+        [
+            "",
+            "Spoils: `/loot-drop` opens a claimable drop for the party, or record one straight "
+            "into the Party Stash with the button below.",
+        ]
+    )
+    return fit_discord_lines(lines, label="Loot Drop")
+
+
+def _render_combat_status(status: dict) -> str:
+    """Quartermaster's own view of the fight, with no Avrae state in it."""
+    lines = ["**COMBAT STATUS**", ""]
+    if status["status"] == "NO_ACTIVE_SESSION":
+        lines.append(_NO_SESSION)
+        return "\n".join(lines)
+    lines.append(f"Session {status['session_number']} is active.")
+    encounter = status["encounter"]
+    if encounter is not None:
+        duration = format_duration(encounter["elapsed_seconds"])
+        sentence = f"Combat is open in <#{encounter['channel_id']}>"
+        if duration:
+            sentence += f", running {duration}"
+        if encounter["opened_by"]:
+            sentence += f", opened by <@{encounter['opened_by']}>"
+        lines.append(sentence + ".")
+    else:
+        lines.append("No Quartermaster combat is open. `/combat` → Start combat opens one.")
+        last = status["last_closed"]
+        if last is not None:
+            ran = format_duration(last["elapsed_seconds"])
+            ago = format_duration(last["closed_seconds_ago"])
+            sentence = "The previous combat"
+            if ran:
+                sentence += f" ran {ran} and"
+            sentence += " closed"
+            if ago:
+                sentence += f" {ago} ago"
+            lines.append(f"{sentence} in <#{last['channel_id']}>.")
+            if last["outcome"]:
+                lines.append(f"Outcome: {last['outcome']}")
+    lines.extend(_render_open_drops(status["open_drops"]))
+    lines.extend(["", _AVRAE_AUTHORITY])
     return fit_discord_lines(lines, label="Loot Drop")
 
 

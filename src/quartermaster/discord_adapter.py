@@ -10,6 +10,7 @@ from discord.ext import commands
 
 from .avrae_handoff import AvraeHandoffService
 from .characters import CharacterService
+from .combat import CombatService
 from .config import Settings
 from .currency import CurrencyService
 from .db import SQLiteStore
@@ -42,6 +43,7 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
     loot = services.loot or LootDropService(services.store, services.receipts, HandleRepository(services.store))
     characters = services.characters or CharacterService(services.store, services.receipts)
     currency = services.currency or CurrencyService(services.store, services.receipts, handles=HandleRepository(services.store))
+    combat_service = services.combat or CombatService(services.store, services.receipts)
 
     register_commands(
         bot,
@@ -52,6 +54,7 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
         currency=currency,
         loot=loot,
         handoff=handoff,
+        combat_service=combat_service,
     )
 
     async def setup_hook() -> None:
@@ -117,14 +120,16 @@ def run_bot(settings: Settings) -> None:
     )
     logger.info("startup maintenance completed: %s", maintenance)
     loot = LootDropService(store, receipts, handles)
+    combat = CombatService(store, receipts)
     services = BotServices(
         store=store,
         receipts=receipts,
         inventory=InventoryService(store, receipts, handles),
-        sessions=SessionService(store, receipts, loot),
+        sessions=SessionService(store, receipts, loot, combat),
         characters=CharacterService(store, receipts),
         currency=CurrencyService(store, receipts, handles=handles),
         loot=loot,
+        combat=combat,
     )
     bot = create_bot(settings, services)
     bot.run(settings.require_discord_token())

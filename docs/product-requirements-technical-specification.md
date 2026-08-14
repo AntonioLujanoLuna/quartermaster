@@ -286,9 +286,10 @@ Do not assume specific Discord REST routes share a particular bucket. Runtime sc
 Avrae owns:
 
 - character mechanics,
-- combat,
+- combat resolution,
 - initiative,
 - HP,
+- conditions and effects,
 - spell slots,
 - class resources,
 - rechargeable counters where configured.
@@ -302,7 +303,19 @@ Quartermaster initially owns:
 - ownership,
 - provenance,
 - session records,
+- the combat encounter record,
 - Quartermaster ledger.
+
+The combat encounter record is the one place these two lists come close, so the split is
+stated exactly. Quartermaster owns *that* a fight is happening: which session it belongs to,
+which channel it runs in, when it opened and closed, and the DM's note on how it resolved.
+Avrae owns everything *inside* the fight. Quartermaster opening or closing its record does
+not start or end an Avrae combat, and the two can disagree without either being wrong — a DM
+who forgets `/combat end` has stale Quartermaster bookkeeping, not a corrupted mechanic.
+
+A column for HP, initiative, conditions, resources, or combatants on the Quartermaster
+encounter would violate 8.3. A test asserts the table's exact column set to keep that from
+happening by accident.
 
 Potentially later:
 

@@ -1,6 +1,7 @@
 """Quartermaster core runtime."""
 
 from .avrae_handoff import AvraeHandoffCard, AvraeHandoffService
+from .combat import CombatError, CombatService
 from .config import Settings
 from .db import SQLiteStore
 from .handles import HandleRepository
@@ -18,6 +19,8 @@ __all__ = [
     "AvraeHandoffService",
     "AvraeGateway",
     "AvraeInteractionContext",
+    "CombatError",
+    "CombatService",
     "ProviderIntegrationService",
     "ProviderRequest",
     "ProviderResult",
