@@ -103,6 +103,7 @@ def run_bot(settings: Settings) -> None:
     receipts = ReceiptRepository(store)
     handles = HandleRepository(store)
     recovery = recover_startup(
+        store,
         receipts,
         handles,
         receipt_retention_seconds=settings.receipt_retention_seconds,

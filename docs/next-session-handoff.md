@@ -24,9 +24,9 @@ Canonical state is SQLite at schema 10. Discord messages are disposable projecti
 **Runtime and durability.** Configuration is validated at startup. FAST interactions run
 their mutation and receipt in one transaction; DEFERRED interactions persist `PROCESSING`
 before acknowledgement and finalize to `COMMITTED`/`FAILED`. Startup recovery fails any
-receipt interrupted mid-flight and marks the matching provider operations `UNKNOWN`.
-Mutations are addressed by opaque single-use handles carrying the read set they were
-rendered against.
+receipt interrupted mid-flight, marks the matching provider operations `UNKNOWN`, and
+releases any projection claim left behind by the previous run. Mutations are addressed by
+opaque single-use handles carrying the read set they were rendered against.
 
 **Domain.** Party Stash grant/browse/take, Loot Drops (create, claim, manual close,
 session close, absolute expiry), sessions, integer-only treasury with adjust/split/give,
@@ -36,7 +36,10 @@ actor's registered active character and both require one.
 
 **Projection.** State targets are scheduled by normalized lateness; events deliver FIFO
 per destination and bind to durable per-session threads. Undeliverable events dead-letter
-after eight hard failures instead of blocking their destination.
+after eight hard failures instead of blocking their destination. A target's claim is leased,
+so a claim that outlives its delivery is taken back rather than hiding the target forever.
+The runner survives a failed iteration, and every database call it makes — including the
+transport's session-thread binding — runs in a worker thread rather than on the event loop.
 
 **Operations.** `health`, `maintenance`, `backup`, `restore`, and `requeue-events` on the
 CLI; validated timestamped backups on a schedule with retention; `/quartermaster` as the
@@ -47,9 +50,37 @@ commands. The provider operation boundary is durable but has no live gateway beh
 mechanics are mirrored. The extension scaffold at `integrations/avrae/quartermaster_cog.py`
 has never been loaded in an Avrae deployment.
 
-**Checks.** 127 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
-on every pull request. Line coverage is 84% overall; the Discord command and view surface,
-previously covered only by a registration test, is at 92% and 85%.
+**Checks.** 132 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+on every pull request.
+
+## Second correction pass on 2026-08-14
+
+A review of the delivery runtime found three defects. Each is silent, each ends with the
+bot online and answering commands while Discord quietly stops reflecting canonical state,
+and each is fixed and covered by a test that fails against the old behaviour.
+
+- **A projection claim survived the process that took it.** `_claim_next_target` sets
+  `in_flight`, only the same process clears it, and the scheduler skips claimed targets.
+  A crash during the Discord round-trip therefore retired that surface permanently:
+  nothing on the startup path cleared the flag, so restarting did not help either, and
+  health reported an ordinary `DEGRADED` backlog that never drained. Startup now releases
+  every claim, and a claim is leased for five minutes so the same stall cannot outlive one
+  delivery while the process stays up — which is what happens if recording the outcome is
+  itself what failed.
+
+- **One transient error ended all delivery for the life of the process.** Maintenance,
+  backup, and the surface check were each guarded inside the runner loop; the two delivery
+  calls were not. A `sqlite3.OperationalError` from the claim step — reachable whenever an
+  operator runs a CLI command against the live database, which the runbook tells them to do
+  — ended the task. Nothing was logged until shutdown re-raised it. Each step is guarded and
+  logged now, so a bad iteration costs one second.
+
+- **The transport did its database work on the event loop.** `_ensure_session_thread` and
+  `_fetch_channel` read and wrote the store directly from the loop that runs discord.py's
+  heartbeat, while the store serializes every caller onto one connection. An ordinary
+  interaction's write could stall the gateway; measured, a held 0.5s write cost the loop
+  roughly 80% of its ticks. Those calls now go through `asyncio.to_thread`, as every other
+  database call in the runner already did.
 
 ## Correction pass on 2026-08-14
 
@@ -101,9 +132,27 @@ Also corrected:
   which needed an edit per migration and silently stopped simulating anything once it fell
   behind. It now builds a genuine previous-version database.
 
+## Observed but not acted on
+
+Neither of these is a defect; both are capability that exists without a caller, recorded so
+the next session decides deliberately rather than rediscovering them.
+
+- **The relative treasury split has no producer in the Discord layer.**
+  `create_relative_split_handle` and `split_relative_interaction` implement a split that
+  notices the active recipient set changed since the DM looked and asks for confirmation.
+  `/treasury-split` calls `split_treasury_interaction` directly and skips that check, so a
+  character who died between `/characters` and the split silently changes everyone's share.
+  This is the same shape as the take-all gap fixed in the previous pass, but the fix is a
+  product decision — it puts a confirmation step in front of a DM command — so it is left
+  for the table to choose.
+- **`local_metric_buckets` (migration 8) has no reader and no writer**, and
+  `internal_hard_deadline_seconds` and `ack_latency_ms` are likewise computed or validated
+  and never consumed. Latency budgets stay estimates until something records them.
+
 ## Not yet verified live
 
-Nothing in the correction pass has been exercised against the guild. Before the next session:
+Nothing in either correction pass has been exercised against the guild. Before the next
+session:
 
 1. `/stash` → `Browse`, and confirm both `Take 1` and the new `Take all` appear.
 2. `Take all` on a stack the DM grows in between, and confirm the confirmation prompt reads
@@ -114,6 +163,11 @@ Nothing in the correction pass has been exercised against the guild. Before the 
    normalized stack names on the live database.
 5. `health` after a deliberately broken session thread, and `requeue-events` once it is
    recreated.
+6. Kill the bot mid-delivery (stop it while a grant is still propagating), restart, and
+   confirm the startup log reports a released projection claim and the Party Stash converges
+   without a manual database edit.
+7. Run `maintenance` from the CLI while the bot is up and a grant is in flight, and confirm
+   the runner logs at most a failed iteration and keeps delivering.
 
 ## Live Discord setup
 

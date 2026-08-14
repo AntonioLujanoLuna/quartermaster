@@ -304,7 +304,9 @@ class QuartermasterCoreTests(unittest.TestCase):
     def test_deferred_processing_is_recovered_as_failed(self) -> None:
         started = self.receipts.begin_deferred("interaction-3", actor_id="actor-1", response_kind="export")
         self.assertEqual(started.status, "PROCESSING")
-        self.assertEqual(recover_startup(self.receipts, self.handles)["failed_deferred_receipts"], 1)
+        self.assertEqual(
+            recover_startup(self.store, self.receipts, self.handles)["failed_deferred_receipts"], 1
+        )
         recovered = self.receipts.begin_deferred("interaction-3", actor_id="actor-1", response_kind="export")
         self.assertEqual(recovered.status, "FAILED")
         self.assertTrue(recovered.logical_response["retryable"])
@@ -1419,6 +1421,167 @@ class QuartermasterCoreTests(unittest.TestCase):
             self.store.connection.execute(
                 "SELECT dirty_since FROM projection_targets WHERE target_id = 'party-stash'"
             ).fetchone()["dirty_since"]
+        )
+
+    def test_projection_claim_abandoned_by_a_crash_is_released_at_startup(self) -> None:
+        """A crash between claiming a target and recording the delivery is survivable.
+
+        The claim is only ever cleared by the process that took it, and the
+        scheduler skips claimed targets, so without a release on the startup path
+        the Party Stash stops updating permanently — restarting does not help.
+        """
+        self.inventory.grant_interaction("claim-crash-1", actor_id="dm", item_name="Chalk", quantity=1)
+        scheduler = StateProjectionScheduler(self.store, FakeDiscordTransport())
+        self.assertIsNotNone(scheduler._claim_next_target())
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT in_flight FROM projection_targets WHERE target_id = 'party-stash'"
+            ).fetchone()["in_flight"],
+            1,
+        )
+
+        recovery = recover_startup(self.store, self.receipts, self.handles)
+        self.assertEqual(recovery["released_projection_claims"], 1)
+
+        transport = FakeDiscordTransport()
+        self.assertTrue(StateProjectionScheduler(self.store, transport).run_once())
+        self.assertEqual(transport.state_payloads["party-stash"]["items"][0]["item_name"], "Chalk")
+
+    def test_projection_claim_left_behind_mid_run_is_reclaimed_after_its_lease(self) -> None:
+        """Recording a delivery outcome can fail; the claim must not outlive the run.
+
+        Startup release covers a restart. This covers the same target being
+        stranded while the process stays up, which no restart is coming to fix.
+        """
+        self.inventory.grant_interaction("claim-lease-1", actor_id="dm", item_name="Whetstone", quantity=1)
+        clock = _StepClock()
+        scheduler = StateProjectionScheduler(self.store, FakeDiscordTransport(), now=clock)
+        self.assertIsNotNone(scheduler._claim_next_target())
+        # The delivery outcome never gets recorded: in_flight stays set.
+        self.assertIsNone(scheduler._claim_next_target())
+
+        clock.advance(301)
+        transport = FakeDiscordTransport()
+        recovered = StateProjectionScheduler(self.store, transport, now=clock)
+        self.assertTrue(recovered.run_once())
+        self.assertEqual(transport.state_payloads["party-stash"]["items"][0]["item_name"], "Whetstone")
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT dirty_since FROM projection_targets WHERE target_id = 'party-stash'"
+            ).fetchone()["dirty_since"]
+        )
+
+    def test_projection_runner_survives_a_failed_delivery_iteration(self) -> None:
+        """One transient database error must cost an iteration, not the runner.
+
+        Delivery was the only unguarded step in the loop, so an error there ended
+        the task while the bot stayed online: no projection and no event reached
+        Discord again until someone restarted the process.
+        """
+        from quartermaster.discord_projection import ProjectionRunner
+
+        self.inventory.grant_interaction("runner-guard-1", actor_id="dm", item_name="Spade", quantity=1)
+
+        class Transport(FakeDiscordTransport):
+            async def check_surface_reachability(self) -> dict[str, object]:
+                return {"surfaces": {}}
+
+            async def upsert_state(self, target_id, destination, payload, message_id):
+                return super().upsert_state(target_id, destination, payload, message_id)
+
+            async def deliver_event(self, destination, event_type, payload):
+                super().deliver_event(destination, event_type, payload)
+
+        transport = Transport()
+        runner = ProjectionRunner(
+            self.store,
+            transport,
+            maintenance_interval_seconds=3600,
+            backup_interval_seconds=3600,
+        )
+        failures = {"remaining": 1}
+        original_claim = StateProjectionScheduler._claim_next_target
+
+        def flaky_claim(scheduler_self):
+            if failures["remaining"]:
+                failures["remaining"] -= 1
+                raise sqlite3.OperationalError("database is locked")
+            return original_claim(scheduler_self)
+
+        async def run_runner() -> None:
+            stop_event = asyncio.Event()
+            task = asyncio.create_task(runner.run(stop_event))
+            await asyncio.sleep(0.2)
+            self.assertFalse(task.done(), "the runner must outlive a failed iteration")
+            stop_event.set()
+            await task
+
+        with mock.patch.object(StateProjectionScheduler, "_claim_next_target", flaky_claim):
+            with self.assertLogs("quartermaster.discord_projection", level="ERROR"):
+                asyncio.run(run_runner())
+
+        self.assertEqual(failures["remaining"], 0)
+        self.assertEqual(transport.state_payloads["party-stash"]["items"][0]["item_name"], "Spade")
+        self.assertTrue(transport.event_deliveries)
+
+    def test_session_thread_binding_keeps_database_work_off_the_event_loop(self) -> None:
+        """The transport shares one connection with every interaction thread.
+
+        Reading or writing it directly from the event loop lets an ordinary
+        interaction's write block discord.py's heartbeat for as long as it holds
+        the store, so every database call this transport makes belongs in a
+        worker thread.
+        """
+        session = self.sessions.start_session()
+        loop_thread = threading.get_ident()
+        touched_from: list[int] = []
+
+        class Thread:
+            id = 4242
+
+        class Channel:
+            async def create_thread(self, **_kwargs):
+                return Thread()
+
+            async def send(self, _content):
+                return None
+
+        class Bot:
+            async def fetch_channel(self, _channel_id):
+                return Channel()
+
+        settings = Settings(
+            guild_id="1",
+            database_path=self.db_path,
+            party_inventory_channel_id="10",
+            session_log_channel_id="11",
+        )
+        transport = DiscordProjectionTransport(Bot(), settings, self.store)
+        original_read, original_transaction = SQLiteStore.read, SQLiteStore.transaction
+
+        def traced_read(store_self):
+            touched_from.append(threading.get_ident())
+            return original_read(store_self)
+
+        def traced_transaction(store_self, *, immediate: bool = True):
+            touched_from.append(threading.get_ident())
+            return original_transaction(store_self, immediate=immediate)
+
+        async def deliver() -> None:
+            with mock.patch.object(SQLiteStore, "read", traced_read):
+                with mock.patch.object(SQLiteStore, "transaction", traced_transaction):
+                    await transport.deliver_event(
+                        f"session:{session['session_id']}", "SESSION_STARTED", {"session_number": 1}
+                    )
+
+        asyncio.run(deliver())
+        self.assertTrue(touched_from, "the delivery should have read the session thread binding")
+        self.assertNotIn(loop_thread, touched_from)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT discord_thread_id FROM sessions WHERE id = ?", (session["session_id"],)
+            ).fetchone()["discord_thread_id"],
+            "4242",
         )
 
     def test_one_active_character_per_discord_user_is_enforced(self) -> None:
