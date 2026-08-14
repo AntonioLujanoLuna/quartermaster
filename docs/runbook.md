@@ -26,9 +26,23 @@ uv run python -m quartermaster --db $env:QM_DATABASE_PATH maintenance
 uv run python -m quartermaster --db $env:QM_DATABASE_PATH export > .\quartermaster-export.md
 ```
 
-`health` checks SQLite integrity, schema version, the one-active-session invariant, receipt recovery state, outbox backlog, dead-lettered events, dirty projections, expired Loot Drops, the last transient-maintenance outcome, backup freshness, and the most recent Discord surface reachability check. A missing, failed, or stale Discord surface check is `DEGRADED`; pass `--discord-surface-max-age-seconds` to change the freshness window. The bot runs startup recovery, transient maintenance, scheduled backups, and surface checks while projection delivery is running; the `maintenance` command remains available for operator-triggered cleanup. It expires due drops and removes terminal receipts and consumed/expired handles after their configured retention periods.
+`health` checks SQLite integrity, schema version, the one-active-session invariant, receipt recovery state, outbox backlog, dead-lettered events, dirty and stuck projections, expired Loot Drops, the last transient-maintenance outcome, backup freshness, and the most recent Discord surface reachability check. A missing, failed, or stale Discord surface check is `DEGRADED`; pass `--discord-surface-max-age-seconds` to change the freshness window. The bot runs startup recovery, transient maintenance, scheduled backups, and surface checks while projection delivery is running; the `maintenance` command remains available for operator-triggered cleanup. It expires due drops and removes terminal receipts and consumed/expired handles after their configured retention periods.
 
 Configured DM administrators can use `/quartermaster` as the compact Discord control surface. It summarizes Party Stash and session state and provides Grant loot, Session, Stash, Open Loot, Treasury, Characters, Export, Backup, and Health actions. The launcher is ephemeral and uses the same authorization and durable workflows as the individual commands.
+
+## Truncated Discord surfaces
+
+Discord refuses any message over 2000 characters, so every Quartermaster surface renders within that limit and says when it had to stop. A pinned Party Stash ending in
+
+```
+… and 42 more Party Stash entries not shown here. The Quartermaster export holds the full record.
+```
+
+is working as intended, not damaged: the stash outgrew one Discord message. `export` is the complete record, and `/stash` → `Browse` still reaches individual stacks. The same note can appear on `/loot` and `/characters`. Nothing is dropped from canonical state — only from the disposable projection.
+
+## Upgrading to schema 11
+
+Schema 11 adds a failure counter to `projection_targets`. It takes a default and needs no operator action.
 
 ## Upgrading to schema 10
 
@@ -68,6 +82,19 @@ uv run python -m quartermaster --db $env:QM_DATABASE_PATH requeue-events --desti
 ```
 
 Requeueing before fixing the destination just spends the failure budget again. If the destination is gone for good and the notification no longer matters, leaving the row `FAILED` is a valid end state — but health will keep reporting it, so prefer requeueing once the surface is healthy.
+
+## Stuck state projections
+
+A state projection is not queued behind anything, so it is never dead-lettered: the Party Stash message reflects current state, and one successful delivery makes it correct again no matter how many failed before it. It does back off. Hard failures double the wait up to five minutes, so a surface that is failing on something structural — the channel deleted, the bot's permission to it revoked — costs one attempt every five minutes rather than one every second. Rate limits wait exactly as long as Discord asks and do not count.
+
+After eight consecutive failures `health` stops calling it a backlog:
+
+```
+- state_projections: FAILED
+- projection party-stash: 8 consecutive failures: 403 Forbidden (error code: 50013): Missing Permissions
+```
+
+Fix what the error names — the channel, the permission — and the next delivery clears the count on its own. Nothing has to be requeued. A `DEGRADED` `state_projections` with no `projection` line under it is an ordinary backlog and drains without help.
 
 ## Backup and restore
 

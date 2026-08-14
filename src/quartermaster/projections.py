@@ -17,6 +17,13 @@ from .transport import DiscordTransport, RateLimitedError
 
 _MAX_RETRY_BACKOFF_SECONDS = 300.0
 
+# A state target that has failed this many times in a row is not experiencing a
+# backlog, it is stuck on something an operator has to repair. It keeps retrying
+# — unlike an outbox event it blocks nothing, and the next success renders the
+# whole current state — but health names it rather than reporting the same
+# DEGRADED it reports for a surface that is one second behind.
+STUCK_PROJECTION_FAILURES = 8
+
 # A claim is held only for one Discord round-trip. Anything still holding one
 # after this long is not a delivery in progress, it is a claim that was never
 # released, and the target it belongs to is invisible to the scheduler until it
@@ -116,7 +123,9 @@ class StateProjectionScheduler:
             payload = render_state(self.store, target_id)
             message_id = self.transport.upsert_state(target_id, target["destination"], payload, target["discord_message_id"])
         except RateLimitedError as error:
-            self._record_failure(target_id, f"rate limited: {error}", error.retry_after_seconds)
+            self._record_failure(
+                target_id, f"rate limited: {error}", error.retry_after_seconds, rate_limited=True
+            )
             return False
         except Exception as error:
             self._record_failure(target_id, str(error), 1.0)
@@ -137,7 +146,13 @@ class StateProjectionScheduler:
             message_id = await result if inspect.isawaitable(result) else result
         except RateLimitedError as error:
             await asyncio.to_thread(
-                self._record_failure, target_id, f"rate limited: {error}", error.retry_after_seconds
+                partial(
+                    self._record_failure,
+                    target_id,
+                    f"rate limited: {error}",
+                    error.retry_after_seconds,
+                    rate_limited=True,
+                )
             )
             return False
         except Exception as error:
@@ -163,7 +178,8 @@ class StateProjectionScheduler:
                 """UPDATE projection_targets
                    SET discord_message_id = ?, delivered_revision = MAX(delivered_revision, ?),
                        dirty_since = CASE WHEN desired_revision <= ? THEN NULL ELSE dirty_since END,
-                       in_flight = 0, next_attempt_at = NULL, last_error = NULL, updated_at = ?
+                       in_flight = 0, next_attempt_at = NULL, last_error = NULL,
+                       failure_count = 0, updated_at = ?
                  WHERE target_id = ?""",
                 (message_id, rendered, rendered, now, target_id),
             )
@@ -202,12 +218,40 @@ class StateProjectionScheduler:
             )
             return row
 
-    def _record_failure(self, target_id: str, message: str, retry_after: float) -> None:
+    def _record_failure(
+        self, target_id: str, message: str, retry_after: float, *, rate_limited: bool = False
+    ) -> None:
+        """Reschedule a failed delivery, backing off as failures repeat.
+
+        A fixed one-second retry is right for a transient error and wrong for
+        everything else. A surface can fail the same way indefinitely — a
+        deleted channel, a revoked permission, content the destination refuses —
+        and at a fixed second that is one Discord call per second for as long as
+        the bot runs, with nothing in health distinguishing it from a projection
+        that is momentarily behind. Hard failures back off exponentially to the
+        same ceiling the event outbox uses; rate limits are the transport
+        working as intended, so they wait exactly as long as Discord asked and
+        do not count as failures.
+        """
         now = self.now()
         with self.store.transaction() as connection:
+            row = connection.execute(
+                "SELECT failure_count FROM projection_targets WHERE target_id = ?", (target_id,)
+            ).fetchone()
+            if row is None:
+                return
+            failure_count = int(row["failure_count"]) + (0 if rate_limited else 1)
+            delay = (
+                retry_after
+                if rate_limited
+                else min(retry_after * (2 ** (failure_count - 1)), _MAX_RETRY_BACKOFF_SECONDS)
+            )
             connection.execute(
-                "UPDATE projection_targets SET in_flight = 0, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE target_id = ?",
-                (_plus_seconds(now, retry_after), message, now, target_id),
+                """UPDATE projection_targets
+                      SET in_flight = 0, failure_count = ?, next_attempt_at = ?,
+                          last_error = ?, updated_at = ?
+                    WHERE target_id = ?""",
+                (failure_count, _plus_seconds(now, delay), message, now, target_id),
             )
 
 

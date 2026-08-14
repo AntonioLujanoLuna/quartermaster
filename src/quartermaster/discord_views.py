@@ -166,7 +166,7 @@ class PartyStashView(discord.ui.View):
             await _send_execution(
                 interaction,
                 execution,
-                _render_stash(prepared["items"]),
+                _render_stash(prepared["items"], total=prepared.get("total_items")),
                 ephemeral=True,
                 view=view,
             )
@@ -295,7 +295,7 @@ async def _launcher_loot(
         await _send_execution(
             interaction,
             execution,
-            _render_loot(prepared["drops"]),
+            _render_loot(prepared["drops"], prepared["handles"]),
             ephemeral=True,
             view=LootDropView(loot, settings, _actor_id(interaction), prepared["drops"], prepared["handles"]),
         )

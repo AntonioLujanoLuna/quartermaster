@@ -52,6 +52,11 @@ The adapter registers guild-scoped `/stash`, `/grant`, `/session-start`, and `/s
 
 Taking from the Party Stash transfers ownership to the taker's registered active character, exactly as a Loot Drop claim does; an actor with no active registered character cannot take. A Discord user may have at most one active character at a time, which is what makes an even treasury split even.
 
+Every message Quartermaster sends is rendered within Discord's 2000-character limit. List
+surfaces — the Party Stash projection, `/stash`, `/loot`, `/characters` — drop whole entries
+from the end and say how many they dropped rather than letting Discord reject the message;
+the export is the complete record.
+
 The Discord transport is intentionally an adapter boundary at this stage. No network calls occur in the core package or in a database transaction. The adapter is split into `discord_common` (services, authorization, response helpers), `discord_views` (components and launcher actions), `discord_commands` (slash command registration), and `discord_adapter` (bot assembly and the runtime loop).
 
 For managed Windows startup, backup/restore, health, maintenance, dead-lettered events, and degraded operation, see [the operator runbook](docs/runbook.md).

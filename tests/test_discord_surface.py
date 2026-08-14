@@ -40,6 +40,7 @@ from quartermaster.handles import HandleRepository
 from quartermaster.inventory import InventoryService
 from quartermaster.loot import LootDropService
 from quartermaster.receipts import ReceiptRepository
+from quartermaster.rendering import DISCORD_MESSAGE_LIMIT
 from quartermaster.sessions import SessionService
 
 GUILD_ID = 4242
@@ -305,6 +306,44 @@ class DiscordSurfaceTests(unittest.TestCase):
         run(self.command("stash")(interaction))
         self.assertIn("Nothing is recorded yet.", interaction.text)
 
+    def test_a_stash_too_large_for_one_message_still_answers_and_says_so(self) -> None:
+        """`/stash` must survive the campaign that fills it.
+
+        Discord rejects content over 2000 characters outright, so an unbounded
+        listing does not read badly — it fails the interaction, and the player
+        sees only that Quartermaster did not respond.
+        """
+        for index in range(120):
+            run(self.command("grant")(self.dm(), item=f"Relic of the Sunken Court {index}", quantity=1))
+        interaction = self.player()
+        run(self.command("stash")(interaction))
+        self.assertLessEqual(len(interaction.text), DISCORD_MESSAGE_LIMIT)
+        self.assertIn("**PARTY STASH**", interaction.text)
+        self.assertIn("not shown here", interaction.text)
+
+    def test_browse_says_when_it_holds_only_part_of_the_stash(self) -> None:
+        """A capped snapshot read as the whole stash is worse than a short one."""
+        for index in range(40):
+            run(self.command("grant")(self.dm(), item=f"Relic {index}", quantity=1))
+        stash_interaction = self.player()
+        run(self.command("stash")(stash_interaction))
+        browse_interaction = self.player()
+        run(stash_interaction.kwargs["view"].children[0].callback(browse_interaction))
+        self.assertIn("Showing 25 of 40 stacks", browse_interaction.text)
+        self.assertLessEqual(len(browse_interaction.text), DISCORD_MESSAGE_LIMIT)
+
+    def test_a_character_roster_too_large_for_one_message_still_answers(self) -> None:
+        for index in range(60):
+            run(
+                self.command("character-add")(
+                    self.dm(), name=f"Adventurer of the Long Road {index}", discord_user_id=None
+                )
+            )
+        interaction = self.player()
+        run(self.command("characters")(interaction))
+        self.assertLessEqual(len(interaction.text), DISCORD_MESSAGE_LIMIT)
+        self.assertIn("not shown here", interaction.text)
+
     def test_browse_then_take_transfers_the_item_to_the_players_character(self) -> None:
         character_id = self.register_player_character()
         run(self.command("grant")(self.dm(), item="Rope", quantity=2))
@@ -447,6 +486,21 @@ class DiscordSurfaceTests(unittest.TestCase):
             ).fetchone()["quantity"],
             1,
         )
+
+    def test_loot_listing_names_items_it_has_no_claim_control_for(self) -> None:
+        """One view carries a bounded number of buttons; the rest must be admitted.
+
+        Listing an item with no control and saying nothing leaves the player
+        waiting for a button that is never going to appear.
+        """
+        self.register_player_character()
+        for index in range(30):
+            run(self.command("loot-drop")(self.dm(), item=f"Loot Gem {index}", quantity=1))
+        listing = self.player()
+        run(self.command("loot")(listing))
+        self.assertLessEqual(len(listing.text), DISCORD_MESSAGE_LIMIT)
+        self.assertIn("have no claim control here", listing.text)
+        self.assertLessEqual(len(listing.kwargs["view"].children), 25)
 
     def test_loot_listing_is_explicit_when_there_is_nothing_open(self) -> None:
         interaction = self.player()

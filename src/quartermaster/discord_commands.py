@@ -149,7 +149,7 @@ def register_commands(
             await _send_execution(
                 interaction,
                 execution,
-                _render_loot(prepared["drops"]),
+                _render_loot(prepared["drops"], prepared["handles"]),
                 ephemeral=True,
                 view=LootDropView(loot, settings, _actor_id(interaction), prepared["drops"], prepared["handles"]),
             )

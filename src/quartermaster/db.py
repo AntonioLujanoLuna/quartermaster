@@ -10,7 +10,7 @@ from threading import RLock
 
 from .naming import normalize_name
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class MigrationError(RuntimeError):
@@ -267,6 +267,9 @@ MIGRATIONS: dict[int, str] = {
     ALTER TABLE event_outbox ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE event_outbox ADD COLUMN failed_at TEXT;
     CREATE INDEX event_outbox_failed_idx ON event_outbox(status, destination, id);
+    """,
+    11: """
+    ALTER TABLE projection_targets ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;
     """,
 }
 
