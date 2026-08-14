@@ -115,7 +115,7 @@ class DiscordProjectionTransport:
             result["surfaces"][name] = {"channel_id": channel_id, "reachable": True}
         return result
 
-    async def _ensure_session_thread(self, session_id: str) -> str | None:
+    def _read_session_thread(self, session_id: str) -> tuple[int, str | None] | None:
         if self.store is None:
             return None
         with self.store.read() as connection:
@@ -125,21 +125,13 @@ class DiscordProjectionTransport:
             ).fetchone()
         if session is None:
             return None
-        if session["discord_thread_id"]:
-            return str(session["discord_thread_id"])
+        thread_id = session["discord_thread_id"]
+        return int(session["session_number"]), str(thread_id) if thread_id else None
 
-        base_channel = await self.bot.fetch_channel(int(self.settings.session_log_channel_id))
-        try:
-            thread = await base_channel.create_thread(
-                name=f"Session {session['session_number']}",
-                type=discord.ChannelType.public_thread,
-                auto_archive_duration=10080,
-            )
-        except discord.HTTPException as error:
-            if error.status == 429:
-                raise RateLimitedError(getattr(error, "retry_after", 1.0)) from error
-            raise
-
+    def _bind_session_thread(self, session_id: str, thread_id: str) -> str | None:
+        """Record the thread this session's events belong to, once and for all."""
+        if self.store is None:
+            return None
         with self.store.transaction() as transaction:
             current = transaction.execute(
                 "SELECT discord_thread_id FROM sessions WHERE id = ?",
@@ -150,31 +142,73 @@ class DiscordProjectionTransport:
             if current["discord_thread_id"] is None:
                 transaction.execute(
                     "UPDATE sessions SET discord_thread_id = ? WHERE id = ? AND discord_thread_id IS NULL",
-                    (str(thread.id), session_id),
+                    (thread_id, session_id),
                 )
-                return str(thread.id)
+                return thread_id
             return str(current["discord_thread_id"])
+
+    def _unbind_session_thread(self, thread_id: str) -> None:
+        if self.store is None:
+            return
+        with self.store.transaction() as transaction:
+            transaction.execute(
+                "UPDATE sessions SET discord_thread_id = NULL WHERE discord_thread_id = ?",
+                (thread_id,),
+            )
+
+    def _active_session_id(self) -> str:
+        if self.store is None:
+            return ""
+        with self.store.read() as connection:
+            active = connection.execute(
+                "SELECT id FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
+            ).fetchone()
+        return str(active["id"]) if active else ""
+
+    async def _ensure_session_thread(self, session_id: str) -> str | None:
+        """Resolve this session's durable thread, creating it the first time.
+
+        The database work runs in a worker thread. This transport is driven from
+        the bot's event loop, which is also where discord.py's heartbeat lives,
+        and the store serializes every caller onto one connection: reading or
+        writing here directly hands an interaction's write the power to stall the
+        gateway connection.
+        """
+        if self.store is None:
+            return None
+        session = await asyncio.to_thread(self._read_session_thread, session_id)
+        if session is None:
+            return None
+        session_number, existing_thread_id = session
+        if existing_thread_id:
+            return existing_thread_id
+
+        base_channel = await self.bot.fetch_channel(int(self.settings.session_log_channel_id))
+        try:
+            thread = await base_channel.create_thread(
+                name=f"Session {session_number}",
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=10080,
+            )
+        except discord.HTTPException as error:
+            if error.status == 429:
+                raise RateLimitedError(getattr(error, "retry_after", 1.0)) from error
+            raise
+
+        return await asyncio.to_thread(self._bind_session_thread, session_id, str(thread.id))
 
     async def _fetch_channel(self, destination: str) -> Any:
         if destination.startswith("session:"):
             session_id = destination.split(":", 1)[1]
             if session_id == "active" and self.store is not None:
-                with self.store.read() as connection:
-                    active = connection.execute(
-                        "SELECT id FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
-                    ).fetchone()
-                session_id = str(active["id"]) if active else ""
+                session_id = await asyncio.to_thread(self._active_session_id)
             if session_id:
                 thread_id = await self._ensure_session_thread(session_id)
                 if thread_id:
                     try:
                         return await self.bot.fetch_channel(int(thread_id))
                     except discord.NotFound:
-                        with self.store.transaction() as transaction:
-                            transaction.execute(
-                                "UPDATE sessions SET discord_thread_id = NULL WHERE discord_thread_id = ?",
-                                (thread_id,),
-                            )
+                        await asyncio.to_thread(self._unbind_session_thread, thread_id)
                         thread_id = await self._ensure_session_thread(session_id)
                         if thread_id:
                             return await self.bot.fetch_channel(int(thread_id))
@@ -261,12 +295,25 @@ class ProjectionRunner:
         )
 
     async def run(self, stop_event: asyncio.Event) -> None:
+        """Drive projection delivery until stopped, surviving a failed iteration.
+
+        Every step here is guarded. Maintenance, backup, and the surface check
+        already were; delivery was not, so one unexpected error — a `database is
+        locked` from the operator running a CLI command against the live
+        database, say — ended the task, and with it every projection and event
+        delivery for the rest of the process's life. The bot stayed online and
+        answered commands the whole time, and nothing said why the Party Stash
+        had stopped moving.
+        """
         next_maintenance = monotonic()
         next_backup = monotonic()
         next_surface_health = monotonic()
         while not stop_event.is_set():
             now = monotonic()
-            await asyncio.to_thread(expire_due_drops, self.store)
+            try:
+                await asyncio.to_thread(expire_due_drops, self.store)
+            except Exception:
+                logger.exception("loot drop expiry failed")
             if now >= next_maintenance:
                 try:
                     await asyncio.to_thread(
@@ -309,8 +356,16 @@ class ProjectionRunner:
                     )
                     logger.exception("Discord surface reachability check failed")
                 next_surface_health = monotonic() + self.surface_health_interval_seconds
-            delivered_state = await self.state.run_once_async(self.transport)
-            delivered_event = await self.events.run_once_async(self.transport)
+            try:
+                delivered_state = await self.state.run_once_async(self.transport)
+            except Exception:
+                logger.exception("state projection delivery failed")
+                delivered_state = False
+            try:
+                delivered_event = await self.events.run_once_async(self.transport)
+            except Exception:
+                logger.exception("event delivery failed")
+                delivered_event = False
             if not delivered_state and not delivered_event:
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=1.0)

@@ -17,10 +17,34 @@ from .transport import DiscordTransport, RateLimitedError
 
 _MAX_RETRY_BACKOFF_SECONDS = 300.0
 
+# A claim is held only for one Discord round-trip. Anything still holding one
+# after this long is not a delivery in progress, it is a claim that was never
+# released, and the target it belongs to is invisible to the scheduler until it
+# is taken back.
+_CLAIM_LEASE_SECONDS = 300.0
+
 
 def _plus_seconds(timestamp: str, seconds: float) -> str:
     parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     return (parsed + timedelta(seconds=seconds)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def release_projection_claims(store: SQLiteStore) -> int:
+    """Take back every in-flight claim so a restart can project again.
+
+    `_claim_next_target` marks a target `in_flight` and only the same process
+    clears it. A crash between the claim and the delivery record therefore
+    leaves the flag set, and because the scheduler only ever considers targets
+    with `in_flight = 0`, that surface stops updating permanently — a restart
+    does not help, because nothing on the startup path clears it. Exactly one
+    projection runner exists per database, so at startup nothing can legitimately
+    be in flight and every claim is safe to take back.
+    """
+    with store.transaction() as connection:
+        cursor = connection.execute(
+            "UPDATE projection_targets SET in_flight = 0 WHERE in_flight = 1",
+        )
+        return cursor.rowcount
 
 
 def render_state(store: SQLiteStore, target_id: str) -> dict[str, Any]:
@@ -145,7 +169,17 @@ class StateProjectionScheduler:
             )
 
     def _claim_next_target(self) -> Any:
+        """Claim the latest-relative-to-budget dirty target, or an abandoned claim.
+
+        A claim whose lease has run out is taken back rather than left in place:
+        recording the outcome of a delivery can itself fail, and without this the
+        target would stay marked in flight — and so stay unscheduled — for the
+        rest of the process's life. Re-rendering a target that really is still in
+        flight is harmless, because the delivery edits the same message and
+        success only ever advances `delivered_revision`.
+        """
         now = self.now()
+        lease_cutoff = _plus_seconds(now, -_CLAIM_LEASE_SECONDS)
         with self.store.transaction() as connection:
             row = connection.execute(
                 """SELECT *,
@@ -153,17 +187,18 @@ class StateProjectionScheduler:
                      FROM projection_targets
                     WHERE target_type = 'STATE'
                       AND dirty_since IS NOT NULL
-                      AND in_flight = 0
+                      AND (in_flight = 0 OR updated_at <= ?)
                       AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
                     ORDER BY normalized_lateness DESC, priority DESC, dirty_since ASC
                     LIMIT 1""",
-                (now, now),
+                (now, lease_cutoff, now),
             ).fetchone()
             if row is None:
                 return None
             connection.execute(
-                "UPDATE projection_targets SET in_flight = 1, updated_at = ? WHERE target_id = ? AND in_flight = 0",
-                (now, row["target_id"]),
+                """UPDATE projection_targets SET in_flight = 1, updated_at = ?
+                    WHERE target_id = ? AND (in_flight = 0 OR updated_at <= ?)""",
+                (now, row["target_id"], lease_cutoff),
             )
             return row
 
