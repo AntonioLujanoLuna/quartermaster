@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import Lock
 from time import monotonic
-from typing import Any, Callable
+from typing import Any
 
-from .metrics import record_metric
 from .receipts import ReceiptRepository, ReceiptResult
 
 
@@ -29,7 +29,6 @@ class FastExecutionResult:
     deferred: bool
     started_at: float = 0.0
     ack_latency_ms: float | None = None
-    metrics_store: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -38,7 +37,6 @@ class DeferredExecutionResult:
     deferred: bool
     started_at: float = 0.0
     ack_latency_ms: float | None = None
-    metrics_store: Any | None = None
 
 
 class DeferredExecutionError(RuntimeError):
@@ -92,7 +90,6 @@ async def execute_fast(
     soft_deadline_seconds: float = 1.2,
     write_active: Callable[[], bool] | None = None,
     ephemeral: bool = False,
-    metrics_store: Any | None = None,
 ) -> FastExecutionResult:
     """Run bounded local work without blocking Discord's acknowledgement loop."""
     if soft_deadline_seconds <= 0:
@@ -105,28 +102,16 @@ async def execute_fast(
     if not done and not active:
         controller.defer()
         await interaction.response.defer(ephemeral=ephemeral)
-        ack_latency_ms = (monotonic() - started_at) * 1000
-        if metrics_store is not None:
-            asyncio.create_task(
-                asyncio.to_thread(
-                    record_metric,
-                    metrics_store,
-                    "interaction_ack_latency_ms",
-                    ack_latency_ms,
-                    dimension="DEFERRED",
-                )
-            )
         return FastExecutionResult(
             await task,
             True,
             started_at=started_at,
-            ack_latency_ms=ack_latency_ms,
-            metrics_store=metrics_store,
+            ack_latency_ms=(monotonic() - started_at) * 1000,
         )
 
     value = await task
     controller.respond(value)
-    return FastExecutionResult(value, False, started_at=started_at, metrics_store=metrics_store)
+    return FastExecutionResult(value, False, started_at=started_at)
 
 
 async def execute_deferred(
@@ -137,7 +122,6 @@ async def execute_deferred(
     actor_id: str | None,
     response_kind: str,
     ephemeral: bool = False,
-    metrics_store: Any | None = None,
 ) -> DeferredExecutionResult:
     """Persist PROCESSING before acknowledgement and finish in a worker thread."""
     started_at = monotonic()
@@ -149,20 +133,10 @@ async def execute_deferred(
         response_kind=response_kind,
     )
     if initial.status != "PROCESSING":
-        return DeferredExecutionResult(initial, False, started_at=started_at, metrics_store=metrics_store)
+        return DeferredExecutionResult(initial, False, started_at=started_at)
 
     await interaction.response.defer(ephemeral=ephemeral)
     ack_latency_ms = (monotonic() - started_at) * 1000
-    if metrics_store is not None:
-        asyncio.create_task(
-            asyncio.to_thread(
-                record_metric,
-                metrics_store,
-                "interaction_ack_latency_ms",
-                ack_latency_ms,
-                dimension="DEFERRED",
-            )
-        )
     try:
         value = await asyncio.to_thread(operation)
     except Exception as error:
@@ -178,5 +152,4 @@ async def execute_deferred(
         True,
         started_at=started_at,
         ack_latency_ms=ack_latency_ms,
-        metrics_store=metrics_store,
     )

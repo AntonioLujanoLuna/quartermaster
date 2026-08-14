@@ -18,7 +18,6 @@ from .operations import create_scheduled_backup, record_discord_surface_health, 
 from .projections import EventOutboxWorker, StateProjectionScheduler
 from .transport import RateLimitedError
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -119,8 +118,7 @@ class DiscordProjectionTransport:
     async def _ensure_session_thread(self, session_id: str) -> str | None:
         if self.store is None:
             return None
-        with self.store.connection_lock:
-            connection = self.store._require_connection()
+        with self.store.read() as connection:
             session = connection.execute(
                 "SELECT session_number, discord_thread_id FROM sessions WHERE id = ?",
                 (session_id,),
@@ -161,8 +159,8 @@ class DiscordProjectionTransport:
         if destination.startswith("session:"):
             session_id = destination.split(":", 1)[1]
             if session_id == "active" and self.store is not None:
-                with self.store.connection_lock:
-                    active = self.store._require_connection().execute(
+                with self.store.read() as connection:
+                    active = connection.execute(
                         "SELECT id FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
                     ).fetchone()
                 session_id = str(active["id"]) if active else ""
@@ -316,5 +314,5 @@ class ProjectionRunner:
             if not delivered_state and not delivered_event:
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=1.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass

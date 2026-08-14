@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import inspect
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+import json
+from collections.abc import Callable
+from datetime import datetime, timedelta
+from typing import Any
 
 from .clock import iso_now
 from .currency import currency_from_row
 from .db import SQLiteStore
-from .metrics import record_metric
 from .transport import DiscordTransport, RateLimitedError
 
 
@@ -21,8 +21,7 @@ def _plus_seconds(timestamp: str, seconds: float) -> str:
 
 
 def render_state(store: SQLiteStore, target_id: str) -> dict[str, Any]:
-    with store.connection_lock:
-        connection = store._require_connection()
+    with store.read() as connection:
         if target_id == "party-stash":
             rows = connection.execute(
             """SELECT item_name, quantity, provenance
@@ -122,12 +121,7 @@ class StateProjectionScheduler:
 
     def _record_success(self, target: Any, message_id: str) -> None:
         target_id = target["target_id"]
-        dirty_duration_ms: float | None = None
         now = self.now()
-        if target["dirty_since"]:
-            dirty_at = datetime.fromisoformat(str(target["dirty_since"]).replace("Z", "+00:00"))
-            now_at = datetime.fromisoformat(now.replace("Z", "+00:00"))
-            dirty_duration_ms = max(0.0, (now_at - dirty_at).total_seconds() * 1000)
         with self.store.transaction() as connection:
             current = connection.execute("SELECT desired_revision FROM projection_targets WHERE target_id = ?", (target_id,)).fetchone()
             delivered = int(current["desired_revision"]) if current else int(target["desired_revision"])
@@ -138,14 +132,6 @@ class StateProjectionScheduler:
                        in_flight = 0, next_attempt_at = NULL, last_error = NULL, updated_at = ?
                  WHERE target_id = ?""",
                 (message_id, delivered, delivered, now, target_id),
-            )
-        if dirty_duration_ms is not None:
-            record_metric(
-                self.store,
-                "projection_dirty_duration_ms",
-                dirty_duration_ms,
-                dimension=str(target_id),
-                at=now,
             )
 
     def _claim_next_target(self) -> Any:
@@ -231,8 +217,7 @@ class EventOutboxWorker:
 
     def _next_event(self) -> Any:
         now = self.now()
-        with self.store.connection_lock:
-            connection = self.store._require_connection()
+        with self.store.read() as connection:
             return connection.execute(
                 """SELECT event.*
                      FROM event_outbox AS event

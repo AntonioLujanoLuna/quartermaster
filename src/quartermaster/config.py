@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
 
 class ConfigurationError(ValueError):
@@ -40,7 +40,7 @@ class Settings:
     discord_surface_health_max_age_seconds: int = 300
 
     @classmethod
-    def from_env(cls, environment: Mapping[str, str]) -> "Settings":
+    def from_env(cls, environment: Mapping[str, str]) -> Settings:
         guild_id = _required_id(environment, "QM_GUILD_ID")
         raw_path = environment.get("QM_DATABASE_PATH", "").strip()
         if not raw_path:

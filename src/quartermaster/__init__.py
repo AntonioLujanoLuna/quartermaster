@@ -1,7 +1,7 @@
 """Quartermaster core runtime."""
 
-from .config import Settings
 from .avrae_handoff import AvraeHandoffCard, AvraeHandoffService
+from .config import Settings
 from .db import SQLiteStore
 from .handles import HandleRepository
 from .integration import AvraeGateway, AvraeInteractionContext, ProviderIntegrationService, ProviderRequest, ProviderResult

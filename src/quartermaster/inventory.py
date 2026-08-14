@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import uuid
 from typing import Any
 
 from .clock import iso_now
 from .db import SQLiteStore
 from .events import append_event, mark_projection_dirty, session_event_destination
-from .handles import Handle, HandleError, HandleRepository
+from .handles import Handle, HandleRepository
 from .receipts import ReceiptRepository, ReceiptResult
 
 
@@ -26,6 +25,39 @@ def normalize_name(name: str) -> str:
     if not normalized:
         raise InventoryError("item name is required")
     return normalized
+
+
+def active_claimant(connection: Any, actor_id: str | None) -> Any:
+    """Resolve the active character a Discord actor may receive items as."""
+    return connection.execute(
+        "SELECT id, name FROM characters WHERE discord_user_id = ? AND lifecycle = 'ACTIVE'",
+        (actor_id,),
+    ).fetchone()
+
+
+def credit_character_stack(
+    connection: Any,
+    *,
+    owner_id: str,
+    item_name: str,
+    normalized_name: str,
+    quantity: int,
+    provenance: str | None,
+    now: str,
+) -> None:
+    """Move a quantity into a character's holdings, merging with any equal stack."""
+    connection.execute(
+        """INSERT INTO inventory_stacks(
+            id, item_name, normalized_name, variant_metadata, quantity,
+            provenance, owner_type, owner_id, version, last_acquired_at, updated_at
+        ) VALUES (?, ?, ?, '{}', ?, ?, 'CHARACTER', ?, 1, ?, ?)
+        ON CONFLICT(owner_type, owner_id, normalized_name, variant_metadata) DO UPDATE SET
+            quantity = inventory_stacks.quantity + excluded.quantity,
+            version = inventory_stacks.version + 1,
+            last_acquired_at = excluded.last_acquired_at,
+            updated_at = excluded.updated_at""",
+        (str(uuid.uuid4()), item_name, normalized_name, quantity, provenance, owner_id, now, now),
+    )
 
 
 class InventoryService:
@@ -178,19 +210,55 @@ class InventoryService:
         amount = current if mode == "RELATIVE" else int(handle.payload["amount"])
         if current < amount:
             raise InventoryError(f"only {current} remain")
+        # A Take is a transfer of ownership, not a deletion: the taker must be a
+        # registered active character, exactly as a Loot Drop claim requires.
+        taker = active_claimant(connection, actor_id)
+        if taker is None:
+            raise InventoryError("an active registered character is required to take Party Stash items")
         remaining = current - amount
         now = iso_now()
         if remaining == 0:
             connection.execute("DELETE FROM inventory_stacks WHERE id = ?", (stack_id,))
         else:
             connection.execute("UPDATE inventory_stacks SET quantity = ?, version = version + 1, updated_at = ? WHERE id = ?", (remaining, now, stack_id))
-        append_event(connection, operation_id=operation_id, actor_id=actor_id, event_type="ITEM_TAKEN", payload={"stack_id": stack_id, "item_name": row["item_name"], "quantity": amount, "remaining": remaining}, destination=session_event_destination(connection))
+        credit_character_stack(
+            connection,
+            owner_id=str(taker["id"]),
+            item_name=row["item_name"],
+            normalized_name=row["normalized_name"],
+            quantity=amount,
+            provenance=row["provenance"],
+            now=now,
+        )
+        append_event(
+            connection,
+            operation_id=operation_id,
+            actor_id=actor_id,
+            event_type="ITEM_TAKEN",
+            payload={
+                "stack_id": stack_id,
+                "item_name": row["item_name"],
+                "quantity": amount,
+                "remaining": remaining,
+                "character_id": str(taker["id"]),
+                "character_name": taker["name"],
+            },
+            destination=session_event_destination(connection),
+        )
         mark_projection_dirty(connection, target_id="party-stash", target_type="STATE", destination="party-inventory")
-        return {"status": "TAKEN", "stack_id": stack_id, "item_name": row["item_name"], "quantity": amount, "remaining": remaining}
+        return {
+            "status": "TAKEN",
+            "stack_id": stack_id,
+            "item_name": row["item_name"],
+            "quantity": amount,
+            "remaining": remaining,
+            "character_id": str(taker["id"]),
+            "character_name": taker["name"],
+        }
 
     def browse(self) -> list[dict[str, Any]]:
-        with self.store.connection_lock:
-            rows = self.store._require_connection().execute(
+        with self.store.read() as connection:
+            rows = connection.execute(
                 "SELECT id, item_name, quantity, provenance, version, updated_at FROM inventory_stacks WHERE owner_type = 'PARTY' AND owner_id = 'party' ORDER BY last_acquired_at DESC, item_name"
             ).fetchall()
         return [dict(row) for row in rows]

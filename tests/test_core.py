@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -11,15 +12,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from quartermaster.config import ConfigurationError, Settings
 from quartermaster.characters import CharacterError, CharacterService
+from quartermaster.config import ConfigurationError, Settings
 from quartermaster.currency import CurrencyError, CurrencySemanticStaleness, CurrencyService
 from quartermaster.db import SCHEMA_VERSION, SQLiteStore
+from quartermaster.discord_projection import DiscordProjectionTransport
 from quartermaster.export import render_export
 from quartermaster.handles import HandleError, HandleRepository
-from quartermaster.inventory import InventoryService, SemanticStaleness
+from quartermaster.inventory import InventoryError, InventoryService, SemanticStaleness
 from quartermaster.loot import LootDropError, LootDropService
-from quartermaster.metrics import metric_report, record_metric, render_metrics
 from quartermaster.operations import (
     create_backup,
     create_scheduled_backup,
@@ -43,7 +44,6 @@ from quartermaster.response import (
 )
 from quartermaster.sessions import SessionService
 from quartermaster.transport import FakeDiscordTransport, RateLimitedError
-from quartermaster.discord_projection import DiscordProjectionTransport
 
 
 class QuartermasterCoreTests(unittest.TestCase):
@@ -76,6 +76,122 @@ class QuartermasterCoreTests(unittest.TestCase):
                 (character_id, name, lifecycle),
             )
 
+    def _currency_total(self) -> dict[str, int]:
+        """Sum every denomination across every owner, party and characters alike."""
+        row = self.store.connection.execute(
+            """SELECT COALESCE(SUM(cp), 0) AS cp, COALESCE(SUM(sp), 0) AS sp,
+                      COALESCE(SUM(ep), 0) AS ep, COALESCE(SUM(gp), 0) AS gp,
+                      COALESCE(SUM(pp), 0) AS pp
+                 FROM currency_balances"""
+        ).fetchone()
+        return {denomination: int(row[denomination]) for denomination in ("cp", "sp", "ep", "gp", "pp")}
+
+    def _item_total(self) -> dict[str, int]:
+        """Sum every item by name across stacks and the open drops holding them."""
+        totals: dict[str, int] = {}
+        rows = self.store.connection.execute(
+            """SELECT normalized_name, SUM(quantity) AS quantity
+                 FROM inventory_stacks GROUP BY normalized_name
+               UNION ALL
+               SELECT item.normalized_name, SUM(item.remaining_quantity) AS quantity
+                 FROM loot_drop_items item
+                 JOIN loot_drops open_drop ON open_drop.id = item.drop_id
+                WHERE open_drop.status = 'OPEN'
+                GROUP BY item.normalized_name"""
+        ).fetchall()
+        for row in rows:
+            quantity = int(row["quantity"] or 0)
+            if quantity:
+                totals[str(row["normalized_name"])] = totals.get(str(row["normalized_name"]), 0) + quantity
+        return totals
+
+    def test_currency_operations_conserve_every_denomination(self) -> None:
+        """Currency only moves between owners; no operation may create or destroy it."""
+        self._insert_character("conserve-1", "Aria")
+        self._insert_character("conserve-2", "Borin")
+        self.currency.adjust_treasury_interaction(
+            "conserve-seed", actor_id="dm", deltas={"cp": 7, "sp": 13, "gp": 100, "pp": 3}
+        )
+        seeded = self._currency_total()
+        self.assertEqual(seeded, {"cp": 7, "sp": 13, "ep": 0, "gp": 100, "pp": 3})
+
+        self.currency.give_to_character_interaction(
+            "conserve-give", actor_id="dm", character_id="conserve-1", amounts={"gp": 1}
+        )
+        self.assertEqual(self._currency_total(), seeded)
+
+        handle_id = self.currency.create_relative_split_handle(actor_id="dm", amounts={"gp": 30})
+        self.currency.split_relative_interaction("conserve-relative", handle_id=handle_id, actor_id="dm")
+        self.assertEqual(self._currency_total(), seeded)
+
+        # An absolute split across three active characters leaves indivisible remainders.
+        self.currency.split_treasury_interaction(
+            "conserve-split", actor_id="dm", amounts={"cp": 7, "sp": 13, "gp": 60, "pp": 3}
+        )
+        self.assertEqual(self._currency_total(), seeded)
+
+        self.characters.transition_interaction(
+            "conserve-lifecycle", actor_id="dm", character_id="conserve-2", lifecycle="DEAD"
+        )
+        self.characters.resolve_belongings_interaction(
+            "conserve-resolve", actor_id="dm", character_id="conserve-2", destination="party"
+        )
+        self.assertEqual(self._currency_total(), seeded)
+
+    def test_take_transfers_ownership_and_requires_a_registered_character(self) -> None:
+        self.inventory.grant_interaction(
+            "ownership-grant", actor_id="dm", item_name="Owned Relic", quantity=2
+        )
+        prepared = self.inventory.prepare_take_view(actor_id="player")
+        stack_id = prepared["items"][0]["id"]
+        taken = self.inventory.take_interaction(
+            "ownership-take", handle_id=prepared["handles"][stack_id], actor_id="player"
+        )
+        self.assertEqual(taken.logical_response["character_id"], "player-character")
+        held = self.store.connection.execute(
+            """SELECT quantity FROM inventory_stacks
+                WHERE owner_type = 'CHARACTER' AND owner_id = 'player-character'
+                  AND normalized_name = 'owned relic'"""
+        ).fetchone()
+        self.assertEqual(held["quantity"], 1)
+
+        unregistered = self.inventory.create_take_handle(
+            stack_id=stack_id, actor_id="unregistered", amount=1
+        )
+        with self.assertRaisesRegex(InventoryError, "active registered character"):
+            self.inventory.take_interaction(
+                "ownership-unregistered", handle_id=unregistered, actor_id="unregistered"
+            )
+
+    def test_item_operations_conserve_quantities_across_owners_and_drops(self) -> None:
+        """Taking, claiming, and closing move items between holders without loss."""
+        self.inventory.grant_interaction(
+            "conserve-grant", actor_id="dm", item_name="Conservation Token", quantity=6
+        )
+        granted = self._item_total()
+        self.assertEqual(granted, {"conservation token": 6})
+
+        prepared = self.inventory.prepare_take_view(actor_id="player")
+        handle_id = prepared["handles"][prepared["items"][0]["id"]]
+        self.inventory.take_interaction("conserve-take", handle_id=handle_id, actor_id="player")
+        self.assertEqual(self._item_total(), granted)
+
+        drop = self.loot.create_drop_interaction(
+            "conserve-drop", actor_id="dm", items=[("Drop Token", 5, None)]
+        )
+        with_drop = self._item_total()
+        self.assertEqual(with_drop["drop token"], 5)
+
+        claim = self.loot.prepare_claim_view(actor_id="player")
+        claim_handle = claim["handles"][claim["drops"][0]["items"][0]["id"]]
+        self.loot.claim_interaction("conserve-claim", handle_id=claim_handle, actor_id="player")
+        self.assertEqual(self._item_total(), with_drop)
+
+        self.loot.close_drop_interaction(
+            "conserve-close", drop_id=drop.logical_response["drop_id"], actor_id="dm"
+        )
+        self.assertEqual(self._item_total(), with_drop)
+
     def test_settings_require_guild_and_database(self) -> None:
         with self.assertRaises(ConfigurationError):
             Settings.from_env({})
@@ -105,16 +221,17 @@ class QuartermasterCoreTests(unittest.TestCase):
     def test_server_owner_is_a_dm_administrator(self) -> None:
         from types import SimpleNamespace
 
-        from quartermaster.discord_adapter import _is_dm
+        from quartermaster.discord_common import _is_dm
 
         settings = Settings(guild_id="42", database_path=self.db_path)
         interaction = SimpleNamespace(guild=SimpleNamespace(owner_id=42), user=SimpleNamespace(id=42))
         self.assertTrue(asyncio.run(_is_dm(interaction, settings)))
 
     def test_dm_authorization_accepts_configured_role_and_rejects_other_members(self) -> None:
-        import discord
         from types import SimpleNamespace
         from unittest.mock import MagicMock
+
+        import discord
 
         member = MagicMock(spec=discord.Member)
         member.id = 7
@@ -123,7 +240,7 @@ class QuartermasterCoreTests(unittest.TestCase):
         interaction = SimpleNamespace(guild=SimpleNamespace(owner_id=99), user=member)
         allowed = Settings(guild_id="123", database_path=self.db_path, dm_role_ids=("44",))
         denied = Settings(guild_id="123", database_path=self.db_path, dm_role_ids=("55",))
-        from quartermaster.discord_adapter import _is_dm
+        from quartermaster.discord_common import _is_dm
 
         self.assertTrue(asyncio.run(_is_dm(interaction, allowed)))
         self.assertFalse(asyncio.run(_is_dm(interaction, denied)))
@@ -235,7 +352,7 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertTrue(interaction.response.deferred)
 
     def test_adapter_fast_path_uses_deadline_fallback(self) -> None:
-        from quartermaster.discord_adapter import _run_fast
+        from quartermaster.discord_common import _run_fast
 
         release = threading.Event()
 
@@ -406,8 +523,11 @@ class QuartermasterCoreTests(unittest.TestCase):
             amounts={"gp": 81},
         )
         self.assertEqual(result.logical_response["remainder"]["gp"], 1)
+        self.assertEqual(result.logical_response["distributed"]["gp"], 80)
         self.assertEqual(len(result.logical_response["recipients"]), 4)
-        self.assertEqual(self.currency.view_treasury()["gp"], 0)
+        # Specification 33.1: the indivisible remainder stays with the source.
+        self.assertEqual(self.currency.view_treasury()["gp"], 1)
+        self.assertEqual(result.logical_response["after"]["gp"], 1)
         balances = self.store.connection.execute(
             "SELECT owner_id, gp FROM currency_balances WHERE owner_type = 'CHARACTER' ORDER BY owner_id"
         ).fetchall()
@@ -565,7 +685,8 @@ class QuartermasterCoreTests(unittest.TestCase):
         )
         self.assertEqual(confirmed.logical_response["split"]["gp"], 80)
         self.assertEqual(confirmed.logical_response["remainder"]["gp"], 2)
-        self.assertEqual(self.currency.view_treasury()["gp"], 1)
+        # 81 gp held, 78 gp distributed three ways, 1 gp unsplit plus a 2 gp remainder.
+        self.assertEqual(self.currency.view_treasury()["gp"], 3)
 
     def test_export_and_party_stash_projection_include_treasury(self) -> None:
         self.currency.adjust_treasury_interaction("treasury-export", actor_id="dm", deltas={"gp": 80})
@@ -582,6 +703,37 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertTrue(backup.exists())
         with SQLiteStore(backup).open() as restored:
             self.assertEqual(restored.connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], SCHEMA_VERSION)
+
+    def test_restore_migrates_an_older_backup_without_mutating_it(self) -> None:
+        """A snapshot taken before the newest migration must still be restorable."""
+        self.inventory.grant_interaction("older-grant", actor_id="dm", item_name="Older Token", quantity=1)
+        backup = self.store.snapshot(Path(self.tempdir.name) / "older-backup.sqlite")
+        # Undo the newest migration in the snapshot so it is genuinely one version behind.
+        aged = sqlite3.connect(backup)
+        try:
+            aged.execute("DROP TABLE provider_operations")
+            aged.execute("DELETE FROM schema_migrations WHERE version = ?", (SCHEMA_VERSION,))
+            aged.commit()
+        finally:
+            aged.close()
+
+        restored = restore_backup(backup, Path(self.tempdir.name) / "restored-older.sqlite")
+        self.assertEqual(restored["source_schema_version"], SCHEMA_VERSION - 1)
+        self.assertEqual(restored["schema_version"], SCHEMA_VERSION)
+        with SQLiteStore(Path(self.tempdir.name) / "restored-older.sqlite").open() as restored_store:
+            self.assertIn("Older Token x1", render_export(restored_store))
+        # The archived snapshot keeps the schema it was taken at.
+        aged = sqlite3.connect(backup)
+        try:
+            self.assertEqual(
+                aged.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0],
+                SCHEMA_VERSION - 1,
+            )
+        finally:
+            aged.close()
+        self.assertFalse(
+            (Path(self.tempdir.name) / "restored-older.sqlite.restore-staging").exists()
+        )
 
     def test_backup_validation_and_restore_are_equivalent(self) -> None:
         self.inventory.grant_interaction("backup-grant", actor_id="dm", item_name="Backup Token", quantity=2)
@@ -717,8 +869,8 @@ class QuartermasterCoreTests(unittest.TestCase):
         )
 
     def test_quartermaster_launcher_summarizes_state_and_exposes_actions(self) -> None:
-        from quartermaster.discord_adapter import (
-            BotServices,
+        from quartermaster.discord_common import BotServices
+        from quartermaster.discord_views import (
             LauncherMoreView,
             QuartermasterLauncherView,
             _launcher_snapshot,
@@ -754,23 +906,11 @@ class QuartermasterCoreTests(unittest.TestCase):
         more = LauncherMoreView(services, settings, self.characters, self.currency, self.loot)
         self.assertEqual(
             {item.label for item in more.children},
-            {"Stash", "Open Loot", "Treasury", "Characters", "Export", "Backup", "Health", "Metrics"},
+            {"Stash", "Open Loot", "Treasury", "Characters", "Export", "Backup", "Health"},
         )
 
-    def test_local_metrics_report_aggregates_histogram_percentiles(self) -> None:
-        for duration in (4, 20, 40, 300, 600, 2500):
-            record_metric(self.store, "interaction_ack_latency_ms", duration, dimension="FAST")
-
-        report = metric_report(self.store)
-        values = report["metrics"]["interaction_ack_latency_ms"]["FAST"]
-        self.assertEqual(values["count"], 6)
-        self.assertEqual(values["p50_ms"], 50.0)
-        self.assertEqual(values["p95_ms"], 5000.0)
-        self.assertEqual(values["max_ms"], 2500.0)
-        self.assertIn("interaction_ack_latency_ms [FAST]", render_metrics(report))
-
     def test_discord_response_helper_omits_empty_view(self) -> None:
-        from quartermaster.discord_adapter import _send_execution
+        from quartermaster.discord_common import _send_execution
 
         class Response:
             def __init__(self) -> None:
@@ -793,7 +933,7 @@ class QuartermasterCoreTests(unittest.TestCase):
     def test_discord_backup_response_reports_validated_filename(self) -> None:
         from types import SimpleNamespace
 
-        from quartermaster.discord_adapter import _send_deferred_backup
+        from quartermaster.discord_common import _send_deferred_backup
 
         class Response:
             def __init__(self) -> None:
@@ -891,8 +1031,9 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertTrue(all(entry["reachable"] for entry in result["surfaces"].values()))
 
     def test_discord_surface_reachability_converts_rate_limits(self) -> None:
-        import discord
         from types import SimpleNamespace
+
+        import discord
 
         class RateLimitHTTPException(discord.HTTPException):
             def __init__(self) -> None:
@@ -913,8 +1054,9 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertEqual(raised.exception.retry_after_seconds, 4.5)
 
     def test_party_stash_pin_permission_failure_is_not_silently_ignored(self) -> None:
-        import discord
         from types import SimpleNamespace
+
+        import discord
 
         class Message:
             id = 456
@@ -948,7 +1090,7 @@ class QuartermasterCoreTests(unittest.TestCase):
 
         primary = Path(self.tempdir.name) / "runner-backups"
         self.inventory.grant_interaction(
-            "runner-metric-grant",
+            "runner-projection-grant",
             actor_id="dm",
             item_name="Runner Metric Token",
             quantity=1,
@@ -976,9 +1118,6 @@ class QuartermasterCoreTests(unittest.TestCase):
             ).fetchone()["last_status"],
             "OK",
         )
-        metric_values = metric_report(self.store)["metrics"]["projection_dirty_duration_ms"]
-        self.assertIn("party-stash", metric_values)
-        self.assertGreaterEqual(metric_values["party-stash"]["count"], 1)
 
     def test_session_projection_destination_moves_to_the_new_session(self) -> None:
         first = self.sessions.start_session()
@@ -1006,8 +1145,9 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertEqual(destinations, [f"session:{first['session_id']}", f"session:{second['session_id']}"])
 
     def test_deleted_party_stash_projection_is_recreated_and_pinned(self) -> None:
-        import discord
         from types import SimpleNamespace
+
+        import discord
 
         class Message:
             id = 456
@@ -1052,7 +1192,7 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertEqual(ended["status"], "CLOSED")
 
     def test_session_end_interaction_replays_without_closing_twice(self) -> None:
-        started = self.sessions.start_session()
+        self.sessions.start_session()
         first = self.sessions.end_interaction("session-end-1", actor_id="dm", where_ended="At the gate")
         replay = self.sessions.end_interaction("session-end-1", actor_id="dm", where_ended="Elsewhere")
         self.assertEqual(first.logical_response["status"], "CLOSED")
@@ -1081,7 +1221,7 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertEqual(character["quantity"], 1)
 
     def test_loot_claim_requires_an_active_registered_character(self) -> None:
-        created = self.loot.create_drop_interaction(
+        self.loot.create_drop_interaction(
             "unregistered-drop",
             actor_id="dm",
             items=[("Unregistered Token", 1, None)],

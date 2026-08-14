@@ -22,16 +22,13 @@ Run these commands from the repository root:
 
 ```powershell
 uv run python -m quartermaster --db $env:QM_DATABASE_PATH health
-uv run python -m quartermaster --db $env:QM_DATABASE_PATH metrics
 uv run python -m quartermaster --db $env:QM_DATABASE_PATH maintenance
 uv run python -m quartermaster --db $env:QM_DATABASE_PATH export > .\quartermaster-export.md
 ```
 
 `health` checks SQLite integrity, schema version, the one-active-session invariant, receipt recovery state, outbox backlog, dirty projections, expired Loot Drops, the last transient-maintenance outcome, backup freshness, and the most recent Discord surface reachability check. A missing, failed, or stale Discord surface check is `DEGRADED`; pass `--discord-surface-max-age-seconds` to change the freshness window. The bot runs startup recovery, transient maintenance, scheduled backups, and surface checks while projection delivery is running; the `maintenance` command remains available for operator-triggered cleanup. It expires due drops and removes terminal receipts and consumed/expired handles after their configured retention periods.
 
-Configured DM administrators can use `/quartermaster` as the compact Discord control surface. It summarizes Party Stash and session state and provides Grant loot, Session, Stash, Open Loot, Treasury, Characters, Export, Backup, Health, and Metrics actions. The launcher is ephemeral and uses the same authorization and durable workflows as the individual commands.
-
-`metrics` reports local aggregate ACK latency and projection dirty-duration percentiles for the recent window. It stores hourly bounded histograms only; actor and interaction identities are not retained. Use `--metric-window-hours` to change the default 24-hour window.
+Configured DM administrators can use `/quartermaster` as the compact Discord control surface. It summarizes Party Stash and session state and provides Grant loot, Session, Stash, Open Loot, Treasury, Characters, Export, Backup, and Health actions. The launcher is ephemeral and uses the same authorization and durable workflows as the individual commands.
 
 ## Backup and restore
 
@@ -72,6 +69,8 @@ uv run python -m quartermaster --db .\restored.sqlite export
 ```
 
 Only use `restore --replace` when the destination has been explicitly chosen and the current database has been backed up. Never overwrite the only copy of campaign state.
+
+A backup taken before a later schema migration is still restorable. Restore copies the snapshot first and brings the copy up to the current schema, so the archived file keeps the schema version it was taken at; the restored database is validated at the current version. A snapshot from a schema this build does not know is refused rather than migrated.
 
 ## Degraded operation
 

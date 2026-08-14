@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
-from typing import Iterator
-
 
 SCHEMA_VERSION = 9
 
@@ -248,7 +247,7 @@ class SQLiteStore:
         self.connection_lock = RLock()
         self._write_transaction_count = 0
 
-    def open(self) -> "SQLiteStore":
+    def open(self) -> SQLiteStore:
         if self.connection is not None:
             return self
         if self.path != ":memory:":
@@ -285,7 +284,7 @@ class SQLiteStore:
         # connection lock; taking that lock here would block acknowledgement.
         return self._write_transaction_count > 0
 
-    def __enter__(self) -> "SQLiteStore":
+    def __enter__(self) -> SQLiteStore:
         return self.open()
 
     def __exit__(self, *_: object) -> None:
@@ -324,6 +323,12 @@ class SQLiteStore:
                 raise MigrationError(f"schema version {current} is not supported target {SCHEMA_VERSION}")
         except sqlite3.Error as exc:
             raise MigrationError("schema migration failed") from exc
+
+    @contextmanager
+    def read(self) -> Iterator[sqlite3.Connection]:
+        """Borrow the shared connection for a read that must not interleave with a write."""
+        with self.connection_lock:
+            yield self._require_connection()
 
     @contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:

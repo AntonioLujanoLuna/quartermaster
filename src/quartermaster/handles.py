@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from .clock import iso_now
 from .db import SQLiteStore
@@ -70,7 +71,7 @@ class HandleRepository:
         handle_id = secrets.token_urlsafe(12)
         expires_at = None
         if ttl_seconds is not None:
-            expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat().replace("+00:00", "Z")
+            expires_at = (datetime.now(UTC) + timedelta(seconds=ttl_seconds)).isoformat().replace("+00:00", "Z")
         connection.execute(
             """INSERT INTO interaction_handles(
                 id, schema_version, workflow_type, action, actor_id, payload,

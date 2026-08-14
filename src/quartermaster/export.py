@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any
 
 from .currency import currency_from_row, format_currency
 from .db import SCHEMA_VERSION, SQLiteStore
 
 
 def render_export(store: SQLiteStore) -> str:
-    with store.connection_lock:
-        return _render_export(store)
+    with store.read() as connection:
+        return _render_export(connection)
 
 
-def _render_export(store: SQLiteStore) -> str:
-    connection = store._require_connection()
+def _render_export(connection: Any) -> str:
     active = connection.execute(
         "SELECT session_number, started_at FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
     ).fetchone()
@@ -40,7 +40,7 @@ def _render_export(store: SQLiteStore) -> str:
     history = connection.execute(
         "SELECT event_type, payload, created_at FROM ledger_entries ORDER BY created_at DESC LIMIT 10"
     ).fetchall()
-    generated = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    generated = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     lines = [
         "# Quartermaster Export",

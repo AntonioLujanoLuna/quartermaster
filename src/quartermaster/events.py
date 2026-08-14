@@ -8,7 +8,6 @@ from typing import Any
 
 from .clock import iso_now
 
-
 _PROJECTION_DEFAULTS: dict[str, tuple[float, int]] = {
     "party-stash": (2.0, 100),
     "session-surface": (5.0, 50),
