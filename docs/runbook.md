@@ -26,9 +26,48 @@ uv run python -m quartermaster --db $env:QM_DATABASE_PATH maintenance
 uv run python -m quartermaster --db $env:QM_DATABASE_PATH export > .\quartermaster-export.md
 ```
 
-`health` checks SQLite integrity, schema version, the one-active-session invariant, receipt recovery state, outbox backlog, dirty projections, expired Loot Drops, the last transient-maintenance outcome, backup freshness, and the most recent Discord surface reachability check. A missing, failed, or stale Discord surface check is `DEGRADED`; pass `--discord-surface-max-age-seconds` to change the freshness window. The bot runs startup recovery, transient maintenance, scheduled backups, and surface checks while projection delivery is running; the `maintenance` command remains available for operator-triggered cleanup. It expires due drops and removes terminal receipts and consumed/expired handles after their configured retention periods.
+`health` checks SQLite integrity, schema version, the one-active-session invariant, receipt recovery state, outbox backlog, dead-lettered events, dirty projections, expired Loot Drops, the last transient-maintenance outcome, backup freshness, and the most recent Discord surface reachability check. A missing, failed, or stale Discord surface check is `DEGRADED`; pass `--discord-surface-max-age-seconds` to change the freshness window. The bot runs startup recovery, transient maintenance, scheduled backups, and surface checks while projection delivery is running; the `maintenance` command remains available for operator-triggered cleanup. It expires due drops and removes terminal receipts and consumed/expired handles after their configured retention periods.
 
 Configured DM administrators can use `/quartermaster` as the compact Discord control surface. It summarizes Party Stash and session state and provides Grant loot, Session, Stash, Open Loot, Treasury, Characters, Export, Backup, and Health actions. The launcher is ephemeral and uses the same authorization and durable workflows as the individual commands.
+
+## Upgrading to schema 10
+
+Schema 10 adds the rule that a Discord user may hold at most one active character. If the
+live database already breaks it, the migration refuses and the bot will not start; the error
+names the players and characters involved:
+
+```
+schema migration 10 failed: UNIQUE constraint failed: characters.discord_user_id.
+Quartermaster now allows one active character per Discord user. Mark the extras DEAD,
+RETIRED, or DEPARTED on the previous build, then upgrade: Discord user 123 has Aria, Borin
+```
+
+Which character to stand down is a campaign decision, so the migration will not guess. Start
+the previous build, resolve each named player with `/character-lifecycle`, then upgrade. The
+database is not modified by the failed attempt.
+
+The same migration also recomputes `normalized_name` on existing stacks and merges any that
+collide once they agree — two stacks of the same item that differed only by capitalization or
+internal spacing become one, with their quantities added.
+
+## Dead-lettered events
+
+Event delivery is FIFO per destination, so an event that can never be delivered would otherwise hold up every later event to the same channel or session thread. After eight consecutive hard failures — a deleted thread, a revoked permission, a destination that no longer resolves — the event is marked `FAILED` and delivery moves on. Rate limits are not hard failures: they are retried at the delay Discord asks for and never spend that budget.
+
+A dead letter is permanent until an operator clears it, so `health` reports `event_dead_letters: FAILED` rather than folding it into the ordinary outbox backlog, which drains on its own:
+
+```powershell
+uv run python -m quartermaster --db $env:QM_DATABASE_PATH health
+```
+
+Nothing is lost from canonical state — the ledger and `domain_events` still hold the event; only the disposable Discord notification was dropped. Repair the destination first (recreate the thread, restore the permission), then requeue:
+
+```powershell
+uv run python -m quartermaster --db $env:QM_DATABASE_PATH requeue-events
+uv run python -m quartermaster --db $env:QM_DATABASE_PATH requeue-events --destination-key "session:<session-id>"
+```
+
+Requeueing before fixing the destination just spends the failure budget again. If the destination is gone for good and the notification no longer matters, leaving the row `FAILED` is a valid end state — but health will keep reporting it, so prefer requeueing once the surface is healthy.
 
 ## Backup and restore
 

@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from quartermaster.db import SCHEMA_VERSION, SQLiteStore
+from quartermaster.db import SQLiteStore
 from quartermaster.integration import (
     AvraeInteractionContext,
     ProviderIntegrationError,
@@ -43,8 +43,10 @@ class ProviderIntegrationTests(unittest.TestCase):
             payload={"action": "Longsword"},
         )
 
-    def test_schema_9_adds_durable_provider_operation_table(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 9)
+    def test_provider_operations_table_carries_the_durable_outcome_columns(self) -> None:
+        # Opening the store already asserts the schema reached SCHEMA_VERSION,
+        # so this checks the shape the provider boundary depends on instead of
+        # restating the version number.
         columns = {
             row["name"]
             for row in self.store.connection.execute("PRAGMA table_info(provider_operations)").fetchall()

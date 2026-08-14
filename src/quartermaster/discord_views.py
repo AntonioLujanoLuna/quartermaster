@@ -32,31 +32,51 @@ from .operations import create_scheduled_backup, health_report, render_health
 from .response import DeferredExecutionError
 from .sessions import SessionError
 
+MAX_VIEW_BUTTONS = 25
+
 
 class TakeView(discord.ui.View):
-    def __init__(self, inventory: InventoryService, settings: Settings, actor_id: str, items: list[dict], handles: dict[str, str]) -> None:
+    def __init__(
+        self,
+        inventory: InventoryService,
+        settings: Settings,
+        actor_id: str,
+        items: list[dict],
+        handles: dict[str, str],
+        take_all_handles: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(timeout=300)
         self.inventory = inventory
         self.settings = settings
         self.actor_id = actor_id
-        for item in items[:25]:
+        take_all_handles = take_all_handles or {}
+        for item in items:
+            if len(self.children) >= MAX_VIEW_BUTTONS:
+                break
             handle_id = handles.get(item["id"])
-            if handle_id is None:
-                continue
-            button = discord.ui.Button(
-                label=f"Take {item['item_name'][:65]}",
-                style=discord.ButtonStyle.secondary,
-                custom_id=f"qm:h:{handle_id}",
-            )
-            button.callback = self._callback_for(handle_id)
-            self.add_item(button)
+            if handle_id is not None:
+                button = discord.ui.Button(
+                    label=f"Take 1 {item['item_name'][:60]}",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"qm:h:{handle_id}",
+                )
+                button.callback = self._callback_for(handle_id)
+                self.add_item(button)
+            take_all_id = take_all_handles.get(item["id"])
+            if take_all_id is not None and len(self.children) < MAX_VIEW_BUTTONS:
+                button = discord.ui.Button(
+                    label=f"Take all {item['item_name'][:58]}",
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"qm:hall:{take_all_id}",
+                )
+                button.callback = self._callback_for(take_all_id)
+                self.add_item(button)
 
     def _callback_for(self, handle_id: str) -> Callable[[discord.Interaction], object]:
         async def callback(interaction: discord.Interaction) -> None:
             try:
                 execution = await _run_fast(
                     interaction,
-                    self.inventory.store,
                     self.settings,
                     lambda: self.inventory.take_interaction(
                         str(interaction.id), handle_id=handle_id, actor_id=_actor_id(interaction)
@@ -102,7 +122,6 @@ class TakeConfirmationView(discord.ui.View):
         try:
             execution = await _run_fast(
                 interaction,
-                self.inventory.store,
                 self.settings,
                 lambda: self.inventory.confirm_take_interaction(
                     str(interaction.id), handle_id=self.handle_id, actor_id=_actor_id(interaction)
@@ -131,13 +150,19 @@ class PartyStashView(discord.ui.View):
         try:
             execution = await _run_fast(
                 interaction,
-                self.inventory.store,
                 self.settings,
                 lambda: self.inventory.prepare_take_view(actor_id=_actor_id(interaction)),
                 ephemeral=True,
             )
             prepared = execution.value
-            view = TakeView(self.inventory, self.settings, _actor_id(interaction), prepared["items"], prepared["handles"])
+            view = TakeView(
+                self.inventory,
+                self.settings,
+                _actor_id(interaction),
+                prepared["items"],
+                prepared["handles"],
+                prepared["take_all_handles"],
+            )
             await _send_execution(
                 interaction,
                 execution,
@@ -172,7 +197,6 @@ class LootDropView(discord.ui.View):
             try:
                 execution = await _run_fast(
                     interaction,
-                    self.loot.store,
                     self.settings,
                     lambda: self.loot.claim_interaction(
                         str(interaction.id), handle_id=handle_id, actor_id=_actor_id(interaction)
@@ -239,7 +263,7 @@ async def _launcher_stash(interaction: discord.Interaction, services: BotService
         await _send_error(interaction, "This bot is configured for a different guild.")
         return
     try:
-        execution = await _run_fast(interaction, services.store, settings, services.inventory.browse, ephemeral=True)
+        execution = await _run_fast(interaction, settings, services.inventory.browse, ephemeral=True)
         await _send_execution(
             interaction,
             execution,
@@ -263,7 +287,6 @@ async def _launcher_loot(
     try:
         execution = await _run_fast(
             interaction,
-            services.store,
             settings,
             lambda: loot.prepare_claim_view(actor_id=_actor_id(interaction)),
             ephemeral=True,
@@ -290,7 +313,7 @@ async def _launcher_treasury(
         await _send_error(interaction, "This bot is configured for a different guild.")
         return
     try:
-        execution = await _run_fast(interaction, services.store, settings, currency.view_treasury, ephemeral=True)
+        execution = await _run_fast(interaction, settings, currency.view_treasury, ephemeral=True)
         await _send_execution(
             interaction,
             execution,
@@ -312,7 +335,6 @@ async def _launcher_characters(
         return
     execution = await _run_fast(
         interaction,
-        services.store,
         settings,
         characters.list_characters,
         ephemeral=True,
@@ -405,7 +427,6 @@ class LauncherMoreView(discord.ui.View):
             return
         execution = await _run_fast(
             interaction,
-            self.services.store,
             self.settings,
             lambda: render_health(health_report(self.services.store)),
             ephemeral=True,
@@ -437,7 +458,6 @@ class GrantLootModal(discord.ui.Modal, title="Grant loot"):
         try:
             execution = await _run_fast(
                 interaction,
-                self.inventory.store,
                 self.settings,
                 lambda: self.inventory.grant_interaction(
                     str(interaction.id),
@@ -487,7 +507,6 @@ class QuartermasterLauncherView(discord.ui.View):
         try:
             execution = await _run_fast(
                 interaction,
-                self.services.store,
                 self.settings,
                 lambda: self.services.sessions.start_interaction(
                     str(interaction.id), actor_id=_actor_id(interaction)

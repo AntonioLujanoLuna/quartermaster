@@ -24,6 +24,34 @@ class CharacterError(RuntimeError):
     """Raised for invalid character or lifecycle operations."""
 
 
+def _require_no_other_active_character(
+    connection: Any,
+    discord_user_id: str | None,
+    *,
+    exclude_character_id: str | None = None,
+) -> None:
+    """Hold the one-active-character-per-player rule with a usable message.
+
+    `one_active_character_per_user_idx` is the real guarantee; this check exists
+    so the DM sees which character is in the way instead of a constraint error.
+    A second active character would take an extra share of every treasury split
+    and make loot claims resolve to an arbitrary one of the two.
+    """
+    if discord_user_id is None:
+        return
+    query = "SELECT id, name FROM characters WHERE discord_user_id = ? AND lifecycle = 'ACTIVE'"
+    parameters: tuple[Any, ...] = (discord_user_id,)
+    if exclude_character_id is not None:
+        query += " AND id <> ?"
+        parameters += (exclude_character_id,)
+    existing = connection.execute(f"{query} ORDER BY created_at, id LIMIT 1", parameters).fetchone()
+    if existing is not None:
+        raise CharacterError(
+            f"{existing['name']} is already active for that Discord user; "
+            "mark them dead, retired, or departed before activating another"
+        )
+
+
 class CharacterService:
     def __init__(self, store: SQLiteStore, receipts: ReceiptRepository) -> None:
         self.store = store
@@ -68,6 +96,7 @@ class CharacterService:
         name: str,
         discord_user_id: str | None,
     ) -> dict[str, Any]:
+        _require_no_other_active_character(connection, discord_user_id)
         character_id = str(uuid.uuid4())
         now = iso_now()
         connection.execute(
@@ -114,13 +143,17 @@ class CharacterService:
         lifecycle: str,
     ) -> dict[str, Any]:
         character = connection.execute(
-            "SELECT id, name, lifecycle FROM characters WHERE id = ?", (character_id,)
+            "SELECT id, name, lifecycle, discord_user_id FROM characters WHERE id = ?", (character_id,)
         ).fetchone()
         if character is None:
             raise CharacterError("character not found")
         current = str(character["lifecycle"])
         if lifecycle not in _ALLOWED_TRANSITIONS[current]:
             raise CharacterError(f"cannot transition {current} to {lifecycle}")
+        if lifecycle == "ACTIVE":
+            _require_no_other_active_character(
+                connection, character["discord_user_id"], exclude_character_id=character_id
+            )
         now = iso_now()
         connection.execute(
             "UPDATE characters SET lifecycle = ?, updated_at = ? WHERE id = ?",

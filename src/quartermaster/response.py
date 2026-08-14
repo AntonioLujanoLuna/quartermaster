@@ -72,13 +72,20 @@ class ResponseController:
                 raise ResponseStateError(f"cannot defer from {self._state}")
             self._state = ResponseState.DEFERRED
 
-    def should_fallback_to_deferred(self, *, can_defer: bool, write_active: bool, now: float | None = None) -> bool:
+    def should_fallback_to_deferred(self, *, can_defer: bool, now: float | None = None) -> bool:
+        """Decide whether to spend the acknowledgement on a deferral.
+
+        Deferring past the soft deadline is never worse than waiting: the result
+        still arrives, as a follow-up. Waiting can lose Discord's three-second
+        window entirely, and once the token is dead the mutation has committed
+        with nothing to show for it — so nothing about the local work in flight
+        argues for holding the acknowledgement back.
+        """
         elapsed = (monotonic() if now is None else now) - self._started_at
         with self._lock:
             return (
                 self._state is ResponseState.UNACKNOWLEDGED
                 and can_defer
-                and not write_active
                 and elapsed >= self.soft_deadline_seconds
             )
 
@@ -88,7 +95,7 @@ async def execute_fast(
     operation: Callable[[], Any],
     *,
     soft_deadline_seconds: float = 1.2,
-    write_active: Callable[[], bool] | None = None,
+    can_defer: bool = True,
     ephemeral: bool = False,
 ) -> FastExecutionResult:
     """Run bounded local work without blocking Discord's acknowledgement loop."""
@@ -98,8 +105,7 @@ async def execute_fast(
     controller = ResponseController(started_at=started_at, soft_deadline_seconds=soft_deadline_seconds)
     task = asyncio.create_task(asyncio.to_thread(operation))
     done, _ = await asyncio.wait({task}, timeout=soft_deadline_seconds)
-    active = write_active() if write_active is not None else False
-    if not done and not active:
+    if not done and controller.should_fallback_to_deferred(can_defer=can_defer):
         controller.defer()
         await interaction.response.defer(ephemeral=ephemeral)
         return FastExecutionResult(

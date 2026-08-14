@@ -66,6 +66,32 @@ def run_maintenance(
         raise
 
 
+def requeue_dead_letter_events(store: SQLiteStore, *, destination: str | None = None) -> int:
+    """Return dead-lettered events to the delivery queue after an operator fix.
+
+    Dead-lettering is deliberately terminal, so nothing requeues automatically:
+    an event only comes back once whatever made it undeliverable (a deleted
+    thread, a revoked permission) has actually been repaired.
+    """
+    now = iso_now()
+    with store.transaction() as connection:
+        if destination is None:
+            cursor = connection.execute(
+                """UPDATE event_outbox
+                      SET status = 'PENDING', failure_count = 0, failed_at = NULL, next_attempt_at = ?
+                    WHERE status = 'FAILED'""",
+                (now,),
+            )
+        else:
+            cursor = connection.execute(
+                """UPDATE event_outbox
+                      SET status = 'PENDING', failure_count = 0, failed_at = NULL, next_attempt_at = ?
+                    WHERE status = 'FAILED' AND destination = ?""",
+                (now, destination),
+            )
+        return cursor.rowcount
+
+
 def record_discord_surface_health(
     store: SQLiteStore,
     *,
@@ -109,6 +135,9 @@ def health_report(
         ).fetchone()[0]
         pending_events = connection.execute(
             "SELECT COUNT(*) FROM event_outbox WHERE status = 'PENDING'"
+        ).fetchone()[0]
+        dead_lettered_events = connection.execute(
+            "SELECT COUNT(*) FROM event_outbox WHERE status = 'FAILED'"
         ).fetchone()[0]
         dirty_projections = connection.execute(
             "SELECT COUNT(*) FROM projection_targets WHERE dirty_since IS NOT NULL"
@@ -173,6 +202,10 @@ def health_report(
         if provider_operations_unknown == 0 and provider_operations_requested == 0
         else "DEGRADED",
         "event_outbox": "OK" if pending_events == 0 else "DEGRADED",
+        # A backlog drains on its own; a dead letter never does. It stays FAILED
+        # so it cannot be mistaken for ordinary pending delivery, and clears only
+        # once an operator repairs the destination and requeues it.
+        "event_dead_letters": "OK" if dead_lettered_events == 0 else "FAILED",
         "state_projections": "OK" if dirty_projections == 0 else "DEGRADED",
         "expired_drops": "OK" if due_drops == 0 else "DEGRADED",
         "maintenance": "OK" if maintenance is None or maintenance["last_status"] == "OK" else "DEGRADED",
@@ -195,6 +228,7 @@ def health_report(
             "provider_operations_unknown": provider_operations_unknown,
             "provider_operations_requested": provider_operations_requested,
             "pending_events": pending_events,
+            "dead_lettered_events": dead_lettered_events,
             "dirty_projections": dirty_projections,
             "expired_drops": due_drops,
             "backup_age_seconds": backup_age,

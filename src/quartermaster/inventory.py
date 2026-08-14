@@ -9,6 +9,7 @@ from .clock import iso_now
 from .db import SQLiteStore
 from .events import append_event, mark_projection_dirty, session_event_destination
 from .handles import Handle, HandleRepository
+from .naming import normalize_name as _normalize_name
 from .receipts import ReceiptRepository, ReceiptResult
 
 
@@ -21,16 +22,26 @@ class SemanticStaleness(InventoryError):
 
 
 def normalize_name(name: str) -> str:
-    normalized = " ".join(name.split()).casefold()
+    normalized = _normalize_name(name)
     if not normalized:
         raise InventoryError("item name is required")
     return normalized
 
 
 def active_claimant(connection: Any, actor_id: str | None) -> Any:
-    """Resolve the active character a Discord actor may receive items as."""
+    """Resolve the active character a Discord actor may receive items as.
+
+    `one_active_character_per_user_idx` keeps this to at most one row; the
+    ordering makes the result deterministic anyway rather than leaving the
+    recipient of a claim to whichever row SQLite happens to return first.
+    """
+    if actor_id is None:
+        return None
     return connection.execute(
-        "SELECT id, name FROM characters WHERE discord_user_id = ? AND lifecycle = 'ACTIVE'",
+        """SELECT id, name FROM characters
+            WHERE discord_user_id = ? AND lifecycle = 'ACTIVE'
+            ORDER BY created_at, id
+            LIMIT 1""",
         (actor_id,),
     ).fetchone()
 
@@ -130,6 +141,12 @@ class InventoryService:
             )
 
     def prepare_take_view(self, *, actor_id: str | None, limit: int = 25) -> dict[str, Any]:
+        """Snapshot the stash and mint the handles the browse controls will use.
+
+        Take-all handles are RELATIVE and carry the quantity that was on screen,
+        which is what lets a take of "everything" notice that the stash changed
+        under the player and ask them to confirm the new amount instead.
+        """
         if limit <= 0:
             raise ValueError("limit must be positive")
         with self.store.transaction() as connection:
@@ -138,20 +155,37 @@ class InventoryService:
                 (limit,),
             ).fetchall()
             items = [dict(row) for row in rows]
-            handles = {
-                row["id"]: self.handles.create_in_transaction(
+            handles: dict[str, str] = {}
+            take_all_handles: dict[str, str] = {}
+            for row in rows:
+                snapshot = {"quantity": row["quantity"], "version": row["version"]}
+                handles[row["id"]] = self.handles.create_in_transaction(
                     connection,
                     workflow_type="stash",
                     action="take",
                     actor_id=actor_id,
                     payload={"stack_id": row["id"], "item_name": row["item_name"], "amount": 1, "mode": "ABSOLUTE"},
-                    read_set_snapshot={"quantity": row["quantity"], "version": row["version"]},
+                    read_set_snapshot=snapshot,
                     single_use=True,
                     ttl_seconds=300,
                 )
-                for row in rows
-            }
-            return {"items": items, "handles": handles}
+                if int(row["quantity"]) > 1:
+                    take_all_handles[row["id"]] = self.handles.create_in_transaction(
+                        connection,
+                        workflow_type="stash",
+                        action="take",
+                        actor_id=actor_id,
+                        payload={
+                            "stack_id": row["id"],
+                            "item_name": row["item_name"],
+                            "amount": "all",
+                            "mode": "RELATIVE",
+                        },
+                        read_set_snapshot=snapshot,
+                        single_use=True,
+                        ttl_seconds=300,
+                    )
+            return {"items": items, "handles": handles, "take_all_handles": take_all_handles}
 
     def take_interaction(self, interaction_id: str, *, handle_id: str, actor_id: str | None) -> ReceiptResult:
         return self.receipts.execute_fast(

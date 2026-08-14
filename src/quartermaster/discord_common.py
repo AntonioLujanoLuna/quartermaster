@@ -75,7 +75,6 @@ async def _send_error(interaction: discord.Interaction, message: str) -> None:
 
 async def _run_fast(
     interaction: discord.Interaction,
-    store: SQLiteStore,
     settings: Settings,
     operation: Callable[[], object],
     *,
@@ -85,7 +84,6 @@ async def _run_fast(
         interaction,
         operation,
         soft_deadline_seconds=settings.soft_deadline_seconds,
-        write_active=lambda: store.write_transaction_active,
         ephemeral=ephemeral,
     )
 

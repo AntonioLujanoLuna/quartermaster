@@ -8,14 +8,16 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from quartermaster.characters import CharacterError, CharacterService
 from quartermaster.config import ConfigurationError, Settings
 from quartermaster.currency import CurrencyError, CurrencySemanticStaleness, CurrencyService
-from quartermaster.db import SCHEMA_VERSION, SQLiteStore
+from quartermaster.db import DATA_MIGRATIONS, MIGRATIONS, SCHEMA_VERSION, MigrationError, SQLiteStore
 from quartermaster.discord_projection import DiscordProjectionTransport
 from quartermaster.export import render_export
 from quartermaster.handles import HandleError, HandleRepository
@@ -26,6 +28,7 @@ from quartermaster.operations import (
     create_scheduled_backup,
     health_report,
     record_discord_surface_health,
+    requeue_dead_letter_events,
     restore_backup,
     run_maintenance,
     validate_backup,
@@ -44,6 +47,21 @@ from quartermaster.response import (
 )
 from quartermaster.sessions import SessionService
 from quartermaster.transport import FakeDiscordTransport, RateLimitedError
+
+
+class _StepClock:
+    """A clock the outbox tests can push past a retry backoff deliberately."""
+
+    def __init__(self) -> None:
+        # Whole seconds so the millisecond-truncated ISO round-trip is exact, and
+        # a second ahead so events queued at real `iso_now()` are already due.
+        self.moment = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=1)
+
+    def __call__(self) -> str:
+        return self.moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    def advance(self, seconds: float) -> None:
+        self.moment += timedelta(seconds=seconds)
 
 
 class QuartermasterCoreTests(unittest.TestCase):
@@ -309,7 +327,7 @@ class QuartermasterCoreTests(unittest.TestCase):
 
     def test_response_state_has_one_initial_ack(self) -> None:
         controller = ResponseController(started_at=100.0, soft_deadline_seconds=1.2)
-        self.assertTrue(controller.should_fallback_to_deferred(can_defer=True, write_active=False, now=101.2))
+        self.assertTrue(controller.should_fallback_to_deferred(can_defer=True, now=101.2))
         controller.defer()
         self.assertEqual(controller.state, ResponseState.DEFERRED)
         with self.assertRaises(ResponseStateError):
@@ -375,7 +393,7 @@ class QuartermasterCoreTests(unittest.TestCase):
             release.wait(1)
             return {"ok": True}
 
-        result = asyncio.run(_run_fast(interaction, self.store, settings, operation))
+        result = asyncio.run(_run_fast(interaction, settings, operation))
         self.assertTrue(result.deferred)
         self.assertEqual(result.value, {"ok": True})
         self.assertTrue(interaction.response.deferred)
@@ -705,17 +723,32 @@ class QuartermasterCoreTests(unittest.TestCase):
             self.assertEqual(restored.connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], SCHEMA_VERSION)
 
     def test_restore_migrates_an_older_backup_without_mutating_it(self) -> None:
-        """A snapshot taken before the newest migration must still be restorable."""
-        self.inventory.grant_interaction("older-grant", actor_id="dm", item_name="Older Token", quantity=1)
-        backup = self.store.snapshot(Path(self.tempdir.name) / "older-backup.sqlite")
-        # Undo the newest migration in the snapshot so it is genuinely one version behind.
-        aged = sqlite3.connect(backup)
-        try:
-            aged.execute("DROP TABLE provider_operations")
-            aged.execute("DELETE FROM schema_migrations WHERE version = ?", (SCHEMA_VERSION,))
-            aged.commit()
-        finally:
-            aged.close()
+        """A snapshot taken before the newest migration must still be restorable.
+
+        The older database is built by running only the migrations up to the
+        previous version, rather than by hand-undoing whichever artifacts the
+        newest migration happens to create. That kept needing an edit per
+        migration, and silently stopped simulating anything when it fell behind.
+        """
+        older_version = SCHEMA_VERSION - 1
+        older_migrations = {
+            version: script for version, script in MIGRATIONS.items() if version <= older_version
+        }
+        older_data_migrations = {
+            version: fix for version, fix in DATA_MIGRATIONS.items() if version <= older_version
+        }
+        backup = Path(self.tempdir.name) / "older-backup.sqlite"
+        with (
+            mock.patch.dict(MIGRATIONS, older_migrations, clear=True),
+            mock.patch.dict(DATA_MIGRATIONS, older_data_migrations, clear=True),
+            mock.patch("quartermaster.db.SCHEMA_VERSION", older_version),
+        ):
+            older_path = Path(self.tempdir.name) / "older-source.sqlite"
+            with SQLiteStore(older_path).open() as older_store:
+                InventoryService(
+                    older_store, ReceiptRepository(older_store), HandleRepository(older_store)
+                ).grant_interaction("older-grant", actor_id="dm", item_name="Older Token", quantity=1)
+                older_store.snapshot(backup)
 
         restored = restore_backup(backup, Path(self.tempdir.name) / "restored-older.sqlite")
         self.assertEqual(restored["source_schema_version"], SCHEMA_VERSION - 1)
@@ -1350,6 +1383,371 @@ class QuartermasterCoreTests(unittest.TestCase):
         pending = self.store.connection.execute("SELECT attempt_count, next_attempt_at FROM event_outbox WHERE status = 'PENDING' ORDER BY id DESC LIMIT 1").fetchone()
         self.assertEqual(pending["attempt_count"], 1)
         self.assertIsNotNone(pending["next_attempt_at"])
+
+    def test_state_projection_keeps_work_committed_during_delivery(self) -> None:
+        """A mutation that lands mid-delivery must still be rendered afterwards.
+
+        Retiring the revision read *after* the Discord round-trip credited the
+        in-flight payload with that mutation and cleared dirty_since with it, so
+        the change was never drawn and health still reported a clean projection.
+        """
+        self.inventory.grant_interaction("race-1", actor_id="dm", item_name="Rope", quantity=1)
+        inventory = self.inventory
+
+        class RacingTransport(FakeDiscordTransport):
+            """A grant lands while the Discord call for the previous state is open."""
+
+            def upsert_state(self, target_id, destination, payload, message_id):
+                inventory.grant_interaction("race-2", actor_id="dm", item_name="Torch", quantity=5)
+                return super().upsert_state(target_id, destination, payload, message_id)
+
+        scheduler = StateProjectionScheduler(self.store, RacingTransport())
+        self.assertTrue(scheduler.run_once())
+        target = self.store.connection.execute(
+            "SELECT dirty_since, desired_revision, delivered_revision FROM projection_targets WHERE target_id = 'party-stash'"
+        ).fetchone()
+        self.assertIsNotNone(target["dirty_since"])
+        self.assertGreater(target["desired_revision"], target["delivered_revision"])
+        self.assertEqual(health_report(self.store)["checks"]["state_projections"], "DEGRADED")
+
+        transport = FakeDiscordTransport()
+        scheduler = StateProjectionScheduler(self.store, transport)
+        self.assertTrue(scheduler.run_once())
+        rendered = {item["item_name"] for item in transport.state_payloads["party-stash"]["items"]}
+        self.assertEqual(rendered, {"Rope", "Torch"})
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT dirty_since FROM projection_targets WHERE target_id = 'party-stash'"
+            ).fetchone()["dirty_since"]
+        )
+
+    def test_one_active_character_per_discord_user_is_enforced(self) -> None:
+        """Two active characters for one player would take two shares of a split."""
+        self.characters.create_interaction("dup-1", actor_id="dm", name="Aria", discord_user_id="user-1")
+        with self.assertRaisesRegex(CharacterError, "Aria is already active"):
+            self.characters.create_interaction("dup-2", actor_id="dm", name="Borin", discord_user_id="user-1")
+
+        # The database holds the rule even if a caller bypasses the service.
+        with self.assertRaises(sqlite3.IntegrityError), self.store.transaction() as connection:
+            connection.execute(
+                """INSERT INTO characters(id, name, discord_user_id, lifecycle, created_at, updated_at)
+                   VALUES ('sneaky', 'Sneaky', 'user-1', 'ACTIVE', '2026-08-11T00:00:00Z', '2026-08-11T00:00:00Z')"""
+            )
+
+        # Characters with no Discord user attached are unconstrained.
+        self.characters.create_interaction("dup-3", actor_id="dm", name="Unbound", discord_user_id=None)
+        self.characters.create_interaction("dup-4", actor_id="dm", name="Also Unbound", discord_user_id=None)
+
+    def test_reactivating_a_character_cannot_create_a_second_active_one(self) -> None:
+        first = self.characters.create_interaction(
+            "revive-1", actor_id="dm", name="Aria", discord_user_id="user-1"
+        ).logical_response
+        self.characters.transition_interaction(
+            "revive-2", actor_id="dm", character_id=first["character_id"], lifecycle="DEAD"
+        )
+        replacement = self.characters.create_interaction(
+            "revive-3", actor_id="dm", name="Borin", discord_user_id="user-1"
+        ).logical_response
+        self.assertEqual(replacement["lifecycle"], "ACTIVE")
+
+        with self.assertRaisesRegex(CharacterError, "Borin is already active"):
+            self.characters.transition_interaction(
+                "revive-4", actor_id="dm", character_id=first["character_id"], lifecycle="ACTIVE"
+            )
+
+    def test_treasury_split_gives_each_player_exactly_one_share(self) -> None:
+        """The split is per active character, so the one-per-player rule is what makes it fair."""
+        self.characters.create_interaction("split-a", actor_id="dm", name="Aria", discord_user_id="user-1")
+        self.characters.create_interaction("split-b", actor_id="dm", name="Cade", discord_user_id="user-2")
+        self.currency.adjust_treasury_interaction("split-fund", actor_id="dm", deltas={"gp": 300})
+        result = self.currency.split_treasury_interaction(
+            "split-run", actor_id="dm", amounts={"gp": 300}
+        ).logical_response
+
+        shares: dict[str, int] = {}
+        with self.store.read() as connection:
+            for row in connection.execute(
+                """SELECT characters.discord_user_id AS player, balances.gp AS gp
+                     FROM currency_balances AS balances
+                     JOIN characters ON characters.id = balances.owner_id
+                    WHERE balances.owner_type = 'CHARACTER' AND characters.discord_user_id IS NOT NULL"""
+            ):
+                shares[row["player"]] = shares.get(row["player"], 0) + int(row["gp"])
+        # setUp seeds one more player, so three players share the 300gp.
+        per_share = result["per_recipient"]["gp"]
+        self.assertEqual(sorted(shares), ["player", "user-1", "user-2"])
+        self.assertEqual(set(shares.values()), {per_share})
+        self.assertEqual(per_share * len(shares), 300)
+
+    def test_undeliverable_event_is_dead_lettered_instead_of_blocking_its_destination(self) -> None:
+        """One poisoned event must not hold the per-destination FIFO gate shut forever."""
+        self.inventory.grant_interaction("poison-1", actor_id="dm", item_name="Gem", quantity=1)
+        self.inventory.grant_interaction("poison-2", actor_id="dm", item_name="Map", quantity=1)
+
+        class PoisonTransport(FakeDiscordTransport):
+            def deliver_event(self, destination, event_type, payload):
+                if payload.get("item_name") == "Gem":
+                    raise RuntimeError("thread was deleted")
+                return super().deliver_event(destination, event_type, payload)
+
+        clock = _StepClock()
+        worker = EventOutboxWorker(self.store, PoisonTransport(), now=clock, max_failures=3)
+        for _ in range(3):
+            self.assertFalse(worker.run_once())
+            clock.advance(600)  # past whatever backoff the retry scheduled
+        poisoned = self.store.connection.execute(
+            "SELECT status, failure_count, failed_at, last_error FROM event_outbox ORDER BY id LIMIT 1"
+        ).fetchone()
+        self.assertEqual(poisoned["status"], "FAILED")
+        self.assertEqual(poisoned["failure_count"], 3)
+        self.assertIsNotNone(poisoned["failed_at"])
+        self.assertIn("thread was deleted", poisoned["last_error"])
+
+        # The event behind it is no longer stuck.
+        self.assertTrue(worker.run_once())
+        self.assertEqual(
+            [entry[2]["item_name"] for entry in worker.transport.event_deliveries], ["Map"]
+        )
+
+        report = health_report(self.store)
+        self.assertEqual(report["checks"]["event_dead_letters"], "FAILED")
+        self.assertEqual(report["counts"]["dead_lettered_events"], 1)
+        self.assertEqual(report["status"], "FAILED")
+
+    def test_dead_letters_return_to_the_queue_only_when_an_operator_requeues_them(self) -> None:
+        self.inventory.grant_interaction("requeue-1", actor_id="dm", item_name="Gem", quantity=1)
+
+        class BrokenTransport(FakeDiscordTransport):
+            def deliver_event(self, destination, event_type, payload):
+                raise RuntimeError("permission revoked")
+
+        worker = EventOutboxWorker(self.store, BrokenTransport(), max_failures=1)
+        self.assertFalse(worker.run_once())
+        self.assertFalse(worker.run_once())  # dead-lettered, so nothing left to attempt
+
+        working = FakeDiscordTransport()
+        self.assertFalse(EventOutboxWorker(self.store, working).run_once())
+        self.assertEqual(requeue_dead_letter_events(self.store), 1)
+        self.assertTrue(EventOutboxWorker(self.store, working).run_once())
+        self.assertEqual(len(working.event_deliveries), 1)
+        self.assertEqual(health_report(self.store)["counts"]["dead_lettered_events"], 0)
+
+    def test_rate_limits_do_not_spend_the_dead_letter_budget(self) -> None:
+        """Being rate limited is the transport working, not the event being poison."""
+        self.inventory.grant_interaction("limited-1", actor_id="dm", item_name="Gem", quantity=1)
+
+        class LimitedTransport(FakeDiscordTransport):
+            def deliver_event(self, destination, event_type, payload):
+                raise RateLimitedError(5)
+
+        clock = _StepClock()
+        worker = EventOutboxWorker(self.store, LimitedTransport(), now=clock, max_failures=2)
+        for _ in range(5):
+            self.assertFalse(worker.run_once())
+            clock.advance(600)
+        row = self.store.connection.execute(
+            "SELECT status, attempt_count, failure_count FROM event_outbox ORDER BY id LIMIT 1"
+        ).fetchone()
+        self.assertEqual(row["status"], "PENDING")
+        self.assertEqual(row["failure_count"], 0)
+        self.assertEqual(row["attempt_count"], 5)
+
+    def test_hard_failures_back_off_exponentially(self) -> None:
+        self.inventory.grant_interaction("backoff-1", actor_id="dm", item_name="Gem", quantity=1)
+
+        class BrokenTransport(FakeDiscordTransport):
+            def deliver_event(self, destination, event_type, payload):
+                raise RuntimeError("nope")
+
+        clock = _StepClock()
+        worker = EventOutboxWorker(self.store, BrokenTransport(), now=clock, max_failures=10)
+        delays = []
+        for _ in range(4):
+            before = clock.moment
+            worker.run_once()
+            row = self.store.connection.execute(
+                "SELECT next_attempt_at FROM event_outbox ORDER BY id LIMIT 1"
+            ).fetchone()
+            scheduled = datetime.fromisoformat(row["next_attempt_at"].replace("Z", "+00:00"))
+            delays.append((scheduled - before).total_seconds())
+            clock.advance(600)
+        self.assertEqual(delays, [1.0, 2.0, 4.0, 8.0])
+
+    def test_fast_path_defers_while_another_write_transaction_is_open(self) -> None:
+        """A write in flight is the slow case, so it must not suppress deferral.
+
+        The adapter used to skip the deferral whenever any write transaction was
+        open, which is exactly when the work is most likely to outrun Discord's
+        three-second window and leave a committed mutation with no reply.
+        """
+        from quartermaster.discord_common import _run_fast
+
+        holding = threading.Event()
+        release = threading.Event()
+
+        def hold_the_write_lock() -> None:
+            with self.store.transaction():
+                holding.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold_the_write_lock, daemon=True)
+        holder.start()
+        self.assertTrue(holding.wait(5))
+
+        class Response:
+            def __init__(self) -> None:
+                self.deferred = False
+
+            async def defer(self, *, ephemeral: bool = False) -> None:
+                self.deferred = True
+                release.set()
+
+        class Interaction:
+            def __init__(self) -> None:
+                self.response = Response()
+
+        interaction = Interaction()
+        settings = Settings(guild_id="123", database_path=self.db_path, soft_deadline_seconds=0.05)
+        result = asyncio.run(
+            _run_fast(
+                interaction,
+                settings,
+                lambda: self.inventory.grant_interaction(
+                    "defer-under-write", actor_id="dm", item_name="Rope", quantity=1
+                ),
+            )
+        )
+        holder.join(5)
+        self.assertTrue(interaction.response.deferred)
+        self.assertTrue(result.deferred)
+        self.assertEqual(result.value.logical_response["status"], "GRANTED")
+
+    def test_expire_due_drops_takes_no_write_lock_when_nothing_is_due(self) -> None:
+        """The projection runner calls this every second; idling must stay a read."""
+        self.loot.create_drop_interaction(
+            "idle-drop", actor_id="dm", items=[("Gem", 1, None)], expiry_hours=72
+        )
+        with mock.patch.object(
+            self.store, "transaction", side_effect=AssertionError("took the write lock while idle")
+        ):
+            self.assertEqual(self.loot.expire_due_drops(), 0)
+
+    def _build_previous_version_database(self, path: Path) -> None:
+        """Open a database at SCHEMA_VERSION - 1 so an upgrade can be exercised."""
+        previous = SCHEMA_VERSION - 1
+        with (
+            mock.patch.dict(
+                MIGRATIONS,
+                {version: script for version, script in MIGRATIONS.items() if version <= previous},
+                clear=True,
+            ),
+            mock.patch.dict(
+                DATA_MIGRATIONS,
+                {version: fix for version, fix in DATA_MIGRATIONS.items() if version <= previous},
+                clear=True,
+            ),
+            mock.patch("quartermaster.db.SCHEMA_VERSION", previous),
+        ):
+            with SQLiteStore(path).open() as store, store.transaction() as connection:
+                for index, (name, user) in enumerate(
+                    [("Aria", "user-1"), ("Borin", "user-1"), ("Cade", "user-2")]
+                ):
+                    connection.execute(
+                        """INSERT INTO characters(id, name, discord_user_id, lifecycle, created_at, updated_at)
+                           VALUES (?, ?, ?, 'ACTIVE', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')""",
+                        (f"legacy-character-{index}", name, user),
+                    )
+
+    def test_upgrading_a_database_with_two_active_characters_names_the_conflict(self) -> None:
+        """The bot will not start until this is resolved, so say which rows are at fault."""
+        legacy_path = Path(self.tempdir.name) / "conflicting.sqlite"
+        self._build_previous_version_database(legacy_path)
+        with self.assertRaises(MigrationError) as raised:
+            SQLiteStore(legacy_path).open()
+        message = str(raised.exception)
+        self.assertIn("one active character per Discord user", message)
+        self.assertIn("Discord user user-1 has Aria, Borin", message)
+        self.assertNotIn("user-2", message)
+
+        # Resolving the conflict on the previous build lets the upgrade through.
+        with (
+            mock.patch.dict(
+                MIGRATIONS,
+                {v: s for v, s in MIGRATIONS.items() if v <= SCHEMA_VERSION - 1},
+                clear=True,
+            ),
+            mock.patch("quartermaster.db.SCHEMA_VERSION", SCHEMA_VERSION - 1),
+        ):
+            with SQLiteStore(legacy_path).open() as store, store.transaction() as connection:
+                connection.execute(
+                    "UPDATE characters SET lifecycle = 'RETIRED' WHERE id = 'legacy-character-1'"
+                )
+        with SQLiteStore(legacy_path).open() as upgraded:
+            self.assertEqual(
+                upgraded.connection.execute(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+                ).fetchone()[0],
+                SCHEMA_VERSION,
+            )
+
+    def test_migration_renormalizes_and_merges_legacy_stack_names(self) -> None:
+        """Rows written before the current rule must converge, not split into duplicates.
+
+        Migration 2 backfilled `lower(trim(item_name))`: ASCII-only, and blind to
+        internal whitespace. Stacks written under that rule disagree with
+        `normalize_name`, so the same item can occupy two stacks for one owner.
+        """
+        legacy_version = SCHEMA_VERSION - 1
+        legacy_path = Path(self.tempdir.name) / "legacy.sqlite"
+        legacy_migrations = {
+            version: script for version, script in MIGRATIONS.items() if version <= legacy_version
+        }
+        legacy_data_migrations = {
+            version: fix for version, fix in DATA_MIGRATIONS.items() if version <= legacy_version
+        }
+        with (
+            mock.patch.dict(MIGRATIONS, legacy_migrations, clear=True),
+            mock.patch.dict(DATA_MIGRATIONS, legacy_data_migrations, clear=True),
+            mock.patch("quartermaster.db.SCHEMA_VERSION", legacy_version),
+        ):
+            with SQLiteStore(legacy_path).open() as legacy:
+                with legacy.transaction() as connection:
+                    for stack_id, item_name, legacy_normalized, quantity in [
+                        ("legacy-1", "Potion  of  Healing", "potion  of  healing", 2),
+                        ("legacy-2", "Potion of Healing", "potion of healing", 3),
+                        ("legacy-3", "Élixir", "Élixir", 1),
+                    ]:
+                        connection.execute(
+                            """INSERT INTO inventory_stacks(
+                                id, item_name, normalized_name, variant_metadata, quantity,
+                                owner_type, owner_id, version, last_acquired_at, updated_at
+                            ) VALUES (?, ?, ?, '{}', ?, 'PARTY', 'party', 1, ?, ?)""",
+                            (stack_id, item_name, legacy_normalized, quantity, "2026-08-01T00:00:00Z", "2026-08-01T00:00:00Z"),
+                        )
+
+        with SQLiteStore(legacy_path).open() as migrated:
+            rows = {
+                row["normalized_name"]: (row["item_name"], row["quantity"])
+                for row in migrated.connection.execute(
+                    "SELECT item_name, normalized_name, quantity FROM inventory_stacks ORDER BY normalized_name"
+                )
+            }
+            self.assertEqual(
+                rows,
+                {"potion of healing": ("Potion of Healing", 5), "élixir": ("Élixir", 1)},
+            )
+            # The merged stack is now reachable through the ordinary grant path.
+            InventoryService(
+                migrated, ReceiptRepository(migrated), HandleRepository(migrated)
+            ).grant_interaction(
+                "post-migration", actor_id="dm", item_name="potion   of healing", quantity=1
+            )
+            self.assertEqual(
+                migrated.connection.execute(
+                    "SELECT quantity FROM inventory_stacks WHERE normalized_name = 'potion of healing'"
+                ).fetchone()["quantity"],
+                6,
+            )
 
 
 if __name__ == "__main__":
