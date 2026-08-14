@@ -154,6 +154,13 @@ class InventoryService:
                 "SELECT id, item_name, quantity, provenance, version, updated_at FROM inventory_stacks WHERE owner_type = 'PARTY' AND owner_id = 'party' ORDER BY last_acquired_at DESC, item_name LIMIT ?",
                 (limit,),
             ).fetchall()
+            # The snapshot is capped at what one component view can carry, so the
+            # caller is told the real size too and can say the list is partial.
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM inventory_stacks WHERE owner_type = 'PARTY' AND owner_id = 'party'"
+                ).fetchone()[0]
+            )
             items = [dict(row) for row in rows]
             handles: dict[str, str] = {}
             take_all_handles: dict[str, str] = {}
@@ -185,7 +192,12 @@ class InventoryService:
                         single_use=True,
                         ttl_seconds=300,
                     )
-            return {"items": items, "handles": handles, "take_all_handles": take_all_handles}
+            return {
+                "items": items,
+                "handles": handles,
+                "take_all_handles": take_all_handles,
+                "total_items": total,
+            }
 
     def take_interaction(self, interaction_id: str, *, handle_id: str, actor_id: str | None) -> ReceiptResult:
         return self.receipts.execute_fast(

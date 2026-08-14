@@ -14,6 +14,7 @@ from .db import MIGRATIONS, SCHEMA_VERSION, SQLiteStore
 from .export import render_export
 from .handles import HandleRepository
 from .loot import expire_due_drops
+from .projections import STUCK_PROJECTION_FAILURES
 from .receipts import ReceiptRepository
 
 
@@ -142,6 +143,13 @@ def health_report(
         dirty_projections = connection.execute(
             "SELECT COUNT(*) FROM projection_targets WHERE dirty_since IS NOT NULL"
         ).fetchone()[0]
+        stuck_projection_rows = connection.execute(
+            """SELECT target_id, failure_count, last_error
+                 FROM projection_targets
+                WHERE dirty_since IS NOT NULL AND failure_count >= ?
+                ORDER BY failure_count DESC, target_id""",
+            (STUCK_PROJECTION_FAILURES,),
+        ).fetchall()
         due_drops = connection.execute(
             "SELECT COUNT(*) FROM loot_drops WHERE status = 'OPEN' AND expires_at <= ?", (iso_now(),)
         ).fetchone()[0]
@@ -184,6 +192,11 @@ def health_report(
     off_device_backup_path = Path(backup_details["off_device_path"]) if backup_details and backup_details.get("off_device_path") else None
     primary_backup_exists = primary_backup_path is not None and primary_backup_path.is_file()
     off_device_backup_exists = off_device_backup_path is None or off_device_backup_path.is_file()
+    stuck_projections = len(stuck_projection_rows)
+    projection_errors = {
+        str(row["target_id"]): f"{row['failure_count']} consecutive failures: {row['last_error']}"
+        for row in stuck_projection_rows
+    }
     backup_ok = (
         backup is not None
         and backup["last_status"] == "OK"
@@ -206,7 +219,14 @@ def health_report(
         # so it cannot be mistaken for ordinary pending delivery, and clears only
         # once an operator repairs the destination and requeues it.
         "event_dead_letters": "OK" if dead_lettered_events == 0 else "FAILED",
-        "state_projections": "OK" if dirty_projections == 0 else "DEGRADED",
+        # A projection that is merely behind catches up on the next iteration.
+        # One that has failed the same way repeatedly is waiting on a repair —
+        # a deleted channel, a revoked permission — and reporting both as
+        # DEGRADED is how a permanently frozen surface hides in plain sight. It
+        # clears itself on the first delivery that succeeds.
+        "state_projections": (
+            "OK" if dirty_projections == 0 else "FAILED" if stuck_projections else "DEGRADED"
+        ),
         "expired_drops": "OK" if due_drops == 0 else "DEGRADED",
         "maintenance": "OK" if maintenance is None or maintenance["last_status"] == "OK" else "DEGRADED",
         "backup": "OK" if backup_ok else "DEGRADED",
@@ -222,6 +242,7 @@ def health_report(
         "schema_version": schema_version,
         "expected_schema_version": SCHEMA_VERSION,
         "checks": checks,
+        "projection_errors": projection_errors,
         "counts": {
             "active_sessions": active_sessions,
             "processing_receipts": processing_receipts,
@@ -230,6 +251,7 @@ def health_report(
             "pending_events": pending_events,
             "dead_lettered_events": dead_lettered_events,
             "dirty_projections": dirty_projections,
+            "stuck_projections": stuck_projections,
             "expired_drops": due_drops,
             "backup_age_seconds": backup_age,
             "backup_primary_exists": primary_backup_exists,
@@ -407,5 +429,7 @@ def render_health(report: dict[str, Any]) -> str:
     """Render health in a concise form suitable for an operator terminal."""
     lines = [f"Quartermaster health: {report['status']}", f"Schema: {report['schema_version']}/{report['expected_schema_version']}"]
     lines.extend(f"- {name}: {status}" for name, status in report["checks"].items())
+    for target_id, error in sorted(report.get("projection_errors", {}).items()):
+        lines.append(f"- projection {target_id}: {error}")
     lines.append("Counts: " + json.dumps(report["counts"], sort_keys=True))
     return "\n".join(lines)

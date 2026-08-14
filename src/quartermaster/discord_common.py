@@ -17,6 +17,7 @@ from .db import SQLiteStore
 from .inventory import InventoryService
 from .loot import LootDropService
 from .receipts import ReceiptRepository
+from .rendering import clamp_discord_content, fit_discord_lines
 from .response import (
     DeferredExecutionResult,
     FastExecutionResult,
@@ -67,10 +68,18 @@ async def _is_dm(interaction: discord.Interaction, settings: Settings) -> bool:
 
 
 async def _send_error(interaction: discord.Interaction, message: str) -> None:
+    """Reply with a failure, never with content Discord will refuse.
+
+    Error text quotes whatever the caller supplied — an item name, a database
+    error, a health report — so it is bounded here rather than trusted. An
+    over-long error is the worst place to lose a reply: the player is already
+    looking at something that did not work.
+    """
+    content = clamp_discord_content(message)
     if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
+        await interaction.followup.send(content, ephemeral=True)
     else:
-        await interaction.response.send_message(message, ephemeral=True)
+        await interaction.response.send_message(content, ephemeral=True)
 
 
 async def _run_fast(
@@ -99,10 +108,11 @@ async def _send_execution(
     kwargs: dict[str, object] = {"ephemeral": ephemeral}
     if view is not None:
         kwargs["view"] = view
+    content = clamp_discord_content(message)
     if execution.deferred:
-        await interaction.followup.send(message, **kwargs)
+        await interaction.followup.send(content, **kwargs)
     else:
-        await interaction.response.send_message(message, **kwargs)
+        await interaction.response.send_message(content, **kwargs)
 
 
 async def _run_deferred(
@@ -179,29 +189,59 @@ async def _send_deferred_backup(
         await interaction.response.send_message(message, ephemeral=True)
 
 
-def _render_stash(items: list[dict]) -> str:
+def _render_stash(items: list[dict], *, total: int | None = None) -> str:
+    """Render the stash, saying so when the browse view holds only part of it.
+
+    `total` is the number of stacks the Party Stash actually holds. The browse
+    snapshot is capped at what one component view can carry, and a player who is
+    not told that reads a short list as the whole stash.
+    """
     lines = ["**PARTY STASH**", ""]
     if not items:
         lines.append("Nothing is recorded yet.")
     else:
         lines.extend(f"• {item['item_name']} x{item['quantity']}" for item in items)
-    return "\n".join(lines)
+    if total is not None and total > len(items):
+        lines.append("")
+        lines.append(f"Showing {len(items)} of {total} stacks. Take some, or ask the DM for the full export.")
+    return fit_discord_lines(lines, label="Party Stash")
 
 
-def _render_loot(drops: list[dict]) -> str:
+def _render_loot(drops: list[dict], handles: dict[str, str] | None = None) -> str:
+    """Render open Loot Drops, saying so when some items have no claim control.
+
+    One component view carries a bounded number of buttons, so beyond that an
+    item is listed with nothing to press. Naming the gap is the difference
+    between a player waiting for a control that is never coming and a player
+    who knows another item has to be claimed or closed first.
+    """
     lines = ["**OPEN LOOT**", ""]
     if not drops:
         return "\n".join(lines + ["There are no open Loot Drops."])
+    unclaimable = 0
     for drop in drops:
         lines.append(f"Drop `{drop['drop_id'][:8]}`")
-        lines.extend(f"• {item['item_name']} x{item['remaining_quantity']}" for item in drop["items"])
-    return "\n".join(lines)
+        for item in drop["items"]:
+            lines.append(f"• {item['item_name']} x{item['remaining_quantity']}")
+            if handles is not None and item["id"] not in handles:
+                unclaimable += 1
+    if unclaimable:
+        entries = "entry" if unclaimable == 1 else "entries"
+        lines.append("")
+        lines.append(
+            f"{unclaimable} {entries} above have no claim control here. "
+            "Claim or close what is showing and open this again."
+        )
+    return fit_discord_lines(lines, label="Loot Drop")
 
 
 def _render_characters(rows: list[dict]) -> str:
     if not rows:
         return "No characters are registered."
-    return "\n".join(f"{row['name']} · `{row['id']}` · {row['lifecycle']}" for row in rows)
+    return fit_discord_lines(
+        [f"{row['name']} · `{row['id']}` · {row['lifecycle']}" for row in rows],
+        label="character",
+    )
 
 
 async def _launcher_admin(interaction: discord.Interaction, settings: Settings) -> bool:

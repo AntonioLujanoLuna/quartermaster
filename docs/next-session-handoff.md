@@ -1,6 +1,6 @@
 # Next-session handoff
 
-Updated: 2026-08-14 · Schema 10
+Updated: 2026-08-14 · Schema 11
 
 ## How to use this document
 
@@ -19,7 +19,7 @@ Two rules keep it useful:
 
 ## Current state
 
-Canonical state is SQLite at schema 10. Discord messages are disposable projections.
+Canonical state is SQLite at schema 11. Discord messages are disposable projections.
 
 **Runtime and durability.** Configuration is validated at startup. FAST interactions run
 their mutation and receipt in one transaction; DEFERRED interactions persist `PROCESSING`
@@ -40,6 +40,13 @@ after eight hard failures instead of blocking their destination. A target's clai
 so a claim that outlives its delivery is taken back rather than hiding the target forever.
 The runner survives a failed iteration, and every database call it makes — including the
 transport's session-thread binding — runs in a worker thread rather than on the event loop.
+A state target that keeps failing backs off to a five-minute ceiling and is reported as
+stuck rather than as a backlog; it is never dead-lettered, because one success renders the
+whole current state.
+
+**Rendering.** Every Discord message is rendered within the platform's 2000-character
+limit. List surfaces drop whole lines from the end and say how many they dropped; the send
+boundary clamps anything else. `rendering.py` holds both rules.
 
 **Operations.** `health`, `maintenance`, `backup`, `restore`, and `requeue-events` on the
 CLI; validated timestamped backups on a schedule with retention; `/quartermaster` as the
@@ -50,8 +57,46 @@ commands. The provider operation boundary is durable but has no live gateway beh
 mechanics are mirrored. The extension scaffold at `integrations/avrae/quartermaster_cog.py`
 has never been loaded in an Avrae deployment.
 
-**Checks.** 132 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Checks.** 139 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request.
+
+## Third correction pass on 2026-08-14
+
+A review of what Discord will actually accept found two defects. Both end with the bot
+online and answering commands while a surface stops updating, and both are fixed and
+covered by tests that fail against the old behaviour.
+
+- **Nothing bounded a message to Discord's 2000-character limit.** Discord rejects
+  over-long content outright and rejects it identically every time, so this was not a
+  rendering blemish that arrives gradually — it was a cliff. The Party Stash is permanent
+  and only grows: at roughly a hundred stacks the pinned projection would start failing on
+  every delivery and never render again. `/stash`, `/characters`, `/loot`, and the raw-JSON
+  fallback for events with no renderer had the same cliff, where the player sees only that
+  Quartermaster did not respond. `rendering.py` now holds the bound: list surfaces drop
+  whole lines from the end and name the count they dropped, and `_send_error` and
+  `_send_execution` clamp whatever reaches them. Open Loot Drops render before the stash
+  body, so the entries that expire are the ones kept when the tail has to go.
+
+- **A permanently failing state projection retried once a second forever.** The event
+  outbox already backed off and dead-lettered; the state scheduler passed a fixed one-second
+  delay for every failure, so a deleted channel or a revoked permission meant one Discord
+  call per second for the life of the process — and `health` reported the same `DEGRADED` it
+  reports for a surface that is one second behind. Hard failures now back off exponentially
+  to the same five-minute ceiling the outbox uses, rate limits wait exactly as long as
+  Discord asks and do not count, and eight consecutive failures make `state_projections`
+  `FAILED` with the target and error named. There is deliberately no dead letter: a state
+  target blocks nothing and one successful delivery renders current state, so the count
+  clears itself.
+
+Also corrected:
+
+- The Loot Drop listing rendered items it had no claim control for. One component view
+  carries a bounded number of buttons, and beyond that an item was listed with nothing to
+  press and nothing said. Browse had the same gap: its snapshot is capped at 25 stacks and
+  read as the whole stash. Both now say what they are showing and out of how much.
+- Two migration tests derived "the previous version" from `SCHEMA_VERSION - 1`, so adding
+  migration 11 pointed them at migration 10 instead of the one they were written for. They
+  name the version they mean now, through one `_schema_version` helper.
 
 ## Second correction pass on 2026-08-14
 
@@ -148,6 +193,12 @@ the next session decides deliberately rather than rediscovering them.
 - **`local_metric_buckets` (migration 8) has no reader and no writer**, and
   `internal_hard_deadline_seconds` and `ack_latency_ms` are likewise computed or validated
   and never consumed. Latency budgets stay estimates until something records them.
+- **Component callbacks have no equivalent of `bot.tree.error`.** Slash commands route an
+  unexpected exception to a handler that replies and logs; a button callback catches only
+  the domain errors it names, so anything else — a `sqlite3.OperationalError` from a
+  contended write, say — reaches discord.py's default `View.on_error`, which logs and
+  leaves the player looking at Discord's bare "This interaction failed". Every view would
+  need the same `on_error`, which is a shape decision rather than a fix.
 
 ## Not yet verified live
 
@@ -168,6 +219,11 @@ session:
    without a manual database edit.
 7. Run `maintenance` from the CLI while the bot is up and a grant is in flight, and confirm
    the runner logs at most a failed iteration and keeps delivering.
+8. Grant enough distinct items to push the pinned Party Stash past 2000 characters, and
+   confirm it keeps updating and that the truncation line reads acceptably at the table.
+9. Revoke the bot's Send Messages permission on `#party-inventory`, watch the retry interval
+   grow in the log, and confirm `health` reports `state_projections: FAILED` with the target
+   named. Restore the permission and confirm it clears without operator action.
 
 ## Live Discord setup
 

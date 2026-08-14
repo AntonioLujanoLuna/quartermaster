@@ -16,6 +16,7 @@ from .db import SQLiteStore
 from .loot import expire_due_drops
 from .operations import create_scheduled_backup, record_discord_surface_health, run_maintenance
 from .projections import EventOutboxWorker, StateProjectionScheduler
+from .rendering import clamp_discord_content, fit_discord_lines
 from .transport import RateLimitedError
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,13 @@ class ProjectionConfigurationError(RuntimeError):
 
 
 def _content_for_state(target_id: str, payload: dict[str, Any]) -> str:
+    """Render one state surface within Discord's content limit.
+
+    The Party Stash is permanent and only grows, so this is the one renderer
+    that will certainly outgrow a Discord message on a long campaign. Open Loot
+    Drops are rendered before the stash body because they expire, so they are
+    what a reader loses least by keeping when the tail has to go.
+    """
     if target_id == "party-stash":
         lines = ["**PARTY STASH**", ""]
         if payload.get("treasury") is not None:
@@ -35,7 +43,9 @@ def _content_for_state(target_id: str, payload: dict[str, Any]) -> str:
             lines.extend(["", f"**NEW LOOT** · `{drop['drop_id'][:8]}`"])
             lines.extend(f"- {item['item_name']} x{item['remaining']}" for item in drop["items"])
         lines.extend(f"• {item['item_name']} x{item['quantity']}" for item in items)
-        return "\n".join(lines) if items or payload.get("loot_drops") else "\n".join(lines + ["Nothing is recorded yet."])
+        if not items and not payload.get("loot_drops"):
+            lines.append("Nothing is recorded yet.")
+        return fit_discord_lines(lines, label="Party Stash")
     if target_id == "session-surface":
         active = payload.get("active")
         previous = payload.get("previous")
@@ -43,9 +53,11 @@ def _content_for_state(target_id: str, payload: dict[str, Any]) -> str:
         lines.append(f"Active session: {active['session_number']}" if active else "No active session.")
         if previous:
             lines.append(f"Previous endpoint: {previous.get('where_ended') or 'Not recorded'}")
-        return "\n".join(lines)
+        return fit_discord_lines(lines, label="session")
     if target_id == "dm-surface":
-        return f"**QUARTERMASTER**\n\nActive sessions: {payload['active_session_count']}\nStash entries: {payload['stash_count']}"
+        return clamp_discord_content(
+            f"**QUARTERMASTER**\n\nActive sessions: {payload['active_session_count']}\nStash entries: {payload['stash_count']}"
+        )
     raise ProjectionConfigurationError(f"unknown state target {target_id}")
 
 
@@ -72,7 +84,11 @@ def _content_for_event(event_type: str, payload: dict[str, Any]) -> str:
         return f"Currency given to {payload['character_name']}."
     if event_type == "BELONGINGS_RESOLVED":
         return f"Belongings resolved from {payload['source_character_name']} to {payload['destination_name']}."
-    return f"{event_type}: {json.dumps(payload, sort_keys=True)}"
+    # An event with no renderer of its own falls back to its raw payload, which
+    # has no bound at all: a Loot Drop of many items or a belongings resolution
+    # carrying every stack a character held would otherwise be rejected by
+    # Discord and dead-lettered after eight attempts.
+    return clamp_discord_content(f"{event_type}: {json.dumps(payload, sort_keys=True)}")
 
 
 class DiscordProjectionTransport:

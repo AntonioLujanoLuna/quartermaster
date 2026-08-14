@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -28,6 +29,7 @@ from quartermaster.operations import (
     create_scheduled_backup,
     health_report,
     record_discord_surface_health,
+    render_health,
     requeue_dead_letter_events,
     restore_backup,
     run_maintenance,
@@ -47,6 +49,31 @@ from quartermaster.response import (
 )
 from quartermaster.sessions import SessionService
 from quartermaster.transport import FakeDiscordTransport, RateLimitedError
+
+# Migration 10 added the one-active-character-per-user index and renormalized
+# stack names, so the databases that exercise it have to be built at 9. Naming
+# the version keeps these tests pointed at the migration they are about instead
+# of drifting onto whichever migration happens to be newest.
+_BEFORE_ACTIVE_CHARACTER_RULE = 9
+
+
+@contextmanager
+def _schema_version(version: int):
+    """Build and open databases as a build that only knows migrations up to `version`."""
+    with (
+        mock.patch.dict(
+            MIGRATIONS,
+            {number: script for number, script in MIGRATIONS.items() if number <= version},
+            clear=True,
+        ),
+        mock.patch.dict(
+            DATA_MIGRATIONS,
+            {number: fix for number, fix in DATA_MIGRATIONS.items() if number <= version},
+            clear=True,
+        ),
+        mock.patch("quartermaster.db.SCHEMA_VERSION", version),
+    ):
+        yield
 
 
 class _StepClock:
@@ -1736,6 +1763,111 @@ class QuartermasterCoreTests(unittest.TestCase):
             clock.advance(600)
         self.assertEqual(delays, [1.0, 2.0, 4.0, 8.0])
 
+    def test_party_stash_projection_stays_within_discord_message_limit(self) -> None:
+        """The permanent surface must keep rendering as the campaign accumulates.
+
+        Discord refuses content over 2000 characters, and it refuses it the same
+        way every time. Unbounded rendering therefore does not degrade the Party
+        Stash, it retires it: every later delivery fails identically while the
+        bot stays online and answers commands.
+        """
+        from quartermaster.discord_projection import _content_for_state
+        from quartermaster.projections import render_state
+        from quartermaster.rendering import DISCORD_MESSAGE_LIMIT
+
+        for index in range(200):
+            self.inventory.grant_interaction(
+                f"overflow-grant-{index}",
+                actor_id="dm",
+                item_name=f"Curiosity of the Deep Vault number {index}",
+                quantity=index + 1,
+            )
+        self.loot.create_drop_interaction(
+            "overflow-drop", actor_id="dm", items=[("Fresh Loot Token", 1, None)]
+        )
+
+        content = _content_for_state("party-stash", render_state(self.store, "party-stash"))
+        self.assertLessEqual(len(content), DISCORD_MESSAGE_LIMIT)
+        # The heading and the expiring Loot Drop survive; the stash tail is what
+        # gives way, and the reader is told how much of it did.
+        self.assertIn("**PARTY STASH**", content)
+        self.assertIn("Fresh Loot Token", content)
+        self.assertIn("not shown here", content)
+        self.assertIn("Quartermaster export", content)
+
+    def test_state_projection_backs_off_and_health_names_a_stuck_surface(self) -> None:
+        """A permanently failing surface must not retry once a second forever.
+
+        A deleted channel or a revoked permission fails identically on every
+        attempt. At a fixed one-second retry that is one Discord call per second
+        for the life of the process, and health reports the same DEGRADED it
+        reports for a surface that is one second behind.
+        """
+        self.inventory.grant_interaction("stuck-grant", actor_id="dm", item_name="Sextant", quantity=1)
+
+        class BrokenTransport(FakeDiscordTransport):
+            def upsert_state(self, target_id, destination, payload, message_id):
+                raise RuntimeError("Missing Permissions")
+
+        clock = _StepClock()
+        scheduler = StateProjectionScheduler(self.store, BrokenTransport(), now=clock)
+        delays = []
+        for _ in range(4):
+            before = clock.moment
+            self.assertFalse(scheduler.run_once())
+            row = self.store.connection.execute(
+                "SELECT next_attempt_at FROM projection_targets WHERE target_id = 'party-stash'"
+            ).fetchone()
+            scheduled = datetime.fromisoformat(row["next_attempt_at"].replace("Z", "+00:00"))
+            delays.append((scheduled - before).total_seconds())
+            clock.advance(600)
+        self.assertEqual(delays, [1.0, 2.0, 4.0, 8.0])
+
+        for _ in range(4):
+            self.assertFalse(scheduler.run_once())
+            clock.advance(600)
+        report = health_report(self.store)
+        self.assertEqual(report["checks"]["state_projections"], "FAILED")
+        self.assertEqual(report["counts"]["stuck_projections"], 1)
+        self.assertIn("Missing Permissions", report["projection_errors"]["party-stash"])
+        self.assertIn("party-stash", render_health(report))
+
+        # One delivery that works clears it: nothing has to be requeued by hand.
+        working = FakeDiscordTransport()
+        clock.advance(600)
+        self.assertTrue(StateProjectionScheduler(self.store, working, now=clock).run_once())
+        recovered = health_report(self.store)
+        self.assertEqual(recovered["checks"]["state_projections"], "OK")
+        self.assertEqual(recovered["counts"]["stuck_projections"], 0)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT failure_count FROM projection_targets WHERE target_id = 'party-stash'"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_projection_rate_limits_do_not_spend_the_backoff_budget(self) -> None:
+        """A rate limit is the transport working, so it waits exactly as asked."""
+        self.inventory.grant_interaction("limited-grant", actor_id="dm", item_name="Astrolabe", quantity=1)
+
+        class LimitedTransport(FakeDiscordTransport):
+            def upsert_state(self, target_id, destination, payload, message_id):
+                raise RateLimitedError(30)
+
+        clock = _StepClock()
+        scheduler = StateProjectionScheduler(self.store, LimitedTransport(), now=clock)
+        for _ in range(3):
+            before = clock.moment
+            self.assertFalse(scheduler.run_once())
+            row = self.store.connection.execute(
+                "SELECT failure_count, next_attempt_at FROM projection_targets WHERE target_id = 'party-stash'"
+            ).fetchone()
+            scheduled = datetime.fromisoformat(row["next_attempt_at"].replace("Z", "+00:00"))
+            self.assertEqual((scheduled - before).total_seconds(), 30.0)
+            self.assertEqual(row["failure_count"], 0)
+            clock.advance(600)
+        self.assertEqual(health_report(self.store)["checks"]["state_projections"], "DEGRADED")
+
     def test_fast_path_defers_while_another_write_transaction_is_open(self) -> None:
         """A write in flight is the slow case, so it must not suppress deferral.
 
@@ -1796,21 +1928,8 @@ class QuartermasterCoreTests(unittest.TestCase):
             self.assertEqual(self.loot.expire_due_drops(), 0)
 
     def _build_previous_version_database(self, path: Path) -> None:
-        """Open a database at SCHEMA_VERSION - 1 so an upgrade can be exercised."""
-        previous = SCHEMA_VERSION - 1
-        with (
-            mock.patch.dict(
-                MIGRATIONS,
-                {version: script for version, script in MIGRATIONS.items() if version <= previous},
-                clear=True,
-            ),
-            mock.patch.dict(
-                DATA_MIGRATIONS,
-                {version: fix for version, fix in DATA_MIGRATIONS.items() if version <= previous},
-                clear=True,
-            ),
-            mock.patch("quartermaster.db.SCHEMA_VERSION", previous),
-        ):
+        """Build a database from before the one-active-character rule existed."""
+        with _schema_version(_BEFORE_ACTIVE_CHARACTER_RULE):
             with SQLiteStore(path).open() as store, store.transaction() as connection:
                 for index, (name, user) in enumerate(
                     [("Aria", "user-1"), ("Borin", "user-1"), ("Cade", "user-2")]
@@ -1833,14 +1952,7 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertNotIn("user-2", message)
 
         # Resolving the conflict on the previous build lets the upgrade through.
-        with (
-            mock.patch.dict(
-                MIGRATIONS,
-                {v: s for v, s in MIGRATIONS.items() if v <= SCHEMA_VERSION - 1},
-                clear=True,
-            ),
-            mock.patch("quartermaster.db.SCHEMA_VERSION", SCHEMA_VERSION - 1),
-        ):
+        with _schema_version(_BEFORE_ACTIVE_CHARACTER_RULE):
             with SQLiteStore(legacy_path).open() as store, store.transaction() as connection:
                 connection.execute(
                     "UPDATE characters SET lifecycle = 'RETIRED' WHERE id = 'legacy-character-1'"
@@ -1860,19 +1972,8 @@ class QuartermasterCoreTests(unittest.TestCase):
         internal whitespace. Stacks written under that rule disagree with
         `normalize_name`, so the same item can occupy two stacks for one owner.
         """
-        legacy_version = SCHEMA_VERSION - 1
         legacy_path = Path(self.tempdir.name) / "legacy.sqlite"
-        legacy_migrations = {
-            version: script for version, script in MIGRATIONS.items() if version <= legacy_version
-        }
-        legacy_data_migrations = {
-            version: fix for version, fix in DATA_MIGRATIONS.items() if version <= legacy_version
-        }
-        with (
-            mock.patch.dict(MIGRATIONS, legacy_migrations, clear=True),
-            mock.patch.dict(DATA_MIGRATIONS, legacy_data_migrations, clear=True),
-            mock.patch("quartermaster.db.SCHEMA_VERSION", legacy_version),
-        ):
+        with _schema_version(_BEFORE_ACTIVE_CHARACTER_RULE):
             with SQLiteStore(legacy_path).open() as legacy:
                 with legacy.transaction() as connection:
                     for stack_id, item_name, legacy_normalized, quantity in [
