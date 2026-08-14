@@ -11,7 +11,14 @@ from pathlib import Path
 from .config import Settings
 from .db import SQLiteStore
 from .export import render_export
-from .operations import create_backup, health_report, render_health, restore_backup, run_maintenance
+from .operations import (
+    create_backup,
+    health_report,
+    render_health,
+    requeue_dead_letter_events,
+    restore_backup,
+    run_maintenance,
+)
 
 
 def main() -> int:
@@ -21,7 +28,11 @@ def main() -> int:
     )
     parser = argparse.ArgumentParser(prog="quartermaster")
     parser.add_argument("--db", default="quartermaster.sqlite", type=Path)
-    parser.add_argument("command", choices=["export", "run", "health", "maintenance", "backup", "restore"])
+    parser.add_argument(
+        "command",
+        choices=["export", "run", "health", "maintenance", "backup", "restore", "requeue-events"],
+    )
+    parser.add_argument("--destination-key", help="Limit requeue-events to one outbox destination")
     parser.add_argument("--destination", type=Path)
     parser.add_argument("--off-device-directory", type=Path)
     parser.add_argument("--retention-count", type=int, default=7)
@@ -55,6 +66,10 @@ def main() -> int:
                 receipt_retention_seconds=settings.receipt_retention_seconds,
                 handle_retention_seconds=settings.handle_retention_seconds,
             ))
+    elif args.command == "requeue-events":
+        with SQLiteStore(args.db).open() as store:
+            requeued = requeue_dead_letter_events(store, destination=args.destination_key)
+            print(f"Requeued {requeued} dead-lettered event(s) for delivery.")
     elif args.command == "backup":
         destination = args.destination or (
             Path("backups")

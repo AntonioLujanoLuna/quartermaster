@@ -3,16 +3,39 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
 
-SCHEMA_VERSION = 9
+from .naming import normalize_name
+
+SCHEMA_VERSION = 10
 
 
 class MigrationError(RuntimeError):
     """Raised when the canonical schema cannot be brought to a supported version."""
+
+
+def _split_statements(script: str) -> list[str]:
+    """Split a migration script into individual statements.
+
+    `sqlite3.complete_statement` tracks string literals, so this is safe for
+    scripts containing semicolons inside quotes, unlike splitting on ';'.
+    """
+    statements: list[str] = []
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            statement = buffer.strip()
+            if statement:
+                statements.append(statement)
+            buffer = ""
+    tail = buffer.strip()
+    if tail:
+        statements.append(tail)
+    return statements
 
 
 MIGRATIONS: dict[int, str] = {
@@ -236,6 +259,83 @@ MIGRATIONS: dict[int, str] = {
     CREATE INDEX provider_operations_context_idx
         ON provider_operations(session_id, guild_id, channel_id, updated_at);
     """,
+    10: """
+    CREATE UNIQUE INDEX one_active_character_per_user_idx
+        ON characters(discord_user_id)
+     WHERE lifecycle = 'ACTIVE' AND discord_user_id IS NOT NULL;
+
+    ALTER TABLE event_outbox ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE event_outbox ADD COLUMN failed_at TEXT;
+    CREATE INDEX event_outbox_failed_idx ON event_outbox(status, destination, id);
+    """,
+}
+
+
+def _renormalize_inventory_names(connection: sqlite3.Connection) -> None:
+    """Bring pre-existing stacks onto the runtime's normalization rule.
+
+    Migration 2 backfilled `lower(trim(item_name))`, which is ASCII-only and
+    leaves internal whitespace intact, so rows written before it could disagree
+    with `normalize_name` and split into duplicate stacks. Recompute the rule in
+    Python and merge any stacks that collide once they agree.
+    """
+    rows = connection.execute(
+        """SELECT id, owner_type, owner_id, item_name, normalized_name, variant_metadata,
+                  quantity, last_acquired_at
+             FROM inventory_stacks
+            ORDER BY id"""
+    ).fetchall()
+    groups: dict[tuple[str, str, str, str], list[sqlite3.Row]] = {}
+    for row in rows:
+        try:
+            target = normalize_name(row["item_name"])
+        except (AttributeError, TypeError):
+            continue
+        if not target:
+            continue
+        key = (row["owner_type"], row["owner_id"], target, row["variant_metadata"])
+        groups.setdefault(key, []).append(row)
+
+    for (_owner_type, _owner_id, target, _metadata), members in groups.items():
+        if len(members) == 1 and members[0]["normalized_name"] == target:
+            continue
+        # Prefer the stack that already carries the correct identity, then the
+        # most recently acquired, so the survivor keeps the freshest metadata.
+        winner = max(
+            members,
+            key=lambda row: (
+                row["normalized_name"] == target,
+                row["last_acquired_at"] or "",
+                row["id"],
+            ),
+        )
+        merged_quantity = sum(int(row["quantity"]) for row in members)
+        for row in members:
+            if row["id"] != winner["id"]:
+                connection.execute("DELETE FROM inventory_stacks WHERE id = ?", (row["id"],))
+        connection.execute(
+            """UPDATE inventory_stacks
+                  SET normalized_name = ?, quantity = ?, version = version + 1
+                WHERE id = ?""",
+            (target, merged_quantity, winner["id"]),
+        )
+
+    for row in connection.execute("SELECT id, item_name FROM loot_drop_items").fetchall():
+        try:
+            target = normalize_name(row["item_name"])
+        except (AttributeError, TypeError):
+            continue
+        if target:
+            connection.execute(
+                "UPDATE loot_drop_items SET normalized_name = ? WHERE id = ? AND normalized_name <> ?",
+                (target, row["id"], target),
+            )
+
+
+# Data fixes that cannot be expressed in SQLite's dialect, applied in the same
+# transaction as the schema migration of the same version.
+DATA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    10: _renormalize_inventory_names,
 }
 
 
@@ -245,7 +345,6 @@ class SQLiteStore:
         self.uri = uri
         self.connection: sqlite3.Connection | None = None
         self.connection_lock = RLock()
-        self._write_transaction_count = 0
 
     def open(self) -> SQLiteStore:
         if self.connection is not None:
@@ -278,12 +377,6 @@ class SQLiteStore:
                 self.connection.close()
                 self.connection = None
 
-    @property
-    def write_transaction_active(self) -> bool:
-        # The counter is read by the event loop while a worker may hold the
-        # connection lock; taking that lock here would block acknowledgement.
-        return self._write_transaction_count > 0
-
     def __enter__(self) -> SQLiteStore:
         return self.open()
 
@@ -306,23 +399,64 @@ class SQLiteStore:
             if applied - supported:
                 raise MigrationError(f"unsupported schema versions: {sorted(applied - supported)}")
             for version in sorted(supported - applied):
-                script = f"""
-                BEGIN IMMEDIATE;
-                {MIGRATIONS[version]}
-                INSERT INTO schema_migrations(version, applied_at)
-                VALUES ({version}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-                COMMIT;
-                """
-                try:
-                    connection.executescript(script)
-                except sqlite3.Error:
-                    connection.rollback()
-                    raise
+                self._apply_migration(version)
             current = connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
             if current != SCHEMA_VERSION:
                 raise MigrationError(f"schema version {current} is not supported target {SCHEMA_VERSION}")
         except sqlite3.Error as exc:
-            raise MigrationError("schema migration failed") from exc
+            raise MigrationError(f"schema migration failed: {exc}") from exc
+
+    def _apply_migration(self, version: int) -> None:
+        """Apply one schema migration, its data fix, and its version row atomically.
+
+        Statements are executed individually rather than through `executescript`
+        so that a Python data migration can share the transaction: `executescript`
+        commits before it runs, which would leave the schema and the data fix
+        separable across a crash.
+        """
+        data_migration = DATA_MIGRATIONS.get(version)
+        try:
+            with self.transaction() as connection:
+                for statement in _split_statements(MIGRATIONS[version]):
+                    connection.execute(statement)
+                if data_migration is not None:
+                    data_migration(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                    (version,),
+                )
+        except sqlite3.IntegrityError as exc:
+            # A migration that adds an invariant can only fail on data that already
+            # breaks it, and the bot will not start until it is resolved. Name the
+            # rows in the way rather than leaving the operator with a bare
+            # constraint message on their live campaign database.
+            raise MigrationError(
+                f"schema migration {version} failed: {exc}{self._conflict_hint(version)}"
+            ) from exc
+        except sqlite3.Error as exc:
+            raise MigrationError(f"schema migration {version} failed: {exc}") from exc
+
+    def _conflict_hint(self, version: int) -> str:
+        if version != 10:
+            return ""
+        try:
+            rows = self._require_connection().execute(
+                """SELECT discord_user_id, GROUP_CONCAT(name, ', ') AS names
+                     FROM characters
+                    WHERE lifecycle = 'ACTIVE' AND discord_user_id IS NOT NULL
+                 GROUP BY discord_user_id
+                   HAVING COUNT(*) > 1
+                 ORDER BY discord_user_id"""
+            ).fetchall()
+        except sqlite3.Error:
+            return ""
+        if not rows:
+            return ""
+        conflicts = "; ".join(f"Discord user {row[0]} has {row[1]}" for row in rows)
+        return (
+            ". Quartermaster now allows one active character per Discord user. Mark the"
+            f" extras DEAD, RETIRED, or DEPARTED on the previous build, then upgrade: {conflicts}"
+        )
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
@@ -334,18 +468,14 @@ class SQLiteStore:
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
         with self.connection_lock:
             connection = self._require_connection()
-            self._write_transaction_count += 1
+            connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             try:
-                connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
-                try:
-                    yield connection
-                except BaseException:
-                    connection.rollback()
-                    raise
-                else:
-                    connection.commit()
-            finally:
-                self._write_transaction_count -= 1
+                yield connection
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
 
     def snapshot(self, destination: str | Path) -> Path:
         """Create a consistent SQLite backup without copying a live file."""

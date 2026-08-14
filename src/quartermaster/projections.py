@@ -7,12 +7,15 @@ import inspect
 import json
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from functools import partial
 from typing import Any
 
 from .clock import iso_now
 from .currency import currency_from_row
 from .db import SQLiteStore
 from .transport import DiscordTransport, RateLimitedError
+
+_MAX_RETRY_BACKOFF_SECONDS = 300.0
 
 
 def _plus_seconds(timestamp: str, seconds: float) -> str:
@@ -120,18 +123,25 @@ class StateProjectionScheduler:
         return True
 
     def _record_success(self, target: Any, message_id: str) -> None:
+        """Retire only the revision this delivery actually rendered.
+
+        The revision is the one captured when the target was claimed. Re-reading
+        `desired_revision` here instead would credit this payload with any
+        mutation committed during the Discord round-trip and clear `dirty_since`
+        along with it, so that change would never be rendered and health would
+        still report a clean projection.
+        """
         target_id = target["target_id"]
         now = self.now()
+        rendered = int(target["desired_revision"])
         with self.store.transaction() as connection:
-            current = connection.execute("SELECT desired_revision FROM projection_targets WHERE target_id = ?", (target_id,)).fetchone()
-            delivered = int(current["desired_revision"]) if current else int(target["desired_revision"])
             connection.execute(
                 """UPDATE projection_targets
                    SET discord_message_id = ?, delivered_revision = MAX(delivered_revision, ?),
                        dirty_since = CASE WHEN desired_revision <= ? THEN NULL ELSE dirty_since END,
                        in_flight = 0, next_attempt_at = NULL, last_error = NULL, updated_at = ?
                  WHERE target_id = ?""",
-                (message_id, delivered, delivered, now, target_id),
+                (message_id, rendered, rendered, now, target_id),
             )
 
     def _claim_next_target(self) -> Any:
@@ -167,10 +177,20 @@ class StateProjectionScheduler:
 
 
 class EventOutboxWorker:
-    def __init__(self, store: SQLiteStore, transport: DiscordTransport, *, now: Callable[[], str] = iso_now) -> None:
+    def __init__(
+        self,
+        store: SQLiteStore,
+        transport: DiscordTransport,
+        *,
+        now: Callable[[], str] = iso_now,
+        max_failures: int = 8,
+    ) -> None:
+        if max_failures <= 0:
+            raise ValueError("max_failures must be positive")
         self.store = store
         self.transport = transport
         self.now = now
+        self.max_failures = max_failures
 
     def run_once(self) -> bool:
         event = self._next_event()
@@ -179,7 +199,7 @@ class EventOutboxWorker:
         try:
             self.transport.deliver_event(event["destination"], event["event_type"], json.loads(event["payload"]))
         except RateLimitedError as error:
-            self._retry(event["id"], f"rate limited: {error}", error.retry_after_seconds)
+            self._retry(event["id"], f"rate limited: {error}", error.retry_after_seconds, rate_limited=True)
             return False
         except Exception as error:
             self._retry(event["id"], str(error), 1.0)
@@ -199,7 +219,13 @@ class EventOutboxWorker:
                 await result
         except RateLimitedError as error:
             await asyncio.to_thread(
-                self._retry, event["id"], f"rate limited: {error}", error.retry_after_seconds
+                partial(
+                    self._retry,
+                    event["id"],
+                    f"rate limited: {error}",
+                    error.retry_after_seconds,
+                    rate_limited=True,
+                )
             )
             return False
         except Exception as error:
@@ -227,19 +253,48 @@ class EventOutboxWorker:
                           SELECT 1 FROM event_outbox AS earlier
                            WHERE earlier.destination = event.destination
                              AND earlier.id < event.id
-                             AND earlier.status <> 'DELIVERED'
+                             AND earlier.status = 'PENDING'
                       )
                     ORDER BY event.id
                     LIMIT 1""",
                 (now,),
             ).fetchone()
 
-    def _retry(self, event_id: int, message: str, retry_after: float) -> None:
+    def _retry(self, event_id: int, message: str, retry_after: float, *, rate_limited: bool = False) -> None:
+        """Reschedule a failed delivery, or dead-letter it once it looks poisoned.
+
+        Rate limits are the transport working as intended, so they are retried at
+        the delay Discord asks for and never count toward the failure budget. Hard
+        failures back off exponentially and are capped: without a terminal state,
+        one permanently undeliverable event holds the per-destination FIFO gate
+        shut and blocks every later event to that thread forever.
+        """
         now = self.now()
         with self.store.transaction() as connection:
+            row = connection.execute(
+                "SELECT failure_count FROM event_outbox WHERE id = ?", (event_id,)
+            ).fetchone()
+            if row is None:
+                return
+            failure_count = int(row["failure_count"]) + (0 if rate_limited else 1)
+            if not rate_limited and failure_count >= self.max_failures:
+                connection.execute(
+                    """UPDATE event_outbox
+                          SET status = 'FAILED', attempt_count = attempt_count + 1,
+                              failure_count = ?, last_error = ?, failed_at = ?
+                        WHERE id = ?""",
+                    (failure_count, message, now, event_id),
+                )
+                return
+            delay = (
+                retry_after
+                if rate_limited
+                else min(retry_after * (2 ** (failure_count - 1)), _MAX_RETRY_BACKOFF_SECONDS)
+            )
             connection.execute(
                 """UPDATE event_outbox
-                      SET attempt_count = attempt_count + 1, next_attempt_at = ?, last_error = ?
+                      SET attempt_count = attempt_count + 1, failure_count = ?,
+                          next_attempt_at = ?, last_error = ?
                     WHERE id = ?""",
-                (_plus_seconds(now, retry_after), message, event_id),
+                (failure_count, _plus_seconds(now, delay), message, event_id),
             )

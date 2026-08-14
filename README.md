@@ -48,10 +48,10 @@ $env:QM_DATABASE_PATH = ".\quartermaster.sqlite"
 uv run python -m quartermaster --db .\quartermaster.sqlite run
 ```
 
-The adapter registers guild-scoped `/stash`, `/grant`, `/session-start`, and `/session-end` commands. `/stash` opens a component-backed browse/take flow using opaque single-use handles.
+The adapter registers guild-scoped `/stash`, `/grant`, `/session-start`, and `/session-end` commands. `/stash` opens a component-backed browse/take flow using opaque single-use handles, offering `Take 1` per stack and `Take all` for stacks above one. A `Take all` whose quantity moved after the view was rendered asks for explicit confirmation of the current amount rather than silently taking a different number.
 
-Taking from the Party Stash transfers ownership to the taker's registered active character, exactly as a Loot Drop claim does; an actor with no active registered character cannot take.
+Taking from the Party Stash transfers ownership to the taker's registered active character, exactly as a Loot Drop claim does; an actor with no active registered character cannot take. A Discord user may have at most one active character at a time, which is what makes an even treasury split even.
 
 The Discord transport is intentionally an adapter boundary at this stage. No network calls occur in the core package or in a database transaction. The adapter is split into `discord_common` (services, authorization, response helpers), `discord_views` (components and launcher actions), `discord_commands` (slash command registration), and `discord_adapter` (bot assembly and the runtime loop).
 
-For managed Windows startup, backup/restore, health, maintenance, and degraded operation, see [the operator runbook](docs/runbook.md).
+For managed Windows startup, backup/restore, health, maintenance, dead-lettered events, and degraded operation, see [the operator runbook](docs/runbook.md).

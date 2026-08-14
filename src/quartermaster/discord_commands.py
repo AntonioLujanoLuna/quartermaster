@@ -56,7 +56,6 @@ async def _send_avrae_handoff(
     try:
         execution = await _run_fast(
             interaction,
-            services.store,
             settings,
             lambda: handoff.build(operation_kind, channel_id=str(interaction.channel_id)),
             ephemeral=True,
@@ -121,7 +120,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 services.inventory.browse,
             )
@@ -143,7 +141,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 lambda: loot.prepare_claim_view(actor_id=_actor_id(interaction)),
                 ephemeral=True,
@@ -168,7 +165,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 currency.view_treasury,
                 ephemeral=True,
@@ -190,7 +186,6 @@ def register_commands(
             return
         execution = await _run_fast(
             interaction,
-            services.store,
             settings,
             characters.list_characters,
             ephemeral=True,
@@ -211,7 +206,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 lambda: characters.create_interaction(
                     str(interaction.id),
@@ -243,7 +237,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 lambda: characters.transition_interaction(
                     str(interaction.id),
@@ -275,7 +268,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 lambda: characters.resolve_belongings_interaction(
                     str(interaction.id),
@@ -310,7 +302,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 lambda: currency.adjust_treasury_interaction(
                     str(interaction.id),
@@ -344,7 +335,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 lambda: currency.split_treasury_interaction(
                     str(interaction.id),
@@ -378,7 +368,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 lambda: currency.give_to_character_interaction(
                     str(interaction.id),
@@ -453,7 +442,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 lambda: loot.create_drop_interaction(
                     str(interaction.id),
@@ -481,7 +469,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 lambda: loot.close_drop_interaction(
                     str(interaction.id), drop_id=drop_id, actor_id=_actor_id(interaction)
@@ -501,7 +488,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 lambda: services.inventory.grant_interaction(
                     str(interaction.id), actor_id=_actor_id(interaction), item_name=item, quantity=quantity, provenance=provenance
@@ -525,7 +511,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 lambda: services.sessions.start_interaction(str(interaction.id), actor_id=_actor_id(interaction)),
             )
@@ -552,7 +537,6 @@ def register_commands(
         try:
             execution = await _run_fast(
                 interaction,
-                services.store,
                 settings,
                 lambda: services.sessions.end_interaction(
                     str(interaction.id), actor_id=_actor_id(interaction), where_ended=where_ended

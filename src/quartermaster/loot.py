@@ -304,9 +304,25 @@ class LootDropService:
         return len(drops)
 
     def expire_due_drops(self) -> int:
+        """Close any drop past its absolute expiry.
+
+        This runs on every projection-runner iteration and ahead of every open
+        drop listing, so it checks with a read first: taking the write lock
+        unconditionally made an idle bot contend with live interactions once a
+        second for nothing. A drop that comes due between the check and the next
+        pass is closed on that pass.
+        """
         now = iso_now()
+        with self.store.read() as connection:
+            due = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM loot_drops WHERE status = 'OPEN' AND expires_at <= ?", (now,)
+                ).fetchone()[0]
+            )
+        if not due:
+            return 0
         with self.store.transaction() as connection:
-            drops = connection.execute("SELECT id FROM loot_drops WHERE status = 'OPEN' AND expires_at <= ?", (now,)).fetchall()
+            drops = connection.execute("SELECT id FROM loot_drops WHERE status = 'OPEN' AND expires_at <= ?", (iso_now(),)).fetchall()
             for drop in drops:
                 self._close_drop_in_transaction(connection, str(uuid.uuid4()), drop["id"], "EXPIRED")
             return len(drops)
