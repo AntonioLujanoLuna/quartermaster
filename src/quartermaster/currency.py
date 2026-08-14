@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import uuid
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from .clock import iso_now
 from .db import SQLiteStore
 from .events import append_event, mark_projection_dirty, session_event_destination
 from .handles import HandleRepository
 from .receipts import ReceiptRepository, ReceiptResult
-
 
 CURRENCY_DENOMINATIONS = ("cp", "sp", "ep", "gp", "pp")
 VISIBLE_DENOMINATIONS = ("cp", "sp", "gp", "pp")
@@ -60,8 +59,6 @@ def _validate_nonnegative_amounts(amounts: Mapping[str, int], *, electrum_enable
     normalized = _validate_deltas(amounts, electrum_enabled=electrum_enabled)
     if any(value < 0 for value in normalized.values()):
         raise CurrencyError("currency amounts must be non-negative")
-    if not any(normalized.values()):
-        raise CurrencyError("at least one currency denomination must change")
     return normalized
 
 
@@ -80,8 +77,8 @@ class CurrencyService:
         self.handles = handles or HandleRepository(store)
 
     def view_treasury(self) -> dict[str, int]:
-        with self.store.connection_lock:
-            row = self.store._require_connection().execute(
+        with self.store.read() as connection:
+            row = connection.execute(
                 "SELECT cp, sp, ep, gp, pp FROM currency_balances WHERE owner_type = 'PARTY' AND owner_id = 'party'"
             ).fetchone()
         if row is None:
@@ -266,12 +263,21 @@ class CurrencyService:
         before = currency_from_row(treasury_row)
         if any(amounts[denomination] > before[denomination] for denomination in CURRENCY_DENOMINATIONS):
             raise CurrencyError("treasury does not contain enough currency")
-        after = {denomination: before[denomination] - amounts[denomination] for denomination in CURRENCY_DENOMINATIONS}
         per_recipient = {
             denomination: amounts[denomination] // len(characters) for denomination in CURRENCY_DENOMINATIONS
         }
         remainder = {
             denomination: amounts[denomination] % len(characters) for denomination in CURRENCY_DENOMINATIONS
+        }
+        # Specification 33.1: each denomination splits independently and the
+        # indivisible remainder stays with the source rather than being debited.
+        distributed = {
+            denomination: per_recipient[denomination] * len(characters)
+            for denomination in CURRENCY_DENOMINATIONS
+        }
+        after = {
+            denomination: before[denomination] - distributed[denomination]
+            for denomination in CURRENCY_DENOMINATIONS
         }
         now = iso_now()
         connection.execute(
@@ -306,6 +312,7 @@ class CurrencyService:
             payload={
                 "before": before,
                 "split": dict(amounts),
+                "distributed": distributed,
                 "per_recipient": per_recipient,
                 "remainder": remainder,
                 "recipients": [{"id": character["id"], "name": character["name"]} for character in characters],
@@ -318,6 +325,7 @@ class CurrencyService:
             "status": "SPLIT",
             "before": before,
             "split": dict(amounts),
+            "distributed": distributed,
             "per_recipient": per_recipient,
             "remainder": remainder,
             "recipients": [{"id": character["id"], "name": character["name"]} for character in characters],

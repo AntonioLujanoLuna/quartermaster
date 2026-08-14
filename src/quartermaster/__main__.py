@@ -5,13 +5,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import Settings
 from .db import SQLiteStore
 from .export import render_export
-from .metrics import metric_report, render_metrics
 from .operations import create_backup, health_report, render_health, restore_backup, run_maintenance
 
 
@@ -22,14 +21,13 @@ def main() -> int:
     )
     parser = argparse.ArgumentParser(prog="quartermaster")
     parser.add_argument("--db", default="quartermaster.sqlite", type=Path)
-    parser.add_argument("command", choices=["export", "run", "health", "metrics", "maintenance", "backup", "restore"])
+    parser.add_argument("command", choices=["export", "run", "health", "maintenance", "backup", "restore"])
     parser.add_argument("--destination", type=Path)
     parser.add_argument("--off-device-directory", type=Path)
     parser.add_argument("--retention-count", type=int, default=7)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--discord-surface-max-age-seconds", type=int, default=300)
-    parser.add_argument("--metric-window-hours", type=int, default=24)
     args = parser.parse_args()
     if args.command == "run":
         from .discord_adapter import run_bot
@@ -48,9 +46,6 @@ def main() -> int:
                     discord_surface_max_age_seconds=args.discord_surface_max_age_seconds,
                 )
             ))
-    elif args.command == "metrics":
-        with SQLiteStore(args.db).open() as store:
-            print(render_metrics(metric_report(store, window_hours=args.metric_window_hours)))
     elif args.command == "maintenance":
         environment = dict(os.environ)
         settings = Settings.from_env(environment)
@@ -63,7 +58,7 @@ def main() -> int:
     elif args.command == "backup":
         destination = args.destination or (
             Path("backups")
-            / f"quartermaster-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%SZ')}.sqlite"
+            / f"quartermaster-{datetime.now(UTC).strftime('%Y%m%d-%H%M%SZ')}.sqlite"
         )
         with SQLiteStore(args.db).open() as store:
             print(create_backup(

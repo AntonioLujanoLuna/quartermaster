@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .clock import iso_now
 from .db import SQLiteStore
 from .events import append_event, mark_projection_dirty
 from .handles import Handle, HandleRepository
-from .inventory import normalize_name
+from .inventory import active_claimant, credit_character_stack, normalize_name
 from .receipts import ReceiptRepository, ReceiptResult
 
 
@@ -19,7 +19,7 @@ class LootDropError(RuntimeError):
 
 
 def _expiry_after(hours: int) -> str:
-    return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return (datetime.now(UTC) + timedelta(hours=hours)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _event_destination(session_id: str | None) -> str:
@@ -105,8 +105,7 @@ class LootDropService:
 
     def list_open(self) -> list[dict[str, Any]]:
         self.expire_due_drops()
-        with self.store.connection_lock:
-            connection = self.store._require_connection()
+        with self.store.read() as connection:
             drops = connection.execute(
                 "SELECT id, session_id, expires_at, created_at FROM loot_drops WHERE status = 'OPEN' ORDER BY created_at"
             ).fetchall()
@@ -211,10 +210,7 @@ class LootDropService:
         if row["expires_at"] <= iso_now():
             self._close_drop_in_transaction(connection, operation_id, row["drop_id"], "EXPIRED")
             return {"status": "EXPIRED", "drop_id": row["drop_id"]}
-        claimant = connection.execute(
-            "SELECT id, name FROM characters WHERE discord_user_id = ? AND lifecycle = 'ACTIVE'",
-            (actor_id,),
-        ).fetchone()
+        claimant = active_claimant(connection, actor_id)
         if claimant is None:
             raise LootDropError("an active registered character is required to claim Loot Drops")
         amount = int(handle.payload["amount"])
@@ -228,23 +224,15 @@ class LootDropService:
             (new_remaining, now, drop_item_id),
         )
         owner_id = str(claimant["id"])
-        character = connection.execute(
-            "SELECT * FROM inventory_stacks WHERE owner_type = 'CHARACTER' AND owner_id = ? AND normalized_name = ? AND variant_metadata = '{}'",
-            (owner_id, row["normalized_name"]),
-        ).fetchone()
-        if character is None:
-            connection.execute(
-                """INSERT INTO inventory_stacks(
-                    id, item_name, normalized_name, variant_metadata, quantity,
-                    provenance, owner_type, owner_id, version, last_acquired_at, updated_at
-                ) VALUES (?, ?, ?, '{}', ?, ?, 'CHARACTER', ?, 1, ?, ?)""",
-                (str(uuid.uuid4()), row["item_name"], row["normalized_name"], amount, row["provenance"], owner_id, now, now),
-            )
-        else:
-            connection.execute(
-                "UPDATE inventory_stacks SET quantity = quantity + ?, version = version + 1, last_acquired_at = ?, updated_at = ? WHERE id = ?",
-                (amount, now, now, character["id"]),
-            )
+        credit_character_stack(
+            connection,
+            owner_id=owner_id,
+            item_name=row["item_name"],
+            normalized_name=row["normalized_name"],
+            quantity=amount,
+            provenance=row["provenance"],
+            now=now,
+        )
         append_event(
             connection,
             operation_id=operation_id,

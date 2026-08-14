@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .clock import iso_now
-from .db import SCHEMA_VERSION, SQLiteStore
+from .db import MIGRATIONS, SCHEMA_VERSION, SQLiteStore
 from .export import render_export
 from .handles import HandleRepository
 from .loot import expire_due_drops
@@ -94,55 +94,55 @@ def health_report(
         raise ValueError("backup max age must be positive")
     if discord_surface_max_age_seconds <= 0:
         raise ValueError("Discord surface max age must be positive")
-    connection = store._require_connection()
-    integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
-    schema_version = connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
-    active_sessions = connection.execute("SELECT COUNT(*) FROM sessions WHERE status = 'ACTIVE'").fetchone()[0]
-    processing_receipts = connection.execute(
-        "SELECT COUNT(*) FROM interaction_receipts WHERE status = 'PROCESSING'"
-    ).fetchone()[0]
-    provider_operations_unknown = connection.execute(
-        "SELECT COUNT(*) FROM provider_operations WHERE status = 'UNKNOWN'"
-    ).fetchone()[0]
-    provider_operations_requested = connection.execute(
-        "SELECT COUNT(*) FROM provider_operations WHERE status = 'REQUESTED'"
-    ).fetchone()[0]
-    pending_events = connection.execute(
-        "SELECT COUNT(*) FROM event_outbox WHERE status = 'PENDING'"
-    ).fetchone()[0]
-    dirty_projections = connection.execute(
-        "SELECT COUNT(*) FROM projection_targets WHERE dirty_since IS NOT NULL"
-    ).fetchone()[0]
-    due_drops = connection.execute(
-        "SELECT COUNT(*) FROM loot_drops WHERE status = 'OPEN' AND expires_at <= ?", (iso_now(),)
-    ).fetchone()[0]
-    maintenance = connection.execute(
-        "SELECT last_status FROM maintenance_runs WHERE name = 'transient-state'"
-    ).fetchone()
-    discord_surfaces = connection.execute(
-        "SELECT last_run_at, last_status, last_details FROM maintenance_runs WHERE name = 'discord-surfaces'"
-    ).fetchone()
-    discord_surface_age = None
-    if discord_surfaces is not None and discord_surfaces["last_run_at"] is not None:
-        discord_surface_age = connection.execute(
-            "SELECT (julianday(?) - julianday(?)) * 86400.0",
-            (iso_now(), discord_surfaces["last_run_at"]),
+    with store.read() as connection:
+        integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
+        schema_version = connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
+        active_sessions = connection.execute("SELECT COUNT(*) FROM sessions WHERE status = 'ACTIVE'").fetchone()[0]
+        processing_receipts = connection.execute(
+            "SELECT COUNT(*) FROM interaction_receipts WHERE status = 'PROCESSING'"
         ).fetchone()[0]
+        provider_operations_unknown = connection.execute(
+            "SELECT COUNT(*) FROM provider_operations WHERE status = 'UNKNOWN'"
+        ).fetchone()[0]
+        provider_operations_requested = connection.execute(
+            "SELECT COUNT(*) FROM provider_operations WHERE status = 'REQUESTED'"
+        ).fetchone()[0]
+        pending_events = connection.execute(
+            "SELECT COUNT(*) FROM event_outbox WHERE status = 'PENDING'"
+        ).fetchone()[0]
+        dirty_projections = connection.execute(
+            "SELECT COUNT(*) FROM projection_targets WHERE dirty_since IS NOT NULL"
+        ).fetchone()[0]
+        due_drops = connection.execute(
+            "SELECT COUNT(*) FROM loot_drops WHERE status = 'OPEN' AND expires_at <= ?", (iso_now(),)
+        ).fetchone()[0]
+        maintenance = connection.execute(
+            "SELECT last_status FROM maintenance_runs WHERE name = 'transient-state'"
+        ).fetchone()
+        discord_surfaces = connection.execute(
+            "SELECT last_run_at, last_status, last_details FROM maintenance_runs WHERE name = 'discord-surfaces'"
+        ).fetchone()
+        discord_surface_age = None
+        if discord_surfaces is not None and discord_surfaces["last_run_at"] is not None:
+            discord_surface_age = connection.execute(
+                "SELECT (julianday(?) - julianday(?)) * 86400.0",
+                (iso_now(), discord_surfaces["last_run_at"]),
+            ).fetchone()[0]
+        backup = connection.execute(
+            "SELECT last_run_at, last_status, last_details FROM maintenance_runs WHERE name = 'backup'"
+        ).fetchone()
+        backup_age = None
+        if backup is not None and backup["last_run_at"] is not None:
+            backup_age = connection.execute(
+                "SELECT (julianday(?) - julianday(?)) * 86400.0",
+                (iso_now(), backup["last_run_at"]),
+            ).fetchone()[0]
     discord_surfaces_ok = (
         discord_surfaces is not None
         and discord_surfaces["last_status"] == "OK"
         and discord_surface_age is not None
         and discord_surface_age <= discord_surface_max_age_seconds
     )
-    backup = connection.execute(
-        "SELECT last_run_at, last_status, last_details FROM maintenance_runs WHERE name = 'backup'"
-    ).fetchone()
-    backup_age = None
-    if backup is not None and backup["last_run_at"] is not None:
-        backup_age = connection.execute(
-            "SELECT (julianday(?) - julianday(?)) * 86400.0",
-            (iso_now(), backup["last_run_at"]),
-        ).fetchone()[0]
     backup_details: dict[str, Any] | None = None
     if backup is not None and backup["last_details"]:
         try:
@@ -205,12 +205,11 @@ def health_report(
     }
 
 
-def validate_backup(path: str | Path) -> dict[str, Any]:
-    """Validate SQLite integrity, schema, and human-readable exportability."""
-    backup_path = Path(path).expanduser()
-    if not backup_path.is_file():
-        raise FileNotFoundError(backup_path)
-    connection = sqlite3.connect(str(backup_path))
+def _inspect_backup(path: Path) -> tuple[str, int]:
+    """Read integrity and schema version without migrating the file being inspected."""
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    connection = sqlite3.connect(str(path))
     try:
         integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
         schema_version = connection.execute(
@@ -220,6 +219,13 @@ def validate_backup(path: str | Path) -> dict[str, Any]:
         connection.close()
     if integrity != "ok":
         raise RuntimeError(f"backup integrity check failed: {integrity}")
+    return integrity, int(schema_version)
+
+
+def validate_backup(path: str | Path) -> dict[str, Any]:
+    """Validate SQLite integrity, schema, and human-readable exportability."""
+    backup_path = Path(path).expanduser()
+    integrity, schema_version = _inspect_backup(backup_path)
     if schema_version != SCHEMA_VERSION:
         raise RuntimeError(f"backup schema version {schema_version} is not {SCHEMA_VERSION}")
     with SQLiteStore(backup_path).open() as restored:
@@ -313,7 +319,7 @@ def create_scheduled_backup(
     retention_count: int = 7,
 ) -> dict[str, Any]:
     """Create a timestamped backup using the same validated path as the CLI."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%SZ")
     destination = Path(directory).expanduser() / f"quartermaster-{timestamp}.sqlite"
     return create_backup(
         store,
@@ -329,18 +335,38 @@ def restore_backup(
     *,
     replace: bool = False,
 ) -> dict[str, Any]:
-    """Restore a validated backup, refusing overwrite unless explicitly requested."""
+    """Restore a backup, migrating an older snapshot forward and never mutating the source.
+
+    A backup taken before a later migration is still restorable: it is copied first
+    and brought up to the current schema in the copy, so the archived file on disk
+    keeps the schema it was taken at.
+    """
     source_path = Path(source).expanduser().resolve()
     destination_path = Path(destination).expanduser().resolve()
     if source_path == destination_path:
         raise ValueError("restore source and destination must differ")
-    validate_backup(source_path)
+    _, source_schema_version = _inspect_backup(source_path)
+    if source_schema_version not in MIGRATIONS:
+        raise RuntimeError(
+            f"backup schema version {source_schema_version} is not a supported version "
+            f"(this build understands up to {SCHEMA_VERSION})"
+        )
     if destination_path.exists() and not replace:
         raise FileExistsError(f"restore destination exists: {destination_path}; pass replace=True to overwrite")
     destination_path.parent.mkdir(parents=True, exist_ok=True)
-    with SQLiteStore(source_path).open() as source_store:
-        source_store.snapshot(destination_path)
-    return validate_backup(destination_path)
+    staging_path = destination_path.with_name(destination_path.name + ".restore-staging")
+    if staging_path.exists():
+        staging_path.unlink()
+    shutil.copy2(source_path, staging_path)
+    try:
+        # Opening the copy applies any migrations the snapshot predates.
+        with SQLiteStore(staging_path).open() as staged:
+            staged.snapshot(destination_path)
+    finally:
+        staging_path.unlink(missing_ok=True)
+    result = validate_backup(destination_path)
+    result["source_schema_version"] = source_schema_version
+    return result
 
 
 def render_health(report: dict[str, Any]) -> str:

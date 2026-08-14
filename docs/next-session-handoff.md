@@ -1,6 +1,6 @@
 # Next-session handoff
 
-Updated: 2026-08-11
+Updated: 2026-08-14
 
 ## Verified current state
 
@@ -9,24 +9,24 @@ Updated: 2026-08-11
 - FAST and DEFERRED interaction receipts are implemented.
 - Opaque single-use mutation handles are implemented.
 - Bot startup now recovers interrupted DEFERRED receipts and runs transient-state maintenance before accepting interactions.
-- Party Stash Grant/Take flows are implemented.
+- Party Stash Grant/Take flows are implemented. A Take transfers ownership to the taker's registered active character and requires one, matching the Loot Drop claim rule; it no longer removes the quantity from the world.
 - Relative Take-all staleness now offers explicit confirmation of the current quantity.
 - Loot Drops support creation, claim handles, manual close, session-close, and absolute expiry.
 - Minimal Session lifecycle is implemented.
 - State projection scheduling and FIFO event delivery are implemented; session projections bind to durable per-session Discord threads.
 - The `discord.py` adapter exposes guild-scoped `/stash`, `/grant`, `/session-start`, `/session-end`, `/loot`, `/loot-drop`, `/loot-close`, and DM-admin `/export`.
-- The `discord.py` adapter also exposes DM/admin `/quartermaster`, an ephemeral launcher summarizing Party Stash/session state with Grant loot, Session, Stash, Loot, Treasury, Characters, Export, Backup, Health, and Metrics actions backed by the existing workflows.
+- The `discord.py` adapter also exposes DM/admin `/quartermaster`, an ephemeral launcher summarizing Party Stash/session state with Grant loot, Session, Stash, Loot, Treasury, Characters, Export, Backup, and Health actions backed by the existing workflows.
 - Discord projection delivery and bounded local interaction work run asynchronously after database commit, with deadline-aware response deferral at the configured soft deadline. `/export` and admin-only `/backup` use durable `PROCESSING -> COMMITTED/FAILED` workflows; the CLI remains available for operator-triggered backups.
 - Online backups create timestamped validated snapshots, optionally copy them to a secondary directory, apply retention, and record their paths and outcome for health checks.
 - The projection runner now creates a validated timestamped backup immediately at startup and repeats it on the configurable `QM_BACKUP_INTERVAL_SECONDS` schedule, using the configured primary/off-device directories and retention count.
 - Runtime health now records Discord surface reachability for the configured Party Inventory and Session Log channels; missing, failed, or stale checks report `DEGRADED`.
-- Local aggregate metrics are implemented in schema 8: hourly bounded histograms report ACK p50/p95/max by execution class and projection dirty-duration p50/p95/max by target. They retain no actor or interaction identity and are available through the CLI `metrics` command and launcher Metrics action.
+- Local aggregate metrics have been removed: at this table's interaction volume the percentiles could not carry meaning. The schema-8 `local_metric_buckets` table remains in migration history and is now unused; the `metrics` CLI command and launcher Metrics action are gone.
 - The first Avrae integration slice is implemented and live in schema 9: provider operations are reserved atomically with DEFERRED receipts, finalized with provider outcomes, and interrupted requests become visible `UNKNOWN` outcomes. No HP, initiative, attack, spell, save, or other mechanics are mirrored in Quartermaster.
 - Guild-scoped `/combat` is now the hosted-Avrae fallback front door: it requires an active Quartermaster session and renders native Avrae handoff cards for start, join, turn, attack, cast, check, save, end, and status. It is intentionally read-only until an Avrae-side execution adapter exists.
 - A disposable self-hosted Avrae extension scaffold now exists at `integrations/avrae/quartermaster_cog.py` with `/qm-combat-probe`. It preserves the real Avrae interaction identity, calls native `Combat.from_ctx(inter)`, and records a Quartermaster correlation receipt when loaded; it has not yet been loaded or executed in an Avrae deployment.
 - Adapter acceptance coverage now includes configured DM-role/manage-guild authorization, pin-permission failures, Discord 429 retry translation, and the adapter FAST-to-DEFERRED acknowledgement path.
 - The first treasury/currency slice is implemented: schema-backed integer balances, DM-only treasury adjustments with FAST receipts, non-negative validation, ledger/events, Party Stash/export visibility, and guild-scoped `/treasury` plus `/treasury-adjust` commands. Electrum remains schema-supported but disabled by default.
-- Absolute treasury split and treasury-to-active-character transfers are implemented atomically, preserving per-denomination remainders and rejecting non-active recipients; `/treasury-split` and `/treasury-give` are now registered.
+- Absolute treasury split and treasury-to-active-character transfers are implemented atomically and reject non-active recipients; `/treasury-split` and `/treasury-give` are registered. Per specification 33.1 the indivisible per-denomination remainder stays in the treasury; only the distributed total is debited.
 - Explicit character registration and lifecycle transitions are implemented with ACTIVE/DEAD/RETIRED/DEPARTED invariants; `/characters`, `/character-add`, and `/character-lifecycle` are now registered. Lifecycle changes do not move inventory or currency.
 - Loot Drop claims now require an active registered character mapped to the Discord actor. Relative treasury split handles snapshot treasury version and active recipient IDs, and require explicit confirmation after either changes.
 - Explicit non-active belongings resolution now moves inventory and currency atomically to Party Stash or an active character without changing lifecycle; `/character-resolve` is registered.
@@ -35,7 +35,52 @@ Updated: 2026-08-11
 - Operational commands now cover `health`, `maintenance`, `backup`, and safe restore validation.
 - Managed Windows process wrappers are in `scripts/start-quartermaster.ps1` and `scripts/stop-quartermaster.ps1`.
 - Operator procedures for backup/restore and degraded operation are documented in `docs/runbook.md`.
-- 66 automated tests pass with `uv`.
+- 69 automated tests pass with `uv`; `ruff check` is clean.
+
+## Correction pass on 2026-08-14
+
+A review found two conservation defects in domain arithmetic. Both are fixed, and both are now covered by
+invariant tests rather than example assertions:
+
+- Treasury split debited the full requested amount but distributed only `floor(amount / recipients)` to each
+  character, destroying the remainder. Specification 33.1 requires the remainder to stay with the source. The
+  previous test asserted the destroying behaviour, so the suite ratified it.
+- Party Stash Take decremented the stash and credited nobody, deleting the taken quantity outright, while a
+  Loot Drop claim of the same item credited the claimant. Take now transfers ownership through the same helper
+  the claim path uses.
+
+`test_currency_operations_conserve_every_denomination` and
+`test_item_operations_conserve_quantities_across_owners_and_drops` assert that totals across every owner are
+unchanged by any operation that only moves value. Add to them whenever a new movement operation lands.
+
+Also corrected in the same pass:
+
+- `health_report` read canonical state without the connection lock every other reader takes, so a health read
+  during an open write transaction could observe uncommitted state. Reads now go through `SQLiteStore.read()`.
+- Restoring a backup taken before a later migration failed outright, because validation required exact schema
+  equality; restore also opened and migrated the archived snapshot in place. Restore now copies first, migrates
+  the copy, and leaves the archive at the schema it was taken at.
+- `/characters` and the launcher Characters action bypassed the deadline-aware acknowledgement path used by
+  every other read.
+- The open-loot renderer emitted a mis-encoded bullet character in Discord.
+- The 1344-line `discord_adapter.py` is split into `discord_common`, `discord_views`, `discord_commands`, and
+  `discord_adapter`. Ruff caught four names the split dropped from command bodies that no test covers, which is
+  itself the coverage signal: the slash command bodies are exercised only by the registration test.
+
+Tooling added: `ruff` and `pytest` as dev dependencies, configuration in `pyproject.toml`, and a GitHub Actions
+workflow running both on every pull request.
+
+### Needs live verification
+
+None of the changes below have been exercised against the live guild. Before the next session:
+
+1. `/stash` -> `Browse` -> `Take` as a player whose character is registered, and confirm the item appears under
+   that character in `export`.
+2. `/stash` -> `Take` as an actor with no registered active character, and confirm the refusal message reads
+   acceptably at the table.
+3. `/treasury-split` with an amount that does not divide evenly, and confirm the remainder stays in the
+   treasury.
+4. `/characters` and `/loot`, confirming the acknowledgement timing and the corrected bullet.
 
 ## Live Discord setup
 
@@ -139,7 +184,7 @@ The next combat implementation gate is the live Avrae-side extension spike. The 
 2. Install the Quartermaster core into a self-hosted Avrae environment, load `integrations/avrae/quartermaster_cog.py`, and run `/qm-combat-probe` in a disposable guild with an active Quartermaster session.
 3. Prove one authenticated, harmless native Avrae state change through the provider boundary before adding launcher combat controls.
 4. Add active/closed combat reference projections only after the Avrae-side reference semantics are proven; do not mirror mechanics.
-5. Repeat the local metrics collection during ordinary use and choose evidence-based latency/freshness budgets if the current estimates need refinement.
+5. Choose evidence-based latency and freshness budgets from observed play if the current estimates need refinement.
 
 The larger optional domains - Your Pack, Journal, Parking Lot, Downtime, faction clocks, rich continuity, and Undo - remain evidence-gated and should not be started yet.
 

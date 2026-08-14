@@ -10,13 +10,13 @@ context are available.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol
+from typing import Any, Protocol
 
 from .clock import iso_now
 from .db import SQLiteStore
 from .receipts import ReceiptRepository, ReceiptResult
-
 
 SUPPORTED_PROVIDER_OPERATIONS = frozenset({"start", "join", "next", "attack", "cast", "check", "save", "end", "status"})
 PROVIDER_STATUSES = frozenset({"COMMITTED", "FAILED", "UNKNOWN"})
@@ -55,7 +55,7 @@ class AvraeInteractionContext:
     provider_reference: str
 
     @classmethod
-    def from_interaction(cls, interaction: Any, *, session_id: str) -> "AvraeInteractionContext":
+    def from_interaction(cls, interaction: Any, *, session_id: str) -> AvraeInteractionContext:
         author = getattr(interaction, "author", None) or getattr(interaction, "user", None)
         guild = getattr(interaction, "guild", None)
         channel = getattr(interaction, "channel", None)
@@ -92,7 +92,7 @@ class ProviderResult:
     error: str | None = None
     retryable: bool = False
 
-    def validate(self) -> "ProviderResult":
+    def validate(self) -> ProviderResult:
         if self.status not in PROVIDER_STATUSES:
             raise ProviderIntegrationError(f"unsupported provider result status: {self.status}")
         if self.payload is not None and not isinstance(self.payload, Mapping):

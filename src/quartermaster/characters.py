@@ -11,7 +11,6 @@ from .db import SQLiteStore
 from .events import append_event, mark_projection_dirty, session_event_destination
 from .receipts import ReceiptRepository, ReceiptResult
 
-
 CHARACTER_LIFECYCLES = ("ACTIVE", "DEAD", "RETIRED", "DEPARTED")
 _ALLOWED_TRANSITIONS = {
     "ACTIVE": {"DEAD", "RETIRED", "DEPARTED"},
@@ -31,8 +30,8 @@ class CharacterService:
         self.receipts = receipts
 
     def list_characters(self) -> list[dict[str, Any]]:
-        with self.store.connection_lock:
-            rows = self.store._require_connection().execute(
+        with self.store.read() as connection:
+            rows = connection.execute(
                 """SELECT id, name, discord_user_id, lifecycle, created_at, updated_at
                      FROM characters
                     ORDER BY name, id"""
