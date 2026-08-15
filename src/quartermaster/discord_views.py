@@ -1,46 +1,49 @@
-"""Component views, modals, and launcher actions for the Discord adapter."""
+"""Leaf controls: the components that act, and the modals they open.
+
+The panels in `discord_panels` navigate; everything here changes canonical
+state or collects what a change needs. Keeping the two apart is what lets a
+panel hand a control the way back to itself without the control having to know
+what a panel is.
+"""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import discord
 
-from .characters import CharacterService
-from .config import Settings
-from .currency import CurrencyError, CurrencyService, format_currency
+from .characters import CharacterError
+from .currency import CurrencyError, format_currency
 from .discord_common import (
-    BotServices,
+    Quartermaster,
     _actor_id,
-    _in_configured_guild,
-    _launcher_admin,
-    _render_characters,
-    _render_loot,
-    _render_stash,
-    _run_deferred,
+    _require_dm,
     _run_fast,
-    _send_deferred_backup,
-    _send_deferred_export,
     _send_error,
     _send_execution,
 )
-from .export import render_export
 from .handles import HandleError
-from .inventory import InventoryError, InventoryService, SemanticStaleness
-from .loot import LootDropError, LootDropService
-from .operations import create_scheduled_backup, health_report, render_health
+from .inventory import InventoryError, SemanticStaleness
+from .loot import LootDropError
 from .rendering import DISCORD_VIEW_COMPONENT_LIMIT
-from .response import DeferredExecutionError
 from .sessions import SessionError
 
 logger = logging.getLogger(__name__)
 
 MAX_VIEW_BUTTONS = DISCORD_VIEW_COMPONENT_LIMIT
 
+#: Handles live for five minutes, so a view that carries them should not outlive
+#: them: a button that has quietly expired is worse than one that is gone.
+CONTROL_TIMEOUT = 300
+
+Opener = Callable[[discord.Interaction], Awaitable[None]]
+
+PARTY_DESTINATION = "party"
+
 
 class QuartermasterView(discord.ui.View):
-    """A view whose buttons answer even when something unforeseen breaks.
+    """A view whose controls answer even when something unforeseen breaks.
 
     Slash commands route an unexpected exception to `bot.tree.error`, which
     replies and logs. Component callbacks have no equivalent: each one catches
@@ -48,8 +51,32 @@ class QuartermasterView(discord.ui.View):
     from a contended write, a bug in a renderer — reaches discord.py's default
     `View.on_error`, which logs and leaves the player looking at Discord's bare
     "This interaction failed" with no idea whether their take committed. Every
-    view inherits this so the answer is the same on both surfaces.
+    view inherits this so the answer is the same wherever it is pressed.
     """
+
+    def __init__(self, context: Quartermaster, *, timeout: float | None = CONTROL_TIMEOUT) -> None:
+        super().__init__(timeout=timeout)
+        self.context = context
+        self.settings = context.settings
+
+    def add_navigation(
+        self,
+        opener: Opener,
+        *,
+        label: str,
+        style: discord.ButtonStyle = discord.ButtonStyle.secondary,
+        custom_id: str,
+        row: int | None = None,
+    ) -> discord.ui.Button:
+        """Add a button that moves the caller to another panel."""
+        button = discord.ui.Button(label=label, style=style, custom_id=custom_id, row=row)
+
+        async def callback(interaction: discord.Interaction) -> None:
+            await opener(interaction)
+
+        button.callback = callback
+        self.add_item(button)
+        return button
 
     async def on_error(
         self,
@@ -70,23 +97,79 @@ class QuartermasterView(discord.ui.View):
         )
 
 
+class QuartermasterModal(discord.ui.Modal):
+    """A modal with the same promise as a button: it always answers."""
+
+    def __init__(self, context: Quartermaster) -> None:
+        super().__init__()
+        self.context = context
+        self.settings = context.settings
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        logger.exception(
+            "Quartermaster modal %s failed for interaction %s",
+            type(self).__name__,
+            interaction.id,
+            exc_info=error,
+        )
+        await _send_error(
+            interaction,
+            "Quartermaster could not record that. Nothing was changed unless you were told "
+            "otherwise; open the panel again to see current state.",
+        )
+
+
+def _positive_quantity(raw: object) -> int:
+    """Read a quantity a person typed, refusing everything that is not one."""
+    try:
+        quantity = int(str(raw).strip())
+    except ValueError as error:
+        raise ValueError("Quantity must be a positive whole number.") from error
+    if quantity <= 0:
+        raise ValueError("Quantity must be a positive whole number.")
+    return quantity
+
+
+def _coin_amounts(fields: dict[str, object]) -> dict[str, int]:
+    """Read a four-coin modal, treating an empty box as nothing rather than junk."""
+    amounts: dict[str, int] = {}
+    for coin, raw in fields.items():
+        text = str(raw or "").strip()
+        if not text:
+            amounts[coin] = 0
+            continue
+        try:
+            amounts[coin] = int(text)
+        except ValueError as error:
+            raise ValueError(f"{coin} must be a whole number of coins.") from error
+    return amounts
+
+
+# Party Stash ----------------------------------------------------------------
+
+
 class TakeView(QuartermasterView):
+    """The per-stack take controls, with the way back to a live list.
+
+    Every control here is a single-use handle, so the view is spent the moment
+    it is used. Refresh is not a convenience: without it the player is left
+    pressing buttons that have already been consumed.
+    """
+
     def __init__(
         self,
-        inventory: InventoryService,
-        settings: Settings,
-        actor_id: str,
+        context: Quartermaster,
         items: list[dict],
         handles: dict[str, str],
         take_all_handles: dict[str, str] | None = None,
+        *,
+        refresh: Opener,
+        back: Opener,
     ) -> None:
-        super().__init__(timeout=300)
-        self.inventory = inventory
-        self.settings = settings
-        self.actor_id = actor_id
+        super().__init__(context)
         take_all_handles = take_all_handles or {}
         for item in items:
-            if len(self.children) >= MAX_VIEW_BUTTONS:
+            if len(self.children) >= MAX_VIEW_BUTTONS - 2:
                 break
             handle_id = handles.get(item["id"])
             if handle_id is not None:
@@ -98,7 +181,7 @@ class TakeView(QuartermasterView):
                 button.callback = self._callback_for(handle_id)
                 self.add_item(button)
             take_all_id = take_all_handles.get(item["id"])
-            if take_all_id is not None and len(self.children) < MAX_VIEW_BUTTONS:
+            if take_all_id is not None and len(self.children) < MAX_VIEW_BUTTONS - 2:
                 button = discord.ui.Button(
                     label=f"Take all {item['item_name'][:58]}",
                     style=discord.ButtonStyle.primary,
@@ -106,6 +189,8 @@ class TakeView(QuartermasterView):
                 )
                 button.callback = self._callback_for(take_all_id)
                 self.add_item(button)
+        self.add_navigation(refresh, label="Refresh", custom_id="qm:take:refresh")
+        self.add_navigation(back, label="◀ Party Stash", custom_id="qm:take:back")
 
     def _callback_for(self, handle_id: str) -> Callable[[discord.Interaction], object]:
         async def callback(interaction: discord.Interaction) -> None:
@@ -113,13 +198,12 @@ class TakeView(QuartermasterView):
                 execution = await _run_fast(
                     interaction,
                     self.settings,
-                    lambda: self.inventory.take_interaction(
+                    lambda: self.context.inventory.take_interaction(
                         str(interaction.id), handle_id=handle_id, actor_id=_actor_id(interaction)
                     ),
                     ephemeral=True,
                 )
-                result = execution.value
-                response = result.logical_response
+                response = execution.value.logical_response
                 await _send_execution(
                     interaction,
                     execution,
@@ -127,29 +211,32 @@ class TakeView(QuartermasterView):
                     ephemeral=True,
                 )
             except SemanticStaleness:
-                if interaction.response.is_done():
-                    await interaction.followup.send(
-                        "The quantity changed. Confirm taking the current quantity if that is still what you intend.",
-                        ephemeral=True,
-                        view=TakeConfirmationView(self.inventory, self.settings, handle_id),
-                    )
-                else:
-                    await interaction.response.send_message(
-                        "The quantity changed. Confirm taking the current quantity if that is still what you intend.",
-                        ephemeral=True,
-                        view=TakeConfirmationView(self.inventory, self.settings, handle_id),
-                    )
+                await _send_staleness_prompt(
+                    interaction,
+                    "The quantity changed. Confirm taking the current quantity if that is still what you intend.",
+                    TakeConfirmationView(self.context, handle_id),
+                )
             except (HandleError, InventoryError) as error:
                 await _send_error(interaction, f"That action could not be completed: {error}")
 
         return callback
 
 
+async def _send_staleness_prompt(
+    interaction: discord.Interaction,
+    message: str,
+    view: discord.ui.View,
+) -> None:
+    """Ask for the confirmation, whichever half of the response is still free."""
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True, view=view)
+    else:
+        await interaction.response.send_message(message, ephemeral=True, view=view)
+
+
 class TakeConfirmationView(QuartermasterView):
-    def __init__(self, inventory: InventoryService, settings: Settings, handle_id: str) -> None:
-        super().__init__(timeout=300)
-        self.inventory = inventory
-        self.settings = settings
+    def __init__(self, context: Quartermaster, handle_id: str) -> None:
+        super().__init__(context)
         self.handle_id = handle_id
 
     @discord.ui.button(label="Confirm current quantity", style=discord.ButtonStyle.danger, custom_id="qm:confirm-take")
@@ -158,7 +245,7 @@ class TakeConfirmationView(QuartermasterView):
             execution = await _run_fast(
                 interaction,
                 self.settings,
-                lambda: self.inventory.confirm_take_interaction(
+                lambda: self.context.inventory.confirm_take_interaction(
                     str(interaction.id), handle_id=self.handle_id, actor_id=_actor_id(interaction)
                 ),
                 ephemeral=True,
@@ -174,52 +261,24 @@ class TakeConfirmationView(QuartermasterView):
             await _send_error(interaction, f"That confirmation could not be completed: {error}")
 
 
-class PartyStashView(QuartermasterView):
-    def __init__(self, inventory: InventoryService, settings: Settings) -> None:
-        super().__init__(timeout=300)
-        self.inventory = inventory
-        self.settings = settings
-
-    @discord.ui.button(label="Browse", style=discord.ButtonStyle.primary, custom_id="qm:browse")
-    async def browse(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        try:
-            execution = await _run_fast(
-                interaction,
-                self.settings,
-                lambda: self.inventory.prepare_take_view(actor_id=_actor_id(interaction)),
-                ephemeral=True,
-            )
-            prepared = execution.value
-            view = TakeView(
-                self.inventory,
-                self.settings,
-                _actor_id(interaction),
-                prepared["items"],
-                prepared["handles"],
-                prepared["take_all_handles"],
-            )
-            await _send_execution(
-                interaction,
-                execution,
-                _render_stash(
-                    prepared["items"],
-                    total=prepared.get("total_items"),
-                    controls=prepared["handles"],
-                ),
-                ephemeral=True,
-                view=view,
-            )
-        except InventoryError as error:
-            await _send_error(interaction, f"Party Stash could not be opened: {error}")
+# Loot Drops -----------------------------------------------------------------
 
 
-class LootDropView(QuartermasterView):
-    def __init__(self, loot: LootDropService, settings: Settings, actor_id: str, drops: list[dict], handles: dict[str, str]) -> None:
-        super().__init__(timeout=300)
-        self.loot = loot
-        self.settings = settings
+class LootClaimView(QuartermasterView):
+    def __init__(
+        self,
+        context: Quartermaster,
+        drops: list[dict],
+        handles: dict[str, str],
+        *,
+        refresh: Opener,
+        back: Opener,
+    ) -> None:
+        super().__init__(context)
         for drop in drops:
-            for item in drop["items"][:25]:
+            for item in drop["items"]:
+                if len(self.children) >= MAX_VIEW_BUTTONS - 2:
+                    break
                 handle_id = handles.get(item["id"])
                 if handle_id is None:
                     continue
@@ -230,6 +289,8 @@ class LootDropView(QuartermasterView):
                 )
                 button.callback = self._callback_for(handle_id)
                 self.add_item(button)
+        self.add_navigation(refresh, label="Refresh", custom_id="qm:loot:refresh")
+        self.add_navigation(back, label="◀ Home", custom_id="qm:loot:back")
 
     def _callback_for(self, handle_id: str) -> Callable[[discord.Interaction], object]:
         async def callback(interaction: discord.Interaction) -> None:
@@ -237,13 +298,12 @@ class LootDropView(QuartermasterView):
                 execution = await _run_fast(
                     interaction,
                     self.settings,
-                    lambda: self.loot.claim_interaction(
+                    lambda: self.context.loot.claim_interaction(
                         str(interaction.id), handle_id=handle_id, actor_id=_actor_id(interaction)
                     ),
                     ephemeral=True,
                 )
-                result = execution.value
-                response = result.logical_response
+                response = execution.value.logical_response
                 if response["status"] == "CLAIMED":
                     await _send_execution(
                         interaction,
@@ -264,251 +324,244 @@ class LootDropView(QuartermasterView):
         return callback
 
 
-def _launcher_snapshot(services: BotServices, characters: CharacterService) -> dict[str, int | None]:
-    items = services.inventory.browse()
-    character_rows = characters.list_characters()
-    with services.store.read() as connection:
-        active = connection.execute(
-            "SELECT session_number FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
-        ).fetchone()
-    return {
-        "stash_count": len(items),
-        "active_session_number": int(active["session_number"]) if active else None,
-        "unresolved_estates": sum(1 for row in character_rows if row["lifecycle"] != "ACTIVE"),
-    }
+# Giving ---------------------------------------------------------------------
 
 
-def _render_launcher(snapshot: dict[str, int | None]) -> str:
-    session = (
-        f"Session {snapshot['active_session_number']} active"
-        if snapshot["active_session_number"] is not None
-        else "No active session"
-    )
-    lines = [
-        "**QUARTERMASTER**",
-        "",
-        f"Party Stash · {snapshot['stash_count']} entries",
-        session,
+def _destination_options(
+    recipients: list[dict],
+    *,
+    selected: str,
+) -> list[discord.SelectOption]:
+    options = [
+        discord.SelectOption(
+            label="The Party Stash",
+            value=PARTY_DESTINATION,
+            description="Put it back where the party can take it",
+            default=selected == PARTY_DESTINATION,
+        )
     ]
-    estates = int(snapshot["unresolved_estates"] or 0)
-    if estates:
-        suffix = "estate" if estates == 1 else "estates"
-        lines.append(f"{estates} unresolved character {suffix}")
-    return "\n".join(lines)
-
-
-async def _launcher_stash(interaction: discord.Interaction, services: BotServices, settings: Settings) -> None:
-    if not _in_configured_guild(interaction, settings):
-        await _send_error(interaction, "This bot is configured for a different guild.")
-        return
-    try:
-        execution = await _run_fast(interaction, settings, services.inventory.browse, ephemeral=True)
-        await _send_execution(
-            interaction,
-            execution,
-            _render_stash(execution.value),
-            ephemeral=True,
-            view=PartyStashView(services.inventory, settings),
+    for recipient in recipients[: MAX_VIEW_BUTTONS - 1]:
+        options.append(
+            discord.SelectOption(
+                label=str(recipient["name"])[:100],
+                value=str(recipient["id"]),
+                description="Hand it to this character",
+                default=selected == str(recipient["id"]),
+            )
         )
-    except InventoryError as error:
-        await _send_error(interaction, f"Party Stash could not be opened: {error}")
+    return options
 
 
-async def _launcher_loot(
-    interaction: discord.Interaction,
-    services: BotServices,
-    loot: LootDropService,
-    settings: Settings,
-) -> None:
-    if not _in_configured_guild(interaction, settings):
-        await _send_error(interaction, "This bot is configured for a different guild.")
-        return
-    try:
-        execution = await _run_fast(
-            interaction,
-            settings,
-            lambda: loot.prepare_claim_view(actor_id=_actor_id(interaction)),
-            ephemeral=True,
-        )
-        prepared = execution.value
-        await _send_execution(
-            interaction,
-            execution,
-            _render_loot(prepared["drops"], prepared["handles"]),
-            ephemeral=True,
-            view=LootDropView(loot, settings, _actor_id(interaction), prepared["drops"], prepared["handles"]),
-        )
-    except LootDropError as error:
-        await _send_error(interaction, f"Loot Drops could not be opened: {error}")
+class GiveItemView(QuartermasterView):
+    """Give a held stack away: how much, and to whom, without typing either.
 
+    The quantity controls carry handles minted against the quantity on screen,
+    so "Give all" cannot quietly mean a number the giver never saw. The
+    destination is view state rather than a handle: it is chosen here and now,
+    and there is nothing about it that can go stale underneath the giver.
+    """
 
-async def _launcher_treasury(
-    interaction: discord.Interaction,
-    services: BotServices,
-    currency: CurrencyService,
-    settings: Settings,
-) -> None:
-    if not _in_configured_guild(interaction, settings):
-        await _send_error(interaction, "This bot is configured for a different guild.")
-        return
-    try:
-        execution = await _run_fast(interaction, settings, currency.view_treasury, ephemeral=True)
-        await _send_execution(
-            interaction,
-            execution,
-            f"Treasury: {format_currency(execution.value)}",
-            ephemeral=True,
-        )
-    except CurrencyError as error:
-        await _send_error(interaction, f"Treasury could not be read: {error}")
-
-
-async def _launcher_characters(
-    interaction: discord.Interaction,
-    services: BotServices,
-    characters: CharacterService,
-    settings: Settings,
-) -> None:
-    if not _in_configured_guild(interaction, settings):
-        await _send_error(interaction, "This bot is configured for a different guild.")
-        return
-    execution = await _run_fast(
-        interaction,
-        settings,
-        characters.list_characters,
-        ephemeral=True,
-    )
-    await _send_execution(interaction, execution, _render_characters(execution.value), ephemeral=True)
-
-
-async def _launcher_export(interaction: discord.Interaction, services: BotServices) -> None:
-    try:
-        execution = await _run_deferred(
-            interaction,
-            services,
-            lambda: {"export": render_export(services.store)},
-            response_kind="export",
-            ephemeral=True,
-        )
-        await _send_deferred_export(interaction, execution)
-    except DeferredExecutionError as error:
-        await _send_error(interaction, str(error))
-
-
-async def _launcher_backup(interaction: discord.Interaction, services: BotServices, settings: Settings) -> None:
-    try:
-        execution = await _run_deferred(
-            interaction,
-            services,
-            lambda: create_scheduled_backup(
-                services.store,
-                settings.backup_directory,
-                off_device_directory=settings.backup_off_device_directory,
-                retention_count=settings.backup_retention_count,
-            ),
-            response_kind="backup",
-            ephemeral=True,
-        )
-        await _send_deferred_backup(interaction, execution)
-    except DeferredExecutionError as error:
-        await _send_error(interaction, str(error))
-
-
-class LauncherMoreView(QuartermasterView):
     def __init__(
         self,
-        services: BotServices,
-        settings: Settings,
-        characters: CharacterService,
-        currency: CurrencyService,
-        loot: LootDropService,
+        context: Quartermaster,
+        item: dict,
+        handles: dict[str, str],
+        recipients: list[dict],
+        *,
+        back: Opener,
+        destination: str = PARTY_DESTINATION,
     ) -> None:
-        super().__init__(timeout=600)
-        self.services = services
-        self.settings = settings
-        self.characters = characters
-        self.currency = currency
-        self.loot = loot
-
-    @discord.ui.button(label="Stash", style=discord.ButtonStyle.secondary, custom_id="qm:launcher:stash")
-    async def stash(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        if await _launcher_admin(interaction, self.settings):
-            await _launcher_stash(interaction, self.services, self.settings)
-
-    @discord.ui.button(label="Open Loot", style=discord.ButtonStyle.secondary, custom_id="qm:launcher:loot")
-    async def loot_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        if await _launcher_admin(interaction, self.settings):
-            await _launcher_loot(interaction, self.services, self.loot, self.settings)
-
-    @discord.ui.button(label="Treasury", style=discord.ButtonStyle.secondary, custom_id="qm:launcher:treasury")
-    async def treasury(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        if await _launcher_admin(interaction, self.settings):
-            await _launcher_treasury(interaction, self.services, self.currency, self.settings)
-
-    @discord.ui.button(label="Characters", style=discord.ButtonStyle.secondary, custom_id="qm:launcher:characters")
-    async def characters_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        if await _launcher_admin(interaction, self.settings):
-            await _launcher_characters(interaction, self.services, self.characters, self.settings)
-
-    @discord.ui.button(label="Export", style=discord.ButtonStyle.primary, custom_id="qm:launcher:export")
-    async def export(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        if await _launcher_admin(interaction, self.settings):
-            await _launcher_export(interaction, self.services)
-
-    @discord.ui.button(label="Backup", style=discord.ButtonStyle.primary, custom_id="qm:launcher:backup")
-    async def backup(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        if await _launcher_admin(interaction, self.settings):
-            await _launcher_backup(interaction, self.services, self.settings)
-
-    @discord.ui.button(label="Health", style=discord.ButtonStyle.secondary, custom_id="qm:launcher:health")
-    async def health(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        if not await _launcher_admin(interaction, self.settings):
-            return
-        execution = await _run_fast(
-            interaction,
-            self.settings,
-            lambda: render_health(health_report(self.services.store)),
-            ephemeral=True,
+        super().__init__(context)
+        self.item = item
+        self.handles = handles
+        self.recipients = recipients
+        self.destination = destination
+        select = discord.ui.Select(
+            placeholder="Give to…",
+            options=_destination_options(recipients, selected=destination),
+            custom_id="qm:give:destination",
+            row=0,
         )
-        await _send_execution(interaction, execution, execution.value, ephemeral=True)
+        select.callback = self._choose_destination(select)
+        self.add_item(select)
+        one = handles.get("one")
+        if one is not None:
+            button = discord.ui.Button(label="Give 1", style=discord.ButtonStyle.secondary, custom_id="qm:give:one", row=1)
+            button.callback = self._give_with(one)
+            self.add_item(button)
+        every = handles.get("all")
+        if every is not None:
+            button = discord.ui.Button(label="Give all", style=discord.ButtonStyle.primary, custom_id="qm:give:all", row=1)
+            button.callback = self._give_with(every)
+            self.add_item(button)
+        amount = discord.ui.Button(label="Give some…", style=discord.ButtonStyle.secondary, custom_id="qm:give:some", row=1)
+        amount.callback = self._give_some
+        self.add_item(amount)
+        self.add_navigation(back, label="◀ My Items", custom_id="qm:give:back", row=1)
 
+    def _destination_name(self) -> str:
+        if self.destination == PARTY_DESTINATION:
+            return "the Party Stash"
+        for recipient in self.recipients:
+            if str(recipient["id"]) == self.destination:
+                return str(recipient["name"])
+        return "the chosen character"
 
-class GrantLootModal(discord.ui.Modal, title="Grant loot"):
-    item_name = discord.ui.TextInput(label="Item", placeholder="Silvered dagger", max_length=100)
-    quantity = discord.ui.TextInput(label="Quantity", placeholder="1", max_length=7)
-    provenance = discord.ui.TextInput(label="Provenance", required=False, max_length=200)
+    def _choose_destination(self, select: discord.ui.Select) -> Callable[[discord.Interaction], object]:
+        async def callback(interaction: discord.Interaction) -> None:
+            self.destination = select.values[0]
+            for option in select.options:
+                option.default = option.value == self.destination
+            await interaction.response.edit_message(
+                content=render_give_item(self.item, self._destination_name()),
+                view=self,
+            )
 
-    def __init__(self, inventory: InventoryService, settings: Settings) -> None:
-        super().__init__()
-        self.inventory = inventory
-        self.settings = settings
+        return callback
 
-    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        """A modal submission has the same silent-failure shape as a button."""
-        logger.exception(
-            "Quartermaster grant modal failed for interaction %s", interaction.id, exc_info=error
+    def _give_with(self, handle_id: str) -> Callable[[discord.Interaction], object]:
+        async def callback(interaction: discord.Interaction) -> None:
+            destination = self.destination
+            try:
+                execution = await _run_fast(
+                    interaction,
+                    self.settings,
+                    lambda: self.context.inventory.give_with_handle_interaction(
+                        str(interaction.id),
+                        handle_id=handle_id,
+                        actor_id=_actor_id(interaction),
+                        destination=destination,
+                    ),
+                    ephemeral=True,
+                )
+                await _send_execution(
+                    interaction, execution, _render_given(execution.value.logical_response), ephemeral=True
+                )
+            except SemanticStaleness:
+                await _send_staleness_prompt(
+                    interaction,
+                    "You are holding a different number of those now. Confirm giving everything you "
+                    "currently hold if that is still what you intend.",
+                    GiveConfirmationView(self.context, handle_id, destination),
+                )
+            except (HandleError, InventoryError) as error:
+                await _send_error(interaction, f"That item could not be given: {error}")
+
+        return callback
+
+    async def _give_some(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(
+            GiveQuantityModal(self.context, self.item, self.destination, self._destination_name())
         )
-        await _send_error(
-            interaction,
-            "Quartermaster could not record that grant. Open the Party Stash to see current state.",
-        )
+
+
+class GiveConfirmationView(QuartermasterView):
+    def __init__(self, context: Quartermaster, handle_id: str, destination: str) -> None:
+        super().__init__(context)
+        self.handle_id = handle_id
+        self.destination = destination
+
+    @discord.ui.button(label="Confirm current quantity", style=discord.ButtonStyle.danger, custom_id="qm:confirm-give")
+    async def confirm(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        try:
+            execution = await _run_fast(
+                interaction,
+                self.settings,
+                lambda: self.context.inventory.confirm_give_with_handle_interaction(
+                    str(interaction.id),
+                    handle_id=self.handle_id,
+                    actor_id=_actor_id(interaction),
+                    destination=self.destination,
+                ),
+                ephemeral=True,
+            )
+            await _send_execution(
+                interaction, execution, _render_given(execution.value.logical_response), ephemeral=True
+            )
+        except (HandleError, InventoryError) as error:
+            await _send_error(interaction, f"That confirmation could not be completed: {error}")
+
+
+class GiveQuantityModal(QuartermasterModal, title="Give some of a stack"):
+    quantity = discord.ui.TextInput(label="How many?", placeholder="1", max_length=7)
+
+    def __init__(
+        self,
+        context: Quartermaster,
+        item: dict,
+        destination: str,
+        destination_name: str,
+    ) -> None:
+        super().__init__(context)
+        self.item = item
+        self.destination = destination
+        self.destination_name = destination_name
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if not await _launcher_admin(interaction, self.settings):
-            return
         try:
-            quantity = int(str(self.quantity.value).strip())
-        except ValueError:
-            await _send_error(interaction, "Quantity must be a positive whole number.")
-            return
-        if quantity <= 0:
-            await _send_error(interaction, "Quantity must be a positive whole number.")
+            quantity = _positive_quantity(self.quantity.value)
+        except ValueError as error:
+            await _send_error(interaction, str(error))
             return
         try:
             execution = await _run_fast(
                 interaction,
                 self.settings,
-                lambda: self.inventory.grant_interaction(
+                lambda: self.context.inventory.give_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    item_name=str(self.item["item_name"]),
+                    quantity=quantity,
+                    destination=self.destination,
+                ),
+                ephemeral=True,
+            )
+            await _send_execution(
+                interaction, execution, _render_given(execution.value.logical_response), ephemeral=True
+            )
+        except InventoryError as error:
+            await _send_error(interaction, f"That item could not be given: {error}")
+
+
+def render_give_item(item: dict, destination_name: str) -> str:
+    return "\n".join(
+        [
+            "**GIVE**",
+            "",
+            f"{item['item_name']} · you hold {item['quantity']}",
+            f"Going to {destination_name}.",
+        ]
+    )
+
+
+def _render_given(response: dict) -> str:
+    return (
+        f"{response['character_name']} gave {response['quantity']} {response['item_name']}"
+        f" to {response['destination_name']}. {response['remaining']} still held."
+    )
+
+
+# DM modals ------------------------------------------------------------------
+
+
+class GrantLootModal(QuartermasterModal, title="Grant loot"):
+    item_name = discord.ui.TextInput(label="Item", placeholder="Silvered dagger", max_length=100)
+    quantity = discord.ui.TextInput(label="Quantity", placeholder="1", max_length=7)
+    provenance = discord.ui.TextInput(label="Provenance", required=False, max_length=200)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _require_dm(interaction, self.settings):
+            return
+        try:
+            quantity = _positive_quantity(self.quantity.value)
+        except ValueError as error:
+            await _send_error(interaction, str(error))
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                self.settings,
+                lambda: self.context.inventory.grant_interaction(
                     str(interaction.id),
                     actor_id=_actor_id(interaction),
                     item_name=str(self.item_name.value),
@@ -528,95 +581,228 @@ class GrantLootModal(discord.ui.Modal, title="Grant loot"):
             await _send_error(interaction, f"Loot could not be granted: {error}")
 
 
-class CombatCloseoutView(QuartermasterView):
-    """The end-of-combat controls: spoils into the stash, or the open drops.
+class LootDropModal(QuartermasterModal, title="Open a Loot Drop"):
+    item_name = discord.ui.TextInput(label="Item", placeholder="Loot gem", max_length=100)
+    quantity = discord.ui.TextInput(label="Quantity", placeholder="1", max_length=7)
+    expiry_hours = discord.ui.TextInput(label="Expires in (hours)", placeholder="72", required=False, max_length=3)
+    provenance = discord.ui.TextInput(label="Provenance", required=False, max_length=200)
 
-    Combat ending is the moment loot exists, and it was also the moment the
-    handoff used to stop — the DM read `!i end` and was left to remember which
-    command records what they just won. These two buttons are the existing
-    Party Stash and Loot Drop workflows reached from where the fight ended.
-    """
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _require_dm(interaction, self.settings):
+            return
+        try:
+            quantity = _positive_quantity(self.quantity.value)
+        except ValueError as error:
+            await _send_error(interaction, str(error))
+            return
+        raw_expiry = str(self.expiry_hours.value or "").strip()
+        try:
+            expiry = _positive_quantity(raw_expiry) if raw_expiry else 72
+        except ValueError:
+            await _send_error(interaction, "Expiry must be a positive whole number of hours.")
+            return
+        if expiry > 720:
+            await _send_error(interaction, "A Loot Drop cannot stay open for more than 720 hours.")
+            return
+        item = str(self.item_name.value)
+        provenance = str(self.provenance.value).strip() or None
+        try:
+            execution = await _run_fast(
+                interaction,
+                self.settings,
+                lambda: self.context.loot.create_drop_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    items=[(item, quantity, provenance)],
+                    expiry_hours=expiry,
+                ),
+                ephemeral=True,
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
+                f"Loot Drop `{response['drop_id'][:8]}` created with {quantity} {item.strip()}.",
+                ephemeral=True,
+            )
+        except LootDropError as error:
+            await _send_error(interaction, f"That Loot Drop could not be opened: {error}")
 
-    def __init__(
-        self,
-        services: BotServices,
-        settings: Settings,
-        loot: LootDropService,
-    ) -> None:
-        super().__init__(timeout=600)
-        self.services = services
-        self.settings = settings
-        self.loot = loot
 
-    @discord.ui.button(label="Record spoils", style=discord.ButtonStyle.primary, custom_id="qm:combat:grant")
-    async def grant(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        if await _launcher_admin(interaction, self.settings):
-            await interaction.response.send_modal(GrantLootModal(self.services.inventory, self.settings))
+class SessionEndModal(QuartermasterModal, title="End the session"):
+    where_ended = discord.ui.TextInput(label="Where did it end?", placeholder="The Sunken Tomb", max_length=200)
 
-    @discord.ui.button(label="Open Loot", style=discord.ButtonStyle.secondary, custom_id="qm:combat:loot")
-    async def loot_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        if await _launcher_admin(interaction, self.settings):
-            await _launcher_loot(interaction, self.services, self.loot, self.settings)
-
-
-class QuartermasterLauncherView(QuartermasterView):
-    def __init__(
-        self,
-        services: BotServices,
-        settings: Settings,
-        characters: CharacterService,
-        currency: CurrencyService,
-        loot: LootDropService,
-    ) -> None:
-        super().__init__(timeout=600)
-        self.services = services
-        self.settings = settings
-        self.characters = characters
-        self.currency = currency
-        self.loot = loot
-
-    @discord.ui.button(label="Grant loot", style=discord.ButtonStyle.primary, custom_id="qm:launcher:grant")
-    async def grant(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        if await _launcher_admin(interaction, self.settings):
-            await interaction.response.send_modal(GrantLootModal(self.services.inventory, self.settings))
-
-    @discord.ui.button(label="Session", style=discord.ButtonStyle.primary, custom_id="qm:launcher:session")
-    async def session(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        if not await _launcher_admin(interaction, self.settings):
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _require_dm(interaction, self.settings):
             return
         try:
             execution = await _run_fast(
                 interaction,
                 self.settings,
-                lambda: self.services.sessions.start_interaction(
-                    str(interaction.id), actor_id=_actor_id(interaction)
+                lambda: self.context.sessions.end_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    where_ended=str(self.where_ended.value),
                 ),
                 ephemeral=True,
             )
             response = execution.value.logical_response
-            if response["status"] == "ACTIVE_EXISTS":
-                message = (
-                    f"Session {response['active_session_number']} is still active. "
-                    "End it explicitly with /session-end before starting another."
-                )
+            if response["status"] == "NO_ACTIVE_SESSION":
+                await _send_execution(interaction, execution, "There is no active session.", ephemeral=True)
             else:
-                message = f"Session {response['session_number']} started."
-            await _send_execution(interaction, execution, message, ephemeral=True)
+                await _send_execution(
+                    interaction, execution, f"Session {response['session_number']} closed.", ephemeral=True
+                )
         except SessionError as error:
-            await _send_error(interaction, f"Session could not be started: {error}")
+            await _send_error(interaction, f"The session could not be closed: {error}")
 
-    @discord.ui.button(label="More…", style=discord.ButtonStyle.secondary, custom_id="qm:launcher:more")
-    async def more(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        if not await _launcher_admin(interaction, self.settings):
+
+class CharacterAddModal(QuartermasterModal, title="Register a character"):
+    name = discord.ui.TextInput(label="Character name", placeholder="Tamsin", max_length=100)
+
+    def __init__(self, context: Quartermaster, discord_user_id: str | None, player_label: str) -> None:
+        super().__init__(context)
+        self.discord_user_id = discord_user_id
+        self.player_label = player_label
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _require_dm(interaction, self.settings):
             return
-        await interaction.response.send_message(
-            "Quartermaster admin actions",
-            ephemeral=True,
-            view=LauncherMoreView(
-                self.services,
+        try:
+            execution = await _run_fast(
+                interaction,
                 self.settings,
-                self.characters,
-                self.currency,
-                self.loot,
-            ),
-        )
+                lambda: self.context.characters.create_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    name=str(self.name.value),
+                    discord_user_id=self.discord_user_id,
+                ),
+                ephemeral=True,
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
+                f"Registered {response['name']} to {self.player_label}.",
+                ephemeral=True,
+            )
+        except CharacterError as error:
+            await _send_error(interaction, f"That character could not be registered: {error}")
+
+
+class TreasuryAdjustModal(QuartermasterModal, title="Adjust the treasury"):
+    cp = discord.ui.TextInput(label="Copper", placeholder="0", required=False, max_length=12)
+    sp = discord.ui.TextInput(label="Silver", placeholder="0", required=False, max_length=12)
+    gp = discord.ui.TextInput(label="Gold", placeholder="0", required=False, max_length=12)
+    pp = discord.ui.TextInput(label="Platinum", placeholder="0", required=False, max_length=12)
+    reason = discord.ui.TextInput(label="Reason", required=False, max_length=200)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _require_dm(interaction, self.settings):
+            return
+        try:
+            deltas = _coin_amounts(
+                {"cp": self.cp.value, "sp": self.sp.value, "gp": self.gp.value, "pp": self.pp.value}
+            )
+        except ValueError as error:
+            await _send_error(interaction, str(error))
+            return
+        reason = str(self.reason.value).strip() or None
+        try:
+            execution = await _run_fast(
+                interaction,
+                self.settings,
+                lambda: self.context.currency.adjust_treasury_interaction(
+                    str(interaction.id), actor_id=_actor_id(interaction), deltas=deltas, reason=reason
+                ),
+                ephemeral=True,
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction, execution, f"Treasury updated: {format_currency(response['after'])}.", ephemeral=True
+            )
+        except CurrencyError as error:
+            await _send_error(interaction, f"The treasury could not be adjusted: {error}")
+
+
+class TreasurySplitModal(QuartermasterModal, title="Split the treasury"):
+    cp = discord.ui.TextInput(label="Copper", placeholder="0", required=False, max_length=12)
+    sp = discord.ui.TextInput(label="Silver", placeholder="0", required=False, max_length=12)
+    gp = discord.ui.TextInput(label="Gold", placeholder="0", required=False, max_length=12)
+    pp = discord.ui.TextInput(label="Platinum", placeholder="0", required=False, max_length=12)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _require_dm(interaction, self.settings):
+            return
+        try:
+            amounts = _coin_amounts(
+                {"cp": self.cp.value, "sp": self.sp.value, "gp": self.gp.value, "pp": self.pp.value}
+            )
+        except ValueError as error:
+            await _send_error(interaction, str(error))
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                self.settings,
+                lambda: self.context.currency.split_treasury_interaction(
+                    str(interaction.id), actor_id=_actor_id(interaction), amounts=amounts
+                ),
+                ephemeral=True,
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
+                f"Split among {len(response['recipients'])} active characters: "
+                f"{format_currency(response['per_recipient'])} each.",
+                ephemeral=True,
+            )
+        except CurrencyError as error:
+            await _send_error(interaction, f"The treasury could not be split: {error}")
+
+
+class TreasuryGiveModal(QuartermasterModal, title="Give treasury currency"):
+    cp = discord.ui.TextInput(label="Copper", placeholder="0", required=False, max_length=12)
+    sp = discord.ui.TextInput(label="Silver", placeholder="0", required=False, max_length=12)
+    gp = discord.ui.TextInput(label="Gold", placeholder="0", required=False, max_length=12)
+    pp = discord.ui.TextInput(label="Platinum", placeholder="0", required=False, max_length=12)
+
+    def __init__(self, context: Quartermaster, character_id: str, character_name: str) -> None:
+        super().__init__(context)
+        self.character_id = character_id
+        self.character_name = character_name
+        self.title = f"Give currency to {character_name}"[:45]
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _require_dm(interaction, self.settings):
+            return
+        try:
+            amounts = _coin_amounts(
+                {"cp": self.cp.value, "sp": self.sp.value, "gp": self.gp.value, "pp": self.pp.value}
+            )
+        except ValueError as error:
+            await _send_error(interaction, str(error))
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                self.settings,
+                lambda: self.context.currency.give_to_character_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    character_id=self.character_id,
+                    amounts=amounts,
+                ),
+                ephemeral=True,
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
+                f"Gave {format_currency(response['amount'])} to {response['character_name']}.",
+                ephemeral=True,
+            )
+        except CurrencyError as error:
+            await _send_error(interaction, f"That currency could not be given: {error}")

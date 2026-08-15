@@ -17,6 +17,7 @@ from .db import SQLiteStore
 from .discord_commands import register_commands
 from .discord_common import (
     BotServices,
+    Quartermaster,
     _send_error,
 )
 from .discord_projection import DiscordProjectionTransport, ProjectionRunner
@@ -45,17 +46,16 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
     currency = services.currency or CurrencyService(services.store, services.receipts, handles=HandleRepository(services.store))
     combat_service = services.combat or CombatService(services.store, services.receipts)
 
-    register_commands(
-        bot,
-        guild,
-        settings,
-        services,
+    context = Quartermaster(
+        services=services,
+        settings=settings,
         characters=characters,
         currency=currency,
         loot=loot,
+        combat=combat_service,
         handoff=handoff,
-        combat_service=combat_service,
     )
+    register_commands(bot, guild, context)
 
     async def setup_hook() -> None:
         nonlocal projection_task

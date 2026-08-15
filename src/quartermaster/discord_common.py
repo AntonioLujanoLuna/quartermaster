@@ -41,6 +41,38 @@ class BotServices:
     combat: CombatService | None = None
 
 
+@dataclass(frozen=True)
+class Quartermaster:
+    """Everything a panel needs, resolved once at bot assembly.
+
+    `BotServices` leaves the later services optional because callers built it
+    before they existed. A panel cannot work with `None`, and threading six
+    separately-defaulted services through every view constructor is how one
+    panel ends up holding a different `LootDropService` than the panel it
+    navigated from. The adapter fills the gaps once, here.
+    """
+
+    services: BotServices
+    settings: Settings
+    characters: CharacterService
+    currency: CurrencyService
+    loot: LootDropService
+    combat: CombatService
+    handoff: AvraeHandoffService
+
+    @property
+    def inventory(self) -> InventoryService:
+        return self.services.inventory
+
+    @property
+    def sessions(self) -> SessionService:
+        return self.services.sessions
+
+    @property
+    def store(self) -> SQLiteStore:
+        return self.services.store
+
+
 def _actor_id(interaction: discord.Interaction) -> str:
     return str(interaction.user.id)
 
@@ -115,6 +147,34 @@ async def _send_execution(
         await interaction.followup.send(content, **kwargs)
     else:
         await interaction.response.send_message(content, **kwargs)
+
+
+async def _send_panel(
+    interaction: discord.Interaction,
+    content: str,
+    view: discord.ui.View,
+    *,
+    execution: FastExecutionResult | None = None,
+) -> None:
+    """Render a panel where the caller is already looking.
+
+    Navigation is not a result. Pressing Treasury on the home panel should
+    replace what is on screen, not leave the player scrolling back through a
+    column of ephemeral messages to find the panel they started from. Editing
+    in place needs both the message the component belongs to and an unspent
+    acknowledgement, so the first panel of a session — sent from the slash
+    command, with no message to edit — and any panel whose read overran the
+    soft deadline both fall back to sending one.
+    """
+    body = clamp_discord_content(content)
+    deferred = execution is not None and execution.deferred
+    if not deferred and getattr(interaction, "message", None) is not None and not interaction.response.is_done():
+        await interaction.response.edit_message(content=body, view=view)
+        return
+    if interaction.response.is_done():
+        await interaction.followup.send(body, view=view, ephemeral=True)
+    else:
+        await interaction.response.send_message(body, view=view, ephemeral=True)
 
 
 async def _run_deferred(
@@ -260,7 +320,10 @@ _AVRAE_AUTHORITY = (
     "Avrae holds initiative, HP, conditions, and every mechanical result. "
     "Quartermaster tracks only that the fight is happening."
 )
-_NO_SESSION = "No active Quartermaster session. Start one with `/session-start` before opening combat."
+_NO_SESSION = (
+    "No active Quartermaster session. The DM opens one from **DM Tools → Session** "
+    "before combat can be recorded."
+)
 
 
 def _render_open_drops(drops: list[dict]) -> list[str]:
@@ -287,7 +350,7 @@ def _render_combat_opened(response: dict) -> str:
         return (
             "**COMBAT ALREADY OPEN**\n\n"
             f"Session {response['session_number']} already has combat open in <#{response['channel_id']}>{running}.\n"
-            "Close it with `/combat` → End combat before opening another."
+            "Close it with **End combat** on this panel before opening another."
         )
     lines = [
         "**COMBAT OPEN**",
@@ -297,7 +360,7 @@ def _render_combat_opened(response: dict) -> str:
         "Start it in Avrae:",
         f"`{native_command('start')}`",
         "",
-        "Players join with `/combat` → Join combat. Close it with `/combat` → End combat when the fight is done.",
+        "Players join from **Combat → Join**. Close it with **End combat** when the fight is done.",
     ]
     return "\n".join(lines)
 
@@ -329,8 +392,8 @@ def _render_combat_closed(response: dict) -> str:
     lines.extend(
         [
             "",
-            "Spoils: `/loot-drop` opens a claimable drop for the party, or record one straight "
-            "into the Party Stash with the button below.",
+            "Spoils: **Open Loot** below starts a claimable drop for the party, or record them "
+            "straight into the Party Stash with **Record spoils**.",
         ]
     )
     return fit_discord_lines(lines, label="Loot Drop")
@@ -353,7 +416,7 @@ def _render_combat_status(status: dict) -> str:
             sentence += f", opened by <@{encounter['opened_by']}>"
         lines.append(sentence + ".")
     else:
-        lines.append("No Quartermaster combat is open. `/combat` → Start combat opens one.")
+        lines.append("No Quartermaster combat is open. **Start combat** opens one.")
         last = status["last_closed"]
         if last is not None:
             ran = format_duration(last["elapsed_seconds"])
@@ -381,8 +444,22 @@ def _render_characters(rows: list[dict]) -> str:
     )
 
 
-async def _launcher_admin(interaction: discord.Interaction, settings: Settings) -> bool:
+async def _require_dm(interaction: discord.Interaction, settings: Settings) -> bool:
+    """Gate a DM control, and say so in one voice wherever it is pressed.
+
+    The panels only render a DM control for a DM, so this is the second check
+    rather than the first — a view outlives the render that built it, and the
+    only thing standing between a stale panel and a mutation is the check the
+    callback makes when it is pressed.
+    """
     if not _in_configured_guild(interaction, settings) or not await _is_dm(interaction, settings):
-        await _send_error(interaction, "Only configured DM administrators can use the Quartermaster launcher.")
+        await _send_error(interaction, "Only configured DM administrators can use that control.")
+        return False
+    return True
+
+
+async def _require_guild(interaction: discord.Interaction, settings: Settings) -> bool:
+    if not _in_configured_guild(interaction, settings):
+        await _send_error(interaction, "This bot is configured for a different guild.")
         return False
     return True

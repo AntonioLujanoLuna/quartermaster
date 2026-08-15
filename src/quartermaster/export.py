@@ -62,7 +62,7 @@ def _render_export(connection: Any) -> str:
     ).fetchall()
     # Combat belongs to the session the table is playing — which is the closed
     # one for as long as the next has not started. Reading only the active
-    # session meant the whole record vanished at `/session-end`, so the document
+    # session meant the whole record vanished when the session ended, so the document
     # every truncated surface points at was empty of the fight it just held.
     encounter_session = active if active is not None else previous
     encounters = (
@@ -104,7 +104,7 @@ def _render_export(connection: Any) -> str:
     # Every surface that has to drop entries tells the reader this document
     # holds the full record, so an open Loot Drop cannot be missing from it:
     # while a drop is open its items exist nowhere else, and the only reason
-    # `/loot` truncates is that there are enough of them to matter.
+    # the Open Loot panel truncates is that there are enough of them to matter.
     lines.extend(["", "## Open Loot Drops", ""])
     if open_drops:
         current_drop: str | None = None

@@ -32,9 +32,11 @@ opaque single-use handles carrying the read set they were rendered against.
 session close, absolute expiry), sessions, integer-only treasury with adjust/split/give,
 character registration and lifecycle, and explicit belongings resolution for non-active
 characters. Taking from the stash and claiming a drop both transfer ownership to the
-actor's registered active character and both require one. `/item-give` is the way back:
-a player returns what they hold to the Party Stash or hands it to another active
-character, and every path that credits a holder shares one merge rule in `credit_stack`.
+actor's registered active character and both require one. **My Items** is the way back: a
+player returns what they hold to the Party Stash or hands it to another active character, and
+every path that credits a holder shares one merge rule in `credit_stack`. A give driven by a
+button carries a handle, so "Give all" cannot mean a number the giver never saw; a give that
+names its own quantity does not need one.
 
 **Projection.** State targets are scheduled by normalized lateness; events deliver FIFO
 per destination and bind to durable per-session threads. Undeliverable events dead-letter
@@ -48,27 +50,73 @@ whole current state.
 
 **Rendering.** Every Discord message is rendered within the platform's 2000-character
 limit. List surfaces drop whole lines from the end and say how many they dropped; the send
-boundary clamps anything else. One view carries twenty-five controls, so browse and claim
-listings mint handles against that budget and name the entries they have no control for.
-`rendering.py` holds all three bounds.
+boundary clamps anything else. One view carries twenty-five controls — two of them Refresh and
+the way back — so take and claim listings mint handles against that budget and name the
+entries they have no control for. `rendering.py` holds all three bounds.
+
+**Surface.** One guild-scoped command. `/quartermaster` opens an ephemeral home panel and
+every action past it is a button, a select menu, or a modal. A panel renders only the controls
+its caller may press, and every DM control checks again when it is pressed, because a view
+outlives the render that built it. Nothing is identified by hand: characters, players, held
+items, and open drops all come from select menus built out of canonical state. Navigation
+replaces the panel in place; a result is a separate ephemeral message, so reporting a
+committed mutation never depends on a re-render succeeding.
 
 **Operations.** `health`, `maintenance`, `backup`, `restore`, and `requeue-events` on the
-CLI; validated timestamped backups on a schedule with retention; `/quartermaster` as the
-DM launcher. The export is the full record every truncated surface points at: items with
+CLI; validated timestamped backups on a schedule with retention; **DM Tools → Maintenance**
+in Discord. The export is the full record every truncated surface points at: items with
 the character holding them named, open Loot Drops with what is still unclaimed, and the
 roster. See [the runbook](runbook.md).
 
-**Avrae.** Guild-scoped `/combat` has two halves. Start, End, and Status read and write
+**Avrae.** The Combat panel has two halves. Start, End, and Status read and write
 Quartermaster's own `combat_encounters` record — session, channel, duration, outcome, and
-nothing Avrae owns; Start and End are DM-only. The other six actions render read-only
-handoff cards pointing at native Avrae commands. Ending combat reports outstanding Loot
-Drops and offers the Party Stash and Loot Drop controls. The provider operation boundary is
+nothing Avrae owns; Start and End render only for a DM and check again when pressed. The other
+six controls render read-only handoff cards pointing at native Avrae commands. Ending combat
+reports outstanding Loot Drops and offers the spoils controls. The provider operation boundary is
 durable but has no live caller, and its health check cannot fail on this build. The
 extension scaffold at `integrations/avrae/quartermaster_cog.py` is parked: Gate 1 was
 answered "no, for now" on 2026-08-14, and it has never been loaded in an Avrae deployment.
 
-**Checks.** 189 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Checks.** 224 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request.
+
+## Surface pass on 2026-08-15
+
+Quartermaster had eighteen commands. Using it meant knowing which one existed, what it was
+called, and what order its arguments went in — at the table, mid-session, with four other
+people waiting. Three of them wanted a thirty-six character UUID pasted out of another
+command's output. That is now one command and a panel.
+
+- **`/quartermaster` is the whole surface.** It opens a home panel that states session, Party
+  Stash, open loot, treasury, and who the caller is playing, and every action past it is
+  something already on screen to press. `discord_panels` holds the panels and the navigation
+  between them; `discord_views` holds the controls that act and the modals they open, so a
+  panel can hand a control the way back to itself without the control knowing what a panel is.
+
+- **Nothing is identified by hand.** A character comes from a select menu of the roster, a
+  player from Discord's own user picker, a held item from what you are actually carrying, a
+  Loot Drop from what is actually open — each built out of canonical state at render time.
+  The previous pass recorded typed IDs as "the obvious next ergonomic step" and left it for
+  a session of real use; collapsing the command surface made it the same work as the rest.
+
+- **A panel renders only what its caller may press, and every DM control checks again.** A
+  player never sees DM Tools, which is what makes the refusals rare rather than routine. The
+  check stays at the control because a view outlives the render that built it: a panel left
+  open across a role change would otherwise be a mutation with no gate in front of it.
+
+- **A give driven by a button carries a read set.** This was recorded as an observation last
+  pass — "if a component path for giving ever exists, it needs a handle" — and the panel is
+  that path. `Give all` means the quantity the giver was looking at, so another player handing
+  them more of the same item between rendering and pressing produces the same confirmation
+  prompt `Take all` produces, not a silent transfer of a different number. `create_give_handles`
+  mints it; `_move_from_character` is the one body both the typed and the pressed give share.
+
+Two things were deliberately not done. Navigation replaces the panel in place, but a *result*
+is still a separate ephemeral message: re-rendering a list after a take would mean the report
+of a committed mutation depends on a second read succeeding, and "nothing was changed unless
+you were told otherwise" is the one sentence that must never be wrong. And the take and claim
+panels now spend two of their twenty-five controls on Refresh and the way back, which costs
+one listed stack, because a panel of consumed handles with no way to renew them is a dead end.
 
 ## Fifth pass on 2026-08-15
 
@@ -274,60 +322,75 @@ the next session decides deliberately rather than rediscovering them.
 - **The relative treasury split has no producer in the Discord layer.**
   `create_relative_split_handle` and `split_relative_interaction` implement a split that
   notices the active recipient set changed since the DM looked and asks for confirmation.
-  `/treasury-split` calls `split_treasury_interaction` directly and skips that check, so a
-  character who died between `/characters` and the split silently changes everyone's share.
-  This is the same shape as the take-all gap fixed in the previous pass, but the fix is a
-  product decision — it puts a confirmation step in front of a DM command — so it is left
-  for the table to choose.
+  The Split control calls `split_treasury_interaction` directly and skips that check, so a
+  character who died between the DM reading the roster and pressing Split silently changes
+  everyone's share. This is the same shape as the take-all gap, and as the give gap the
+  surface pass closed, but the fix is a product decision — it puts a confirmation step in
+  front of a DM control — so it is left for the table to choose.
 - **`local_metric_buckets` (migration 8) has no reader and no writer**, and
   `internal_hard_deadline_seconds` and `ack_latency_ms` are likewise computed or validated
   and never consumed. Latency budgets stay estimates until something records them.
-- **`/item-give` takes an item name and a character ID typed by hand.** So do
-  `/character-lifecycle`, `/character-resolve`, and `/treasury-give`. Autocomplete on those
-  parameters is the obvious next ergonomic step, and it is worth waiting for one session of
-  real use to say whether typing an ID at the table is actually the friction it looks like.
-- **A give is not guarded by a read set.** Take and claim carry a handle with the quantity
-  they were rendered against; a give is typed with an explicit quantity, so there is nothing
-  on screen to go stale. If a component path for giving ever exists, it needs a handle.
-
 ## Not yet verified live
 
-Nothing in any correction pass has been exercised against the guild. Before the next
-session:
+Nothing in any correction pass has been exercised against the guild, and the surface pass
+replaced every way in. The command list changed, so **the first thing to confirm is that the
+guild's old commands are gone and `/quartermaster` is there** — a stale tree is the one
+failure that makes everything below untestable.
 
-1. `/stash` → `Browse`, and confirm both `Take 1` and the new `Take all` appear.
-2. `Take all` on a stack the DM grows in between, and confirm the confirmation prompt reads
+Panel surface:
+
+1. `/quartermaster` as the server owner and as a player, and confirm the player's panel has no
+   **DM Tools** and the DM's does.
+2. Press through every panel and confirm each one replaces the message in place rather than
+   leaving a column of ephemeral replies, and that the way back always works.
+3. **Party Stash → Take something…**, and confirm both `Take 1` and `Take all` appear, that
+   Refresh renews the controls after a take, and that a take reports what it moved.
+4. `Take all` on a stack the DM grows in between, and confirm the confirmation prompt reads
    acceptably at the table and takes the current quantity.
-3. `/character-add` for a player who already has an active character, and confirm the
+5. **My Items → an item → Give all** back to the party, and the same to another character
+   through the destination select. Confirm the pinned Party Stash reflects the return and the
+   session log line reads acceptably.
+6. **My Items → Give some…** with a quantity larger than the holding, and confirm the refusal
+   names what is actually held.
+7. Have a second player hand the first more of the same item while the first has the give
+   panel open, then press `Give all`, and confirm the confirmation prompt appears and reads
+   acceptably. This is the one path with no live evidence at all behind it.
+8. **Characters → Register…**, pick a player from the user select, and confirm the reply names
+   them by mention. Repeat for a player who already has an active character and confirm the
    refusal names the existing one.
-4. Restart across the schema-10 migration and confirm health, the unique index, and the
-   normalized stack names on the live database.
-5. `health` after a deliberately broken session thread, and `requeue-events` once it is
-   recreated.
-6. Kill the bot mid-delivery (stop it while a grant is still propagating), restart, and
-   confirm the startup log reports a released projection claim and the Party Stash converges
-   without a manual database edit.
-7. Run `maintenance` from the CLI while the bot is up and a grant is in flight, and confirm
-   the runner logs at most a failed iteration and keeps delivering.
-8. Grant enough distinct items to push the pinned Party Stash past 2000 characters, and
-   confirm it keeps updating and that the truncation line reads acceptably at the table.
-9. Revoke the bot's Send Messages permission on `#party-inventory`, watch the retry interval
-   grow in the log, and confirm `health` reports `state_projections: FAILED` with the target
-   named. Restore the permission and confirm it clears without operator action.
-10. Revoke Manage Messages on `#party-inventory` and grant an item. Confirm the pinned
+9. **Characters → Lifecycle…** and **Resolve estate…**, and confirm the staged line reads
+   correctly before Apply and that Apply reports both ends of the move.
+10. **DM Tools → Loot Drops**, open a drop, claim from it as a player, then close it from the
+    select and confirm the remainder returns to the stash.
+11. **Treasury → Give to…**, and confirm the recipient select holds only active characters.
+12. **Combat**, and confirm the handoff cards are open to players while Start and End are not
+    even rendered for them.
+
+Runtime, unchanged by this pass and still unverified:
+
+13. Restart across the schema-10 migration and confirm health, the unique index, and the
+    normalized stack names on the live database.
+14. `health` after a deliberately broken session thread, and `requeue-events` once it is
+    recreated.
+15. Kill the bot mid-delivery (stop it while a grant is still propagating), restart, and
+    confirm the startup log reports a released projection claim and the Party Stash converges
+    without a manual database edit.
+16. Run `maintenance` from the CLI while the bot is up and a grant is in flight, and confirm
+    the runner logs at most a failed iteration and keeps delivering.
+17. Grant enough distinct items to push the pinned Party Stash past 2000 characters, and
+    confirm it keeps updating and that the truncation line reads acceptably at the table.
+18. Revoke the bot's Send Messages permission on `#party-inventory`, watch the retry interval
+    grow in the log, and confirm `health` reports `state_projections: FAILED` with the target
+    named. Restore the permission and confirm it clears without operator action.
+19. Revoke Manage Messages on `#party-inventory` and grant an item. Confirm the pinned
     projection keeps updating in place — one message, not a new one per delivery — and that
     the log names the missing permission. Restore it and confirm the pin returns.
-11. Grant enough two-item stacks to fill the browse controls, press Browse, and confirm the
-    buttons line up with the top of the list and the closing line about entries with no
-    control reads acceptably at the table.
-12. Run `/export` mid-session with an open Loot Drop and an item a player has taken, and
-    confirm the drop, the holder's name, and the roster all read correctly.
-13. `Take all` a stack, then `/item-give` part of it back, and confirm the pinned Party
-    Stash reflects the return and the session log line reads acceptably at the table.
-14. `/item-give` to another player's character, and confirm the recipient's holdings in
-    `/export` and that the giver is left with what they should be.
-15. Register a character and change a lifecycle with the session log in view, and confirm
-    those lines now read as sentences rather than JSON.
+20. Fill the take controls with two-item stacks, and confirm the buttons line up with the top
+    of the list and the closing line about entries with no control reads acceptably.
+21. Export mid-session with an open Loot Drop and an item a player has taken, and confirm the
+    drop, the holder's name, and the roster all read correctly.
+22. Register a character and change a lifecycle with the session log in view, and confirm
+    those lines read as sentences rather than JSON.
 
 ## Live Discord setup
 
@@ -349,10 +412,14 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
 ## Next priorities
 
 1. Work through "Not yet verified live" above.
-2. Play a session with the combat record and see whether the closeout gets used. If the DM
+2. Play one session on the panel and watch where the DM hesitates. The surface pass replaced
+   a command list with a shape, and a shape is only right if the thing you want next is
+   already on screen — how many presses a real grant, a real take, and a real end-of-session
+   actually cost is worth more than any further feature.
+3. Play a session with the combat record and see whether the closeout gets used. If the DM
    never presses **Record spoils** after a fight, the control is in the wrong place. That
    observation is worth more than any further combat feature.
-3. Choose evidence-based latency and freshness budgets from observed play if the current
+4. Choose evidence-based latency and freshness budgets from observed play if the current
    estimates prove wrong.
 
 The Avrae extension spike is no longer a priority: Gate 1 was answered "no, for now", so
