@@ -29,10 +29,11 @@ from .handles import HandleError
 from .inventory import InventoryError, InventoryService, SemanticStaleness
 from .loot import LootDropError, LootDropService
 from .operations import create_scheduled_backup, health_report, render_health
+from .rendering import DISCORD_VIEW_COMPONENT_LIMIT
 from .response import DeferredExecutionError
 from .sessions import SessionError
 
-MAX_VIEW_BUTTONS = 25
+MAX_VIEW_BUTTONS = DISCORD_VIEW_COMPONENT_LIMIT
 
 
 class TakeView(discord.ui.View):
@@ -166,7 +167,11 @@ class PartyStashView(discord.ui.View):
             await _send_execution(
                 interaction,
                 execution,
-                _render_stash(prepared["items"], total=prepared.get("total_items")),
+                _render_stash(
+                    prepared["items"],
+                    total=prepared.get("total_items"),
+                    controls=prepared["handles"],
+                ),
                 ephemeral=True,
                 view=view,
             )

@@ -55,7 +55,13 @@ Taking from the Party Stash transfers ownership to the taker's registered active
 Every message Quartermaster sends is rendered within Discord's 2000-character limit. List
 surfaces — the Party Stash projection, `/stash`, `/loot`, `/characters` — drop whole entries
 from the end and say how many they dropped rather than letting Discord reject the message;
-the export is the complete record.
+the export is the complete record. One component view carries twenty-five controls and a
+stack above one needs two of them, so a browse or claim listing that runs out of buttons
+names the entries it has no control for instead of showing them with nothing to press.
+
+The export is what those surfaces point at, so it holds what they cannot: every item with
+the character holding it named, every open Loot Drop with what is still unclaimed, and the
+full character roster.
 
 The Discord transport is intentionally an adapter boundary at this stage. No network calls occur in the core package or in a database transaction. The adapter is split into `discord_common` (services, authorization, response helpers), `discord_views` (components and launcher actions), `discord_commands` (slash command registration), and `discord_adapter` (bot assembly and the runtime loop).
 

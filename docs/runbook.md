@@ -38,7 +38,25 @@ Discord refuses any message over 2000 characters, so every Quartermaster surface
 … and 42 more Party Stash entries not shown here. The Quartermaster export holds the full record.
 ```
 
-is working as intended, not damaged: the stash outgrew one Discord message. `export` is the complete record, and `/stash` → `Browse` still reaches individual stacks. The same note can appear on `/loot` and `/characters`. Nothing is dropped from canonical state — only from the disposable projection.
+is working as intended, not damaged: the stash outgrew one Discord message. `export` is the complete record — items with the character holding them named, open Loot Drops with what is still unclaimed, and the roster — and `/stash` → `Browse` still reaches individual stacks. The same note can appear on `/loot` and `/characters`. Nothing is dropped from canonical state — only from the disposable projection.
+
+A browse or claim listing can also end with
+
+```
+The last 8 entries above have no take control here. Take what is showing and open this again.
+```
+
+One Discord view carries twenty-five controls and a stack above one offers both `Take 1` and `Take all`, so a long listing runs out of buttons before it runs out of items. The controls always cover the top of the list; taking what is showing brings the rest into reach.
+
+## The Party Stash projection is not pinned
+
+Pinning needs Manage Messages, and a Discord channel holds fifty pins. When the pin fails the projection still delivers — the message is the surface, the pin is only where it sits — and the log says so on every attempt:
+
+```
+WARNING quartermaster.discord_projection: could not pin the Party Stash projection in #party-inventory: 403 Forbidden (error code: 50013): Missing Permissions. Grant Manage Messages, or unpin something if the channel is at its pin limit.
+```
+
+Grant the permission or free a pin slot; the surface pins itself on the next delivery, with no operator action and no lost updates in between. `health` will not report this — the projection is current, it is just scrolling with the channel.
 
 ## Upgrading to schema 11
 

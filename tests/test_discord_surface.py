@@ -332,6 +332,31 @@ class DiscordSurfaceTests(unittest.TestCase):
         self.assertIn("Showing 25 of 40 stacks", browse_interaction.text)
         self.assertLessEqual(len(browse_interaction.text), DISCORD_MESSAGE_LIMIT)
 
+    def test_browse_names_the_stacks_it_has_no_take_control_for(self) -> None:
+        """A stack above one costs two controls; one view holds twenty-five.
+
+        Twenty listed stacks wanted forty buttons and got twenty-five, so eight
+        of them were listed with nothing to press and nothing said — the same
+        gap the Loot Drop listing already names.
+        """
+        self.register_player_character()
+        for index in range(20):
+            run(self.command("grant")(self.dm(), item=f"Relic {index}", quantity=3))
+        stash_interaction = self.player()
+        run(self.command("stash")(stash_interaction))
+        browse_interaction = self.player()
+        run(stash_interaction.kwargs["view"].children[0].callback(browse_interaction))
+        view = browse_interaction.kwargs["view"]
+        self.assertLessEqual(len(view.children), 25)
+        self.assertIn("have no take control here", browse_interaction.text)
+        self.assertLessEqual(len(browse_interaction.text), DISCORD_MESSAGE_LIMIT)
+        # Every control the message admits to is a button that exists, and
+        # every button belongs to a stack the message lists.
+        listed = [line for line in browse_interaction.text.splitlines() if line.startswith("• ")]
+        uncontrolled = int(browse_interaction.text.split("The last ")[1].split(" ")[0])
+        self.assertEqual(len(view.children), sum(2 for _ in range(len(listed) - uncontrolled)))
+
+
     def test_a_character_roster_too_large_for_one_message_still_answers(self) -> None:
         for index in range(60):
             run(
