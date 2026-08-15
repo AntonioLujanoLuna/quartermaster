@@ -81,6 +81,12 @@ with it would inflate the campaign's inventory rather than move it. `Give all` c
 same relative handle `Take all` does, so a quantity that moved between rendering and pressing
 is confirmed rather than silently substituted.
 
+Coin moves both ways on the same terms. The Treasury panel names what your character is
+carrying, and **My coin…** sends it back to the treasury or hands it to another active
+character. Adjusting the treasury only touches the party's own balance, so using it to undo
+a mistyped `Give to…` would mint the difference rather than return it — the same reason
+granting is not how you undo a take.
+
 Every message Quartermaster sends is rendered within Discord's 2000-character limit. List
 surfaces — the Party Stash projection and the stash, loot and character panels — drop whole
 entries from the end and say how many they dropped rather than letting Discord reject the

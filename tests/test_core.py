@@ -193,6 +193,93 @@ class QuartermasterCoreTests(unittest.TestCase):
         )
         self.assertEqual(self._currency_total(), seeded)
 
+        self.currency.give_from_character_interaction(
+            "conserve-return", actor_id="player", amounts={"gp": 1}, destination="party"
+        )
+        self.assertEqual(self._currency_total(), seeded)
+
+    def test_a_living_character_can_send_coin_back_to_the_treasury(self) -> None:
+        """A mistyped give is repairable by returning the coin, not by minting more.
+
+        Currency only ever moved towards a living character: a split credits
+        every active one, Give to… credits one, and the only debit refuses an
+        active character on purpose. The nearest repair a DM had — adjusting the
+        treasury back up — creates the difference instead of returning it, so
+        the campaign ended the evening richer than it started.
+        """
+        self.currency.adjust_treasury_interaction("mistype-seed", actor_id="dm", deltas={"gp": 100})
+        seeded = self._currency_total()
+        self.currency.give_to_character_interaction(
+            "mistype-give", actor_id="dm", character_id="player-character", amounts={"gp": 90}
+        )
+        self.assertEqual(self.currency.view_treasury()["gp"], 10)
+
+        returned = self.currency.give_from_character_interaction(
+            "mistype-return", actor_id="player", amounts={"gp": 81}, destination="party"
+        )
+        response = returned.logical_response
+        self.assertEqual(response["status"], "GIVEN")
+        self.assertEqual(response["destination_name"], "the treasury")
+        self.assertEqual(response["character_after"]["gp"], 9)
+        self.assertEqual(self.currency.view_treasury()["gp"], 91)
+        self.assertEqual(self._currency_total(), seeded)
+
+    def test_coin_moves_between_active_characters_without_the_dm(self) -> None:
+        self._insert_character("payee", "Payee")
+        self.currency.adjust_treasury_interaction("peer-seed", actor_id="dm", deltas={"sp": 40})
+        seeded = self._currency_total()
+        self.currency.give_to_character_interaction(
+            "peer-give", actor_id="dm", character_id="player-character", amounts={"sp": 40}
+        )
+        result = self.currency.give_from_character_interaction(
+            "peer-hand", actor_id="player", amounts={"sp": 15}, destination="payee"
+        )
+        self.assertEqual(result.logical_response["destination_name"], "Payee")
+        self.assertEqual(result.logical_response["character_after"]["sp"], 25)
+        self.assertEqual(result.logical_response["destination_after"]["sp"], 15)
+        self.assertEqual(self._currency_total(), seeded)
+        # The pinned surface renders the treasury, which this transfer did not touch.
+        self.assertEqual(self.currency.view_treasury()["sp"], 0)
+
+    def test_giving_coin_refuses_what_the_character_is_not_carrying(self) -> None:
+        self._insert_character("dead-payee", "Dead Payee", lifecycle="DEAD")
+        self.currency.adjust_treasury_interaction("refuse-seed", actor_id="dm", deltas={"gp": 5})
+        self.currency.give_to_character_interaction(
+            "refuse-give", actor_id="dm", character_id="player-character", amounts={"gp": 5}
+        )
+        seeded = self._currency_total()
+
+        for interaction_id, kwargs, expected in (
+            ("refuse-overdraw", {"actor_id": "player", "amounts": {"gp": 6}}, "carrying only"),
+            ("refuse-nobody", {"actor_id": "stranger", "amounts": {"gp": 1}}, "active registered character"),
+            (
+                "refuse-dead",
+                {"actor_id": "player", "amounts": {"gp": 1}, "destination": "dead-payee"},
+                "only active characters",
+            ),
+            (
+                "refuse-self",
+                {"actor_id": "player", "amounts": {"gp": 1}, "destination": "player-character"},
+                "must differ",
+            ),
+            (
+                "refuse-missing",
+                {"actor_id": "player", "amounts": {"gp": 1}, "destination": "no-such-character"},
+                "not found",
+            ),
+            ("refuse-nothing", {"actor_id": "player", "amounts": {"gp": 0}}, "at least one"),
+            ("refuse-negative", {"actor_id": "player", "amounts": {"gp": -1}}, "non-negative"),
+        ):
+            with self.subTest(interaction_id):
+                with self.assertRaisesRegex(CurrencyError, expected):
+                    self.currency.give_from_character_interaction(interaction_id, **kwargs)
+                self.assertIsNone(
+                    self.store.connection.execute(
+                        "SELECT 1 FROM interaction_receipts WHERE interaction_id = ?", (interaction_id,)
+                    ).fetchone()
+                )
+        self.assertEqual(self._currency_total(), seeded)
+
     def test_take_transfers_ownership_and_requires_a_registered_character(self) -> None:
         self.inventory.grant_interaction(
             "ownership-grant", actor_id="dm", item_name="Owned Relic", quantity=2

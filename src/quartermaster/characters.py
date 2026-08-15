@@ -6,7 +6,7 @@ import uuid
 from typing import Any
 
 from .clock import iso_now
-from .currency import CURRENCY_DENOMINATIONS, currency_from_row, empty_currency
+from .currency import CURRENCY_DENOMINATIONS, read_balance, write_balance
 from .db import SQLiteStore
 from .events import append_event, mark_projection_dirty, session_event_destination
 from .receipts import ReceiptRepository, ReceiptResult
@@ -270,29 +270,14 @@ class CharacterService:
             connection.execute("DELETE FROM inventory_stacks WHERE id = ?", (stack["id"],))
             moved_items.append({"item_name": stack["item_name"], "quantity": stack["quantity"]})
 
-        source_currency_row = connection.execute(
-            "SELECT cp, sp, ep, gp, pp FROM currency_balances WHERE owner_type = 'CHARACTER' AND owner_id = ?",
-            (character_id,),
-        ).fetchone()
-        currency_moved = currency_from_row(source_currency_row) if source_currency_row else empty_currency()
+        currency_moved = read_balance(connection, "CHARACTER", character_id)
         if any(currency_moved.values()):
-            destination_currency_row = connection.execute(
-                "SELECT cp, sp, ep, gp, pp FROM currency_balances WHERE owner_type = ? AND owner_id = ?",
-                (destination_type, destination_id),
-            ).fetchone()
-            destination_currency = currency_from_row(destination_currency_row) if destination_currency_row else empty_currency()
+            destination_currency = read_balance(connection, destination_type, destination_id)
             updated_currency = {
                 denomination: destination_currency[denomination] + currency_moved[denomination]
                 for denomination in CURRENCY_DENOMINATIONS
             }
-            connection.execute(
-                """INSERT INTO currency_balances(owner_type, owner_id, cp, sp, ep, gp, pp, version, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
-                   ON CONFLICT(owner_type, owner_id) DO UPDATE SET
-                       cp = excluded.cp, sp = excluded.sp, ep = excluded.ep, gp = excluded.gp, pp = excluded.pp,
-                       version = currency_balances.version + 1, updated_at = excluded.updated_at""",
-                (destination_type, destination_id, updated_currency["cp"], updated_currency["sp"], updated_currency["ep"], updated_currency["gp"], updated_currency["pp"], now),
-            )
+            write_balance(connection, destination_type, destination_id, updated_currency, now)
             connection.execute(
                 """UPDATE currency_balances
                       SET cp = 0, sp = 0, ep = 0, gp = 0, pp = 0, version = version + 1, updated_at = ?

@@ -97,6 +97,10 @@ _EVENT_RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
         f"Treasury split among {len(payload['recipients'])} active characters."
     ),
     "CURRENCY_TRANSFERRED": lambda payload: f"Currency given to {payload['character_name']}.",
+    "CURRENCY_GIVEN": lambda payload: (
+        f"{payload['character_name']} gave {format_currency(payload['amount'])} "
+        f"to {payload['destination_name']}."
+    ),
     "BELONGINGS_RESOLVED": lambda payload: (
         f"Belongings resolved from {payload['source_character_name']} to {payload['destination_name']}."
     ),

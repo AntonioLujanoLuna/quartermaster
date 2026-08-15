@@ -331,12 +331,15 @@ def _destination_options(
     recipients: list[dict],
     *,
     selected: str,
+    party_label: str = "The Party Stash",
+    party_description: str = "Put it back where the party can take it",
+    recipient_description: str = "Hand it to this character",
 ) -> list[discord.SelectOption]:
     options = [
         discord.SelectOption(
-            label="The Party Stash",
+            label=party_label,
             value=PARTY_DESTINATION,
-            description="Put it back where the party can take it",
+            description=party_description,
             default=selected == PARTY_DESTINATION,
         )
     ]
@@ -345,7 +348,7 @@ def _destination_options(
             discord.SelectOption(
                 label=str(recipient["name"])[:100],
                 value=str(recipient["id"]),
-                description="Hand it to this character",
+                description=recipient_description,
                 default=selected == str(recipient["id"]),
             )
         )
@@ -539,6 +542,134 @@ def _render_given(response: dict) -> str:
         f"{response['character_name']} gave {response['quantity']} {response['item_name']}"
         f" to {response['destination_name']}. {response['remaining']} still held."
     )
+
+
+def render_give_coin(purse: dict, destination_name: str) -> str:
+    """The give-coin panel: what the player has, and where it is headed."""
+    character = purse["character"]
+    return "\n".join(
+        [
+            "**GIVE COIN**",
+            "",
+            f"{character['name']} is carrying {format_currency(purse['balance'])}.",
+            f"Going to {destination_name}.",
+        ]
+    )
+
+
+def _render_coin_given(response: dict) -> str:
+    return (
+        f"{response['character_name']} gave {format_currency(response['amount'])}"
+        f" to {response['destination_name']}."
+        f" Still carrying {format_currency(response['character_after'])}."
+    )
+
+
+class GiveCurrencyView(QuartermasterView):
+    """Give coin away: how much, and to whom.
+
+    The same shape as `GiveItemView`, without the handles. A held stack has a
+    quantity on screen that another character can move underneath the giver, so
+    "Give all" has to be minted against what was rendered; coin is typed into a
+    modal at the moment it is given, so there is nothing on screen to go stale.
+    """
+
+    def __init__(
+        self,
+        context: Quartermaster,
+        purse: dict,
+        recipients: list[dict],
+        *,
+        back: Opener,
+        destination: str = PARTY_DESTINATION,
+    ) -> None:
+        super().__init__(context)
+        self.purse = purse
+        self.recipients = recipients
+        self.destination = destination
+        select = discord.ui.Select(
+            placeholder="Give to…",
+            options=_destination_options(
+                recipients,
+                selected=destination,
+                party_label="The treasury",
+                party_description="Put it back where the party's money lives",
+                recipient_description="Hand it to this character",
+            ),
+            custom_id="qm:coin:destination",
+            row=0,
+        )
+        select.callback = self._choose_destination(select)
+        self.add_item(select)
+        give = discord.ui.Button(
+            label="Give coin…", style=discord.ButtonStyle.primary, custom_id="qm:coin:give", row=1
+        )
+        give.callback = self._give
+        self.add_item(give)
+        self.add_navigation(back, label="◀ Treasury", custom_id="qm:coin:back", row=1)
+
+    def _destination_name(self) -> str:
+        if self.destination == PARTY_DESTINATION:
+            return "the treasury"
+        for recipient in self.recipients:
+            if str(recipient["id"]) == self.destination:
+                return str(recipient["name"])
+        return "the chosen character"
+
+    def _choose_destination(self, select: discord.ui.Select) -> Callable[[discord.Interaction], object]:
+        async def callback(interaction: discord.Interaction) -> None:
+            self.destination = select.values[0]
+            for option in select.options:
+                option.default = option.value == self.destination
+            await interaction.response.edit_message(
+                content=render_give_coin(self.purse, self._destination_name()),
+                view=self,
+            )
+
+        return callback
+
+    async def _give(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(
+            GiveCurrencyModal(self.context, self.destination, self._destination_name())
+        )
+
+
+class GiveCurrencyModal(QuartermasterModal, title="Give coin"):
+    cp = discord.ui.TextInput(label="Copper", placeholder="0", required=False, max_length=12)
+    sp = discord.ui.TextInput(label="Silver", placeholder="0", required=False, max_length=12)
+    gp = discord.ui.TextInput(label="Gold", placeholder="0", required=False, max_length=12)
+    pp = discord.ui.TextInput(label="Platinum", placeholder="0", required=False, max_length=12)
+
+    def __init__(self, context: Quartermaster, destination: str, destination_name: str) -> None:
+        super().__init__(context)
+        self.destination = destination
+        self.title = f"Give coin to {destination_name}"[:45]
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            amounts = _coin_amounts(
+                {"cp": self.cp.value, "sp": self.sp.value, "gp": self.gp.value, "pp": self.pp.value}
+            )
+        except ValueError as error:
+            await _send_error(interaction, str(error))
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                self.settings,
+                lambda: self.context.currency.give_from_character_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    amounts=amounts,
+                    destination=self.destination,
+                ),
+                ephemeral=True,
+            )
+            await _send_execution(
+                interaction, execution, _render_coin_given(execution.value.logical_response), ephemeral=True
+            )
+        except CurrencyError as error:
+            await _send_error(interaction, f"That coin could not be given: {error}")
 
 
 # DM modals ------------------------------------------------------------------
