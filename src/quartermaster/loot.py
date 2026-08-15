@@ -10,7 +10,7 @@ from .clock import iso_now
 from .db import SQLiteStore
 from .events import append_event, mark_projection_dirty
 from .handles import Handle, HandleRepository
-from .inventory import active_claimant, credit_character_stack, normalize_name
+from .inventory import active_claimant, credit_character_stack, credit_stack, normalize_name
 from .receipts import ReceiptRepository, ReceiptResult
 
 
@@ -278,24 +278,16 @@ class LootDropService:
         return {"status": "CLOSED", "drop_id": drop_id, "reason": reason, "returned_item_count": sum(int(row["remaining_quantity"]) for row in rows)}
 
     def _return_to_party(self, connection: Any, item_name: str, normalized_name: str, quantity: int, provenance: str | None) -> None:
-        now = iso_now()
-        row = connection.execute(
-            "SELECT id FROM inventory_stacks WHERE owner_type = 'PARTY' AND owner_id = 'party' AND normalized_name = ? AND variant_metadata = '{}'",
-            (normalized_name,),
-        ).fetchone()
-        if row is None:
-            connection.execute(
-                """INSERT INTO inventory_stacks(
-                    id, item_name, normalized_name, variant_metadata, quantity,
-                    provenance, owner_type, owner_id, version, last_acquired_at, updated_at
-                ) VALUES (?, ?, ?, '{}', ?, ?, 'PARTY', 'party', 1, ?, ?)""",
-                (str(uuid.uuid4()), item_name, normalized_name, quantity, provenance, now, now),
-            )
-        else:
-            connection.execute(
-                "UPDATE inventory_stacks SET quantity = quantity + ?, version = version + 1, provenance = COALESCE(?, provenance), last_acquired_at = ?, updated_at = ? WHERE id = ?",
-                (quantity, provenance, now, now, row["id"]),
-            )
+        credit_stack(
+            connection,
+            owner_type="PARTY",
+            owner_id="party",
+            item_name=item_name,
+            normalized_name=normalized_name,
+            quantity=quantity,
+            provenance=provenance,
+            now=iso_now(),
+        )
 
     def close_session_drops(self, connection: Any, *, session_id: str, operation_id: str) -> int:
         drops = connection.execute("SELECT id FROM loot_drops WHERE session_id = ? AND status = 'OPEN'", (session_id,)).fetchall()
