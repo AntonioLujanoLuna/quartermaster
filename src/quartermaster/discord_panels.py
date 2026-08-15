@@ -51,6 +51,7 @@ from .discord_views import (
     MAX_VIEW_BUTTONS,
     PARTY_DESTINATION,
     CharacterAddModal,
+    GiveCurrencyView,
     GiveItemView,
     GrantLootModal,
     LootClaimView,
@@ -63,6 +64,7 @@ from .discord_views import (
     TreasuryAdjustModal,
     TreasuryGiveModal,
     TreasurySplitModal,
+    render_give_coin,
     render_give_item,
 )
 from .export import render_export
@@ -126,6 +128,7 @@ def _home_snapshot(context: Quartermaster, actor_id: str) -> dict[str, Any]:
     roster = context.characters.list_characters()
     holdings = context.inventory.holdings(actor_id=actor_id)
     treasury = context.currency.view_treasury()
+    purse = context.currency.purse(actor_id=actor_id)
     with context.store.read() as connection:
         active = connection.execute(
             "SELECT session_number FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
@@ -139,6 +142,7 @@ def _home_snapshot(context: Quartermaster, actor_id: str) -> dict[str, Any]:
         "treasury": treasury,
         "character": holdings["character"],
         "held_stacks": holdings["total_items"],
+        "purse": purse["balance"],
     }
 
 
@@ -174,6 +178,12 @@ def _render_home(snapshot: dict[str, Any], *, is_dm: bool) -> str:
         held = snapshot["held_stacks"]
         carrying = f"carrying {held} {'stack' if held == 1 else 'stacks'}" if held else "carrying nothing"
         lines.append(f"You are playing **{character['name']}**, {carrying}.")
+        # A split moves coin out of the treasury line above and into a balance
+        # the player owns. Saying so here is the only place they meet it before
+        # they need it.
+        purse = snapshot["purse"]
+        if any(purse.values()):
+            lines.append(f"Your coin · {format_currency(purse)}")
     if is_dm:
         estates = int(snapshot["unresolved_estates"] or 0)
         if estates:
@@ -457,8 +467,15 @@ async def open_give_item(
 
 
 class TreasuryView(PanelView):
-    def __init__(self, context: Quartermaster, *, is_dm: bool) -> None:
+    def __init__(self, context: Quartermaster, *, is_dm: bool, has_coin: bool = False) -> None:
         super().__init__(context)
+        if has_coin:
+            self.add_navigation(
+                _open(open_give_coin, context),
+                label="My coin…",
+                style=discord.ButtonStyle.primary,
+                custom_id="qm:treasury:mycoin",
+            )
         if is_dm:
             adjust = discord.ui.Button(
                 label="Adjust…", style=discord.ButtonStyle.primary, custom_id="qm:treasury:adjust"
@@ -485,8 +502,22 @@ class TreasuryView(PanelView):
             await interaction.response.send_modal(TreasurySplitModal(self.context))
 
 
-def _render_treasury(balance: dict[str, int], *, is_dm: bool) -> str:
-    lines = ["**TREASURY**", "", format_currency(balance)]
+def _render_treasury(snapshot: dict[str, Any], *, is_dm: bool) -> str:
+    """The party's money, and the caller's own.
+
+    A player's coin used to appear nowhere on the surface — a split moved it
+    somewhere only the DM's export could see. Showing both here is what makes
+    the give control below legible: the number you are being offered a way to
+    move is on the same screen as the control that moves it.
+    """
+    lines = ["**TREASURY**", "", format_currency(snapshot["treasury"])]
+    character = snapshot["purse"]["character"]
+    balance = snapshot["purse"]["balance"]
+    # Said only when there is coin to say it about, which is the same condition
+    # the give control appears under: a row of zeroes beside no control to press
+    # is clutter on a panel every player opens.
+    if character is not None and any(balance.values()):
+        lines.extend(["", f"{character['name']} is carrying {format_currency(balance)}."])
     if is_dm:
         lines.extend(
             [
@@ -498,19 +529,73 @@ def _render_treasury(balance: dict[str, int], *, is_dm: bool) -> str:
     return "\n".join(lines)
 
 
+def _treasury_snapshot(context: Quartermaster, actor_id: str) -> dict[str, Any]:
+    return {"treasury": context.currency.view_treasury(), "purse": context.currency.purse(actor_id=actor_id)}
+
+
 async def open_treasury(interaction: discord.Interaction, context: Quartermaster) -> None:
     if not await _require_guild(interaction, context.settings):
         return
     is_dm = await _is_dm(interaction, context.settings)
     try:
-        execution = await _run_fast(interaction, context.settings, context.currency.view_treasury, ephemeral=True)
+        execution = await _run_fast(
+            interaction,
+            context.settings,
+            lambda: _treasury_snapshot(context, _actor_id(interaction)),
+            ephemeral=True,
+        )
     except CurrencyError as error:
         await _send_error(interaction, f"Treasury could not be read: {error}")
         return
+    snapshot = execution.value
     await _send_panel(
         interaction,
-        _render_treasury(execution.value, is_dm=is_dm),
-        TreasuryView(context, is_dm=is_dm),
+        _render_treasury(snapshot, is_dm=is_dm),
+        TreasuryView(context, is_dm=is_dm, has_coin=any(snapshot["purse"]["balance"].values())),
+        execution=execution,
+    )
+
+
+def _coin_snapshot(context: Quartermaster, actor_id: str) -> dict[str, Any]:
+    purse = context.currency.purse(actor_id=actor_id)
+    character = purse["character"]
+    return {
+        "purse": purse,
+        "recipients": [
+            {"id": str(row["id"]), "name": str(row["name"])}
+            for row in context.characters.list_characters()
+            if row["lifecycle"] == "ACTIVE"
+            and (character is None or str(row["id"]) != character["id"])
+        ],
+    }
+
+
+async def open_give_coin(interaction: discord.Interaction, context: Quartermaster) -> None:
+    if not await _require_guild(interaction, context.settings):
+        return
+    execution = await _run_fast(
+        interaction,
+        context.settings,
+        lambda: _coin_snapshot(context, _actor_id(interaction)),
+        ephemeral=True,
+    )
+    prepared = execution.value
+    if prepared["purse"]["character"] is None:
+        await _send_error(
+            interaction,
+            "You have no active character registered, so you are not carrying any coin.",
+        )
+        return
+    await _send_panel(
+        interaction,
+        render_give_coin(prepared["purse"], "the treasury"),
+        GiveCurrencyView(
+            context,
+            prepared["purse"],
+            prepared["recipients"],
+            back=_open(open_treasury, context),
+            destination=PARTY_DESTINATION,
+        ),
         execution=execution,
     )
 

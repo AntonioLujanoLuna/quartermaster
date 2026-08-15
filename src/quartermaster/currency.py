@@ -9,6 +9,7 @@ from .clock import iso_now
 from .db import SQLiteStore
 from .events import append_event, mark_projection_dirty, session_event_destination
 from .handles import HandleRepository
+from .inventory import active_claimant
 from .receipts import ReceiptRepository, ReceiptResult
 
 CURRENCY_DENOMINATIONS = ("cp", "sp", "ep", "gp", "pp")
@@ -62,6 +63,43 @@ def _validate_nonnegative_amounts(amounts: Mapping[str, int], *, electrum_enable
     return normalized
 
 
+def read_balance(connection: Any, owner_type: str, owner_id: str) -> dict[str, int]:
+    """What an owner is carrying, treating an absent row as nothing.
+
+    Only the party has a balance row from the start; a character gets one the
+    first time coin reaches them. Every caller that reads a character has to
+    handle both, so the fallback lives here rather than at each call site.
+    """
+    row = connection.execute(
+        "SELECT cp, sp, ep, gp, pp FROM currency_balances WHERE owner_type = ? AND owner_id = ?",
+        (owner_type, owner_id),
+    ).fetchone()
+    return currency_from_row(row) if row is not None else empty_currency()
+
+
+def write_balance(
+    connection: Any, owner_type: str, owner_id: str, balance: Mapping[str, int], now: str
+) -> None:
+    """Set an owner's balance, creating the row if this is their first coin."""
+    connection.execute(
+        """INSERT INTO currency_balances(owner_type, owner_id, cp, sp, ep, gp, pp, version, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+           ON CONFLICT(owner_type, owner_id) DO UPDATE SET
+               cp = excluded.cp, sp = excluded.sp, ep = excluded.ep, gp = excluded.gp, pp = excluded.pp,
+               version = currency_balances.version + 1, updated_at = excluded.updated_at""",
+        (
+            owner_type,
+            owner_id,
+            int(balance["cp"]),
+            int(balance["sp"]),
+            int(balance["ep"]),
+            int(balance["gp"]),
+            int(balance["pp"]),
+            now,
+        ),
+    )
+
+
 class CurrencyService:
     def __init__(
         self,
@@ -84,6 +122,27 @@ class CurrencyService:
         if row is None:
             raise CurrencyError("treasury balance is missing")
         return currency_from_row(row)
+
+    def purse(self, *, actor_id: str | None) -> dict[str, Any]:
+        """What the actor's active character is carrying, for the give controls.
+
+        Returns the character as well as the coin, for the same reason
+        `InventoryService.holdings` does: "you have no registered character" and
+        "your character has no coin" are different answers, and a surface that
+        conflates them tells a player to go and spend money they do not have.
+
+        Until this existed a player's own coin appeared in exactly one place —
+        the DM's export — so the money a split handed them was invisible to the
+        person it belonged to.
+        """
+        with self.store.read() as connection:
+            holder = active_claimant(connection, actor_id)
+            if holder is None:
+                return {"character": None, "balance": empty_currency()}
+            return {
+                "character": {"id": str(holder["id"]), "name": str(holder["name"])},
+                "balance": read_balance(connection, "CHARACTER", str(holder["id"])),
+            }
 
     def adjust_treasury_interaction(
         self,
@@ -287,23 +346,12 @@ class CurrencyService:
             (after["cp"], after["sp"], after["ep"], after["gp"], after["pp"], now),
         )
         for character in characters:
-            existing = connection.execute(
-                "SELECT cp, sp, ep, gp, pp FROM currency_balances WHERE owner_type = 'CHARACTER' AND owner_id = ?",
-                (character["id"],),
-            ).fetchone()
-            current = currency_from_row(existing) if existing else empty_currency()
+            current = read_balance(connection, "CHARACTER", str(character["id"]))
             updated = {
                 denomination: current[denomination] + per_recipient[denomination]
                 for denomination in CURRENCY_DENOMINATIONS
             }
-            connection.execute(
-                """INSERT INTO currency_balances(owner_type, owner_id, cp, sp, ep, gp, pp, version, updated_at)
-                   VALUES ('CHARACTER', ?, ?, ?, ?, ?, ?, 1, ?)
-                   ON CONFLICT(owner_type, owner_id) DO UPDATE SET
-                       cp = excluded.cp, sp = excluded.sp, ep = excluded.ep, gp = excluded.gp, pp = excluded.pp,
-                       version = currency_balances.version + 1, updated_at = excluded.updated_at""",
-                (character["id"], updated["cp"], updated["sp"], updated["ep"], updated["gp"], updated["pp"], now),
-            )
+            write_balance(connection, "CHARACTER", str(character["id"]), updated, now)
         append_event(
             connection,
             operation_id=operation_id,
@@ -373,11 +421,7 @@ class CurrencyService:
         before = currency_from_row(treasury_row)
         if any(amounts[denomination] > before[denomination] for denomination in CURRENCY_DENOMINATIONS):
             raise CurrencyError("treasury does not contain enough currency")
-        character_row = connection.execute(
-            "SELECT cp, sp, ep, gp, pp FROM currency_balances WHERE owner_type = 'CHARACTER' AND owner_id = ?",
-            (character_id,),
-        ).fetchone()
-        character_before = currency_from_row(character_row) if character_row else empty_currency()
+        character_before = read_balance(connection, "CHARACTER", character_id)
         after = {denomination: before[denomination] - amounts[denomination] for denomination in CURRENCY_DENOMINATIONS}
         character_after = {
             denomination: character_before[denomination] + amounts[denomination]
@@ -390,14 +434,7 @@ class CurrencyService:
                 WHERE owner_type = 'PARTY' AND owner_id = 'party'""",
             (after["cp"], after["sp"], after["ep"], after["gp"], after["pp"], now),
         )
-        connection.execute(
-            """INSERT INTO currency_balances(owner_type, owner_id, cp, sp, ep, gp, pp, version, updated_at)
-               VALUES ('CHARACTER', ?, ?, ?, ?, ?, ?, 1, ?)
-               ON CONFLICT(owner_type, owner_id) DO UPDATE SET
-                   cp = excluded.cp, sp = excluded.sp, ep = excluded.ep, gp = excluded.gp, pp = excluded.pp,
-                   version = currency_balances.version + 1, updated_at = excluded.updated_at""",
-            (character_id, character_after["cp"], character_after["sp"], character_after["ep"], character_after["gp"], character_after["pp"], now),
-        )
+        write_balance(connection, "CHARACTER", character_id, character_after, now)
         append_event(
             connection,
             operation_id=operation_id,
@@ -421,3 +458,110 @@ class CurrencyService:
             "treasury_after": after,
             "character_after": character_after,
         }
+
+    def give_from_character_interaction(
+        self,
+        interaction_id: str,
+        *,
+        actor_id: str | None,
+        amounts: Mapping[str, int],
+        destination: str = "party",
+    ) -> ReceiptResult:
+        """Move coin out of the actor's active character, back or on.
+
+        Until this existed currency only travelled towards a living character.
+        A split credits every active character, **Give to…** credits one, and
+        the single debit in the product — belongings resolution — refuses an
+        active character on purpose. So an active character's balance could
+        only ever rise, and a mistyped give, 90 gp where the DM meant 9, was
+        permanent.
+
+        What made that worse than the equivalent item mistake is the repair. A
+        DM reaching for **Adjust…** to put the 81 gp back does not return it,
+        because adjust only touches the party row: the character keeps the coin
+        and the campaign ends the evening 81 gp richer than it started. This is
+        the coin counterpart of My Items, and it exists for the same reason —
+        a table needs conservation, not a second way to mint.
+        """
+        normalized = _validate_nonnegative_amounts(amounts, electrum_enabled=self.electrum_enabled)
+        normalized_destination = destination.strip()
+        if not normalized_destination:
+            raise CurrencyError("a destination is required")
+        return self.receipts.execute_fast(
+            interaction_id,
+            actor_id=actor_id,
+            response_kind="currency-transfer",
+            mutation=lambda connection, operation_id: self._give_from_character_in_transaction(
+                connection, operation_id, actor_id, normalized, normalized_destination
+            ),
+        )
+
+    def _give_from_character_in_transaction(
+        self,
+        connection: Any,
+        operation_id: str,
+        actor_id: str | None,
+        amounts: Mapping[str, int],
+        destination: str,
+    ) -> dict[str, Any]:
+        giver = active_claimant(connection, actor_id)
+        if giver is None:
+            raise CurrencyError("an active registered character is required to give currency")
+        giver_id = str(giver["id"])
+        held = read_balance(connection, "CHARACTER", giver_id)
+        if any(amounts[denomination] > held[denomination] for denomination in CURRENCY_DENOMINATIONS):
+            raise CurrencyError(f"{giver['name']} is carrying only {format_currency(held)}")
+
+        if destination.casefold() == "party":
+            destination_type, destination_id, destination_name = "PARTY", "party", "the treasury"
+        else:
+            recipient = connection.execute(
+                "SELECT id, name, lifecycle FROM characters WHERE id = ?", (destination,)
+            ).fetchone()
+            if recipient is None:
+                raise CurrencyError("recipient character not found")
+            if recipient["lifecycle"] != "ACTIVE":
+                raise CurrencyError("only active characters can receive currency")
+            if str(recipient["id"]) == giver_id:
+                raise CurrencyError("the recipient must differ from the giver")
+            destination_type, destination_id = "CHARACTER", str(recipient["id"])
+            destination_name = str(recipient["name"])
+
+        now = iso_now()
+        giver_after = {
+            denomination: held[denomination] - amounts[denomination]
+            for denomination in CURRENCY_DENOMINATIONS
+        }
+        destination_before = read_balance(connection, destination_type, destination_id)
+        destination_after = {
+            denomination: destination_before[denomination] + amounts[denomination]
+            for denomination in CURRENCY_DENOMINATIONS
+        }
+        write_balance(connection, "CHARACTER", giver_id, giver_after, now)
+        write_balance(connection, destination_type, destination_id, destination_after, now)
+        result = {
+            "status": "GIVEN",
+            "character_id": giver_id,
+            "character_name": str(giver["name"]),
+            "amount": dict(amounts),
+            "character_after": giver_after,
+            "destination_type": destination_type,
+            "destination_id": destination_id,
+            "destination_name": destination_name,
+            "destination_after": destination_after,
+        }
+        append_event(
+            connection,
+            operation_id=operation_id,
+            actor_id=actor_id,
+            event_type="CURRENCY_GIVEN",
+            payload=result,
+            destination=session_event_destination(connection),
+        )
+        # The pinned surface renders the treasury, not a character's purse, so
+        # it only changes when the party is one end of the transfer.
+        if destination_type == "PARTY":
+            mark_projection_dirty(
+                connection, target_id="party-stash", target_type="STATE", destination="party-inventory"
+            )
+        return result

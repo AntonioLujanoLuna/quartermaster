@@ -42,11 +42,13 @@ from quartermaster.discord_panels import (
     SessionView,
     TreasuryGiveView,
     TreasuryView,
+    open_give_coin,
     open_home,
 )
 from quartermaster.discord_views import (
     CharacterAddModal,
     GiveConfirmationView,
+    GiveCurrencyModal,
     GiveQuantityModal,
     GrantLootModal,
     LootDropModal,
@@ -1114,6 +1116,123 @@ class TreasuryTests(SurfaceTestCase):
         self.assertIn("0 cp · 0 sp · 3 gp · 0 pp", panel.text)
         labels = {getattr(item, "label", None) for item in panel.view.children}
         self.assertEqual(labels, {"Refresh", "◀ Home"})
+
+
+class CoinTests(SurfaceTestCase):
+    """A player's own coin: that they can see it, and that it can move.
+
+    Currency used to travel one way only. A split and **Give to…** credit a
+    living character and nothing debits one — belongings resolution refuses an
+    active character on purpose — so a mistyped give was permanent, and the
+    balance it created appeared nowhere on the surface. These drive the way
+    back, which is the coin counterpart of My Items.
+    """
+
+    def purse(self, character_id: str) -> dict[str, int]:
+        row = self.store.connection.execute(
+            "SELECT cp, sp, gp, pp FROM currency_balances WHERE owner_type = 'CHARACTER' AND owner_id = ?",
+            (character_id,),
+        ).fetchone()
+        return {coin: 0 for coin in ("cp", "sp", "gp", "pp")} if row is None else dict(row)
+
+    def fund(self, character_id: str, name: str, **coins: int) -> None:
+        self.adjust_treasury(**coins)
+        self.submit(
+            TreasuryGiveModal(self.context, character_id, name),
+            "dm",
+            **{coin: coins.get(coin, 0) for coin in ("cp", "sp", "gp", "pp")},
+        )
+
+    def give_panel(self, who: str = "player"):
+        return self.walk("Treasury", "My coin…", who=who)
+
+    def test_the_treasury_panel_names_the_players_own_coin(self) -> None:
+        alpha = self.register("Alpha", PLAYER_ID)
+        self.fund(alpha, "Alpha", gp=90)
+        panel = self.walk("Treasury")
+        self.assertIn("Alpha is carrying 0 cp · 0 sp · 90 gp · 0 pp.", panel.text)
+        self.assertIn("My coin…", {getattr(item, "label", None) for item in panel.view.children})
+
+    def test_home_names_the_players_own_coin(self) -> None:
+        alpha = self.register("Alpha", PLAYER_ID)
+        self.fund(alpha, "Alpha", sp=4)
+        self.assertIn("Your coin · 0 cp · 4 sp · 0 gp · 0 pp", self.home().text)
+
+    def test_a_player_carrying_nothing_is_offered_no_coin_control(self) -> None:
+        self.register("Alpha", PLAYER_ID)
+        panel = self.walk("Treasury")
+        self.assertNotIn("is carrying", panel.text)
+        self.assertNotIn("My coin…", {getattr(item, "label", None) for item in panel.view.children})
+        self.assertNotIn("Your coin", self.home().text)
+
+    def test_a_player_sends_coin_back_to_the_treasury(self) -> None:
+        alpha = self.register("Alpha", PLAYER_ID)
+        self.fund(alpha, "Alpha", gp=90)
+        self.assertEqual(self.currency.view_treasury()["gp"], 0)
+
+        panel = self.give_panel()
+        self.assertIn("Alpha is carrying 0 cp · 0 sp · 90 gp · 0 pp.", panel.text)
+        self.assertIn("Going to the treasury.", panel.text)
+
+        opened = self.press(panel.view, "Give coin…")
+        modal = opened.response.modal
+        self.assertIsInstance(modal, GiveCurrencyModal)
+        given = self.submit(modal, "player", cp=0, sp=0, gp=81, pp=0)
+        self.assertEqual(
+            given.text,
+            "Alpha gave 0 cp · 0 sp · 81 gp · 0 pp to the treasury."
+            " Still carrying 0 cp · 0 sp · 9 gp · 0 pp.",
+        )
+        self.assertEqual(self.currency.view_treasury()["gp"], 81)
+        self.assertEqual(self.purse(alpha)["gp"], 9)
+
+    def test_a_player_hands_coin_to_another_character(self) -> None:
+        alpha = self.register("Alpha", PLAYER_ID)
+        beta = self.register("Beta", BYSTANDER_ID)
+        self.fund(alpha, "Alpha", sp=40)
+
+        panel = self.give_panel()
+        chosen = self.choose(panel.view, "qm:coin:destination", [beta])
+        self.assertIn("Going to Beta.", chosen.text)
+
+        opened = self.press(panel.view, "Give coin…")
+        given = self.submit(opened.response.modal, "player", cp=0, sp=15, gp=0, pp=0)
+        self.assertIn("Alpha gave 0 cp · 15 sp · 0 gp · 0 pp to Beta.", given.text)
+        self.assertEqual(self.purse(alpha)["sp"], 25)
+        self.assertEqual(self.purse(beta)["sp"], 15)
+        # The pinned surface renders the treasury, which this transfer never touched.
+        self.assertEqual(self.currency.view_treasury()["sp"], 0)
+
+    def test_the_coin_destination_list_never_offers_the_giver_themselves(self) -> None:
+        alpha = self.register("Alpha", PLAYER_ID)
+        beta = self.register("Beta", BYSTANDER_ID)
+        self.set_lifecycle(self.register("Gamma", None), "RETIRED")
+        self.fund(alpha, "Alpha", gp=5)
+        options = self.select(self.give_panel().view, "qm:coin:destination").options
+        self.assertEqual({option.value for option in options}, {"party", beta})
+
+    def test_giving_more_coin_than_the_character_carries_is_refused(self) -> None:
+        alpha = self.register("Alpha", PLAYER_ID)
+        self.fund(alpha, "Alpha", gp=5)
+        opened = self.press(self.give_panel().view, "Give coin…")
+        refused = self.submit(opened.response.modal, "player", cp=0, sp=0, gp=6, pp=0)
+        self.assertIn("Alpha is carrying only 0 cp · 0 sp · 5 gp · 0 pp", refused.text)
+        self.assertEqual(self.purse(alpha)["gp"], 5)
+        self.assertEqual(self.currency.view_treasury()["gp"], 0)
+
+    def test_a_coin_box_that_is_not_a_number_is_refused(self) -> None:
+        alpha = self.register("Alpha", PLAYER_ID)
+        self.fund(alpha, "Alpha", gp=5)
+        opened = self.press(self.give_panel().view, "Give coin…")
+        refused = self.submit(opened.response.modal, "player", cp=0, sp=0, gp="most of it", pp=0)
+        self.assertIn("gp must be a whole number of coins.", refused.text)
+        self.assertEqual(self.purse(alpha)["gp"], 5)
+
+    def test_the_coin_panel_says_so_when_there_is_no_character(self) -> None:
+        """The Treasury panel hides the control, but a stale view outlives it."""
+        interaction = self.player(component=True)
+        run(open_give_coin(interaction, self.context))
+        self.assertIn("no active character registered", interaction.text)
 
 
 class CharacterTests(SurfaceTestCase):

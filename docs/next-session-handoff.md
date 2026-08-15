@@ -36,7 +36,10 @@ actor's registered active character and both require one. **My Items** is the wa
 player returns what they hold to the Party Stash or hands it to another active character, and
 every path that credits a holder shares one merge rule in `credit_stack`. A give driven by a
 button carries a handle, so "Give all" cannot mean a number the giver never saw; a give that
-names its own quantity does not need one.
+names its own quantity does not need one. Coin moves both ways on the same terms —
+**Treasury → My coin…** sends a character's own currency back to the treasury or on to
+another active character — and every balance read and write goes through `read_balance` and
+`write_balance`.
 
 **Projection.** State targets are scheduled by normalized lateness; events deliver FIFO
 per destination and bind to durable per-session threads. Undeliverable events dead-letter
@@ -77,8 +80,38 @@ durable but has no live caller, and its health check cannot fail on this build. 
 extension scaffold at `integrations/avrae/quartermaster_cog.py` is parked: Gate 1 was
 answered "no, for now" on 2026-08-14, and it has never been loaded in an Avrae deployment.
 
-**Checks.** 224 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Checks.** 237 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request.
+
+## Sixth pass on 2026-08-15
+
+One defect, with the same shape as the possession gap the fifth pass closed and covered by
+tests that fail against the old behaviour.
+
+- **Currency only moved towards a living character, and a player could not see their own.**
+  A split credits every active character, **Give to…** credits one, and the only debit in
+  the product — belongings resolution — refuses an active character on purpose. So an
+  active character's balance could only ever rise. What made that worse than the equivalent
+  item mistake is the repair: a DM reaching for **Adjust…** to put back 81 gp they meant to
+  keep does not return it, because adjust only touches the party row. The character keeps
+  the coin and the campaign ends the evening 81 gp richer than it started — the same
+  inflation `/grant` would have caused for items, which is exactly why **My Items** exists.
+  Compounding it, a character's balance was rendered in one place only, the DM's export, so
+  the money a split handed a player was invisible to the person it belonged to.
+
+  **Treasury → My coin…** is the coin counterpart of My Items: the giver's active character
+  sends coin back to the treasury or hands it to another active character, refusing a
+  non-active recipient exactly as the item path does. The Treasury panel names what the
+  caller is carrying and the home panel carries a `Your coin` line, both said only when
+  there is coin to say it about. There are no handles on this path and there should not be:
+  a held stack has a quantity on screen that another character can move underneath the
+  giver, so `Give all` has to be minted against what was rendered, but coin is typed into a
+  modal at the moment it is given and has nothing on screen to go stale.
+
+  `read_balance` and `write_balance` in `currency.py` are now the one pair every balance
+  read and write shares — the split, both gives, and belongings resolution — for the same
+  reason `credit_stack` is one merge rule: four hand-written copies of the same upsert are
+  four chances to disagree about what an absent row means.
 
 ## Surface pass on 2026-08-15
 
@@ -363,6 +396,13 @@ Panel surface:
 10. **DM Tools → Loot Drops**, open a drop, claim from it as a player, then close it from the
     select and confirm the remainder returns to the stash.
 11. **Treasury → Give to…**, and confirm the recipient select holds only active characters.
+11a. **Treasury** as a player who has been given coin, and confirm the panel names what they
+    are carrying, that home carries the `Your coin` line, and that both are absent for a
+    player carrying nothing.
+11b. **Treasury → My coin… → Give coin…** back to the treasury, and confirm the treasury
+    rises by exactly what the player's balance fell by. Then the same to another character
+    through the destination select. This is the path that makes a mistyped **Give to…**
+    repairable, so it is worth running the mistake deliberately once.
 12. **Combat**, and confirm the handoff cards are open to players while Start and End are not
     even rendered for them.
 
