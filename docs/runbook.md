@@ -28,7 +28,7 @@ uv run python -m quartermaster --db $env:QM_DATABASE_PATH export > .\quartermast
 
 `health` checks SQLite integrity, schema version, the one-active-session invariant, receipt recovery state, outbox backlog, dead-lettered events, dirty and stuck projections, expired Loot Drops, the last transient-maintenance outcome, backup freshness, and the most recent Discord surface reachability check. A missing, failed, or stale Discord surface check is `DEGRADED`; pass `--discord-surface-max-age-seconds` to change the freshness window. The bot runs startup recovery, transient maintenance, scheduled backups, and surface checks while projection delivery is running; the `maintenance` command remains available for operator-triggered cleanup. It expires due drops and removes terminal receipts and consumed/expired handles after their configured retention periods.
 
-Configured DM administrators can use `/quartermaster` as the compact Discord control surface. It summarizes Party Stash and session state and provides Grant loot, Session, Stash, Open Loot, Treasury, Characters, Export, Backup, and Health actions. The launcher is ephemeral and uses the same authorization and durable workflows as the individual commands.
+`/quartermaster` is the whole Discord surface. It opens an ephemeral home panel that states session, Party Stash, open loot, treasury, and who the caller is playing, and every action past that point is a button, a select menu, or a modal on a panel. The panel a caller sees is the panel they may use: DM Tools appears only for a configured DM administrator, and every DM control re-checks authorization when it is pressed, because a panel outlives the render that built it. Grant loot, Loot Drops, Session, and Maintenance — export, backup, health — all live under DM Tools.
 
 ## Truncated Discord surfaces
 
@@ -38,7 +38,7 @@ Discord refuses any message over 2000 characters, so every Quartermaster surface
 … and 42 more Party Stash entries not shown here. The Quartermaster export holds the full record.
 ```
 
-is working as intended, not damaged: the stash outgrew one Discord message. `export` is the complete record — items with the character holding them named, open Loot Drops with what is still unclaimed, and the roster — and `/stash` → `Browse` still reaches individual stacks. The same note can appear on `/loot` and `/characters`. Nothing is dropped from canonical state — only from the disposable projection.
+is working as intended, not damaged: the stash outgrew one Discord message. `export` is the complete record — items with the character holding them named, open Loot Drops with what is still unclaimed, and the roster — and **Party Stash → Take something…** still reaches individual stacks. The same note can appear on the Open Loot and Characters panels. Nothing is dropped from canonical state — only from the disposable projection.
 
 A browse or claim listing can also end with
 
@@ -46,7 +46,7 @@ A browse or claim listing can also end with
 The last 8 entries above have no take control here. Take what is showing and open this again.
 ```
 
-One Discord view carries twenty-five controls and a stack above one offers both `Take 1` and `Take all`, so a long listing runs out of buttons before it runs out of items. The controls always cover the top of the list; taking what is showing brings the rest into reach.
+One Discord view carries twenty-five controls, two of which are Refresh and the way back, and a stack above one offers both `Take 1` and `Take all`, so a long listing runs out of buttons before it runs out of items. The controls always cover the top of the list; taking what is showing and pressing Refresh brings the rest into reach.
 
 ## The Party Stash projection is not pinned
 
@@ -75,7 +75,7 @@ RETIRED, or DEPARTED on the previous build, then upgrade: Discord user 123 has A
 ```
 
 Which character to stand down is a campaign decision, so the migration will not guess. Start
-the previous build, resolve each named player with `/character-lifecycle`, then upgrade. The
+the previous build, resolve each named player from **Characters → Lifecycle…**, then upgrade. The
 database is not modified by the failed attempt.
 
 The same migration also recomputes `normalized_name` on existing stacks and merges any that
@@ -122,7 +122,7 @@ The bot creates and validates a timestamped online backup immediately after its 
 uv run python -m quartermaster --db $env:QM_DATABASE_PATH backup
 ```
 
-Configured DM administrators can also invoke `/backup` in the Discord guild. It uses the same validated timestamped path, records a durable `PROCESSING -> COMMITTED/FAILED` receipt, and reports the resulting snapshot filename ephemerally. The Discord command does not attach the SQLite file; use the CLI or the configured backup directory to retrieve it.
+Configured DM administrators can also take one from **DM Tools → Maintenance → Backup** in the Discord guild. It uses the same validated timestamped path, records a durable `PROCESSING -> COMMITTED/FAILED` receipt, and reports the resulting snapshot filename ephemerally. The Discord control does not attach the SQLite file; use the CLI or the configured backup directory to retrieve it.
 
 For a second mounted or network-backed destination, copy the validated snapshot there and apply the same retention count:
 

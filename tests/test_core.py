@@ -1116,7 +1116,13 @@ class QuartermasterCoreTests(unittest.TestCase):
         status = self.store.connection.execute("SELECT last_status FROM maintenance_runs WHERE name = 'transient-state'").fetchone()
         self.assertEqual(status["last_status"], "OK")
 
-    def test_discord_adapter_registers_guild_scoped_commands(self) -> None:
+    def test_discord_adapter_registers_one_entry_point(self) -> None:
+        """The surface is a panel, so there is exactly one thing to type.
+
+        Every capability used to be its own command with its own arguments, and
+        the table had to remember all of them. Anything that reappears in this
+        set is a capability that has slipped back out of the panel.
+        """
         import discord
 
         from quartermaster.discord_adapter import BotServices, create_bot
@@ -1124,43 +1130,15 @@ class QuartermasterCoreTests(unittest.TestCase):
         services = BotServices(self.store, self.receipts, self.inventory, self.sessions)
         bot = create_bot(Settings(guild_id="123", database_path=self.db_path), services)
         commands = bot.tree.get_commands(guild=discord.Object(id=123))
-        self.assertEqual(
-            {command.name for command in commands},
-            {
-                "quartermaster",
-                "combat",
-                "stash",
-                "grant",
-                "item-give",
-                "loot",
-                "loot-drop",
-                "loot-close",
-                "export",
-                "backup",
-                "treasury",
-                "treasury-adjust",
-                "treasury-split",
-                "treasury-give",
-                "characters",
-                "character-add",
-                "character-lifecycle",
-                "character-resolve",
-                "session-start",
-                "session-end",
-            },
-        )
+        self.assertEqual({command.name for command in commands}, {"quartermaster"})
 
-    def test_quartermaster_launcher_summarizes_state_and_exposes_actions(self) -> None:
-        from quartermaster.discord_common import BotServices
-        from quartermaster.discord_views import (
-            LauncherMoreView,
-            QuartermasterLauncherView,
-            _launcher_snapshot,
-            _render_launcher,
-        )
+    def test_home_panel_summarizes_what_the_caller_can_act_on(self) -> None:
+        from quartermaster.avrae_handoff import AvraeHandoffService
+        from quartermaster.discord_common import BotServices, Quartermaster
+        from quartermaster.discord_panels import _home_snapshot, _render_home
 
         self.inventory.grant_interaction(
-            "launcher-grant",
+            "home-grant",
             actor_id="dm",
             item_name="Launcher Potion",
             quantity=2,
@@ -1175,21 +1153,25 @@ class QuartermasterCoreTests(unittest.TestCase):
             currency=self.currency,
             loot=self.loot,
         )
-        settings = Settings(guild_id="123", database_path=self.db_path)
-
-        snapshot = _launcher_snapshot(services, self.characters)
-        rendered = _render_launcher(snapshot)
-        self.assertEqual(snapshot, {"stash_count": 1, "active_session_number": 1, "unresolved_estates": 0})
-        self.assertIn("Party Stash · 1 entries", rendered)
-        self.assertIn("Session 1 active", rendered)
-
-        view = QuartermasterLauncherView(services, settings, self.characters, self.currency, self.loot)
-        self.assertEqual({item.label for item in view.children}, {"Grant loot", "Session", "More…"})
-        more = LauncherMoreView(services, settings, self.characters, self.currency, self.loot)
-        self.assertEqual(
-            {item.label for item in more.children},
-            {"Stash", "Open Loot", "Treasury", "Characters", "Export", "Backup", "Health"},
+        context = Quartermaster(
+            services=services,
+            settings=Settings(guild_id="123", database_path=self.db_path),
+            characters=self.characters,
+            currency=self.currency,
+            loot=self.loot,
+            combat=CombatService(self.store, self.receipts),
+            handoff=AvraeHandoffService(self.store),
         )
+
+        snapshot = _home_snapshot(context, "player")
+        self.assertEqual(snapshot["stash_count"], 1)
+        self.assertEqual(snapshot["active_session_number"], 1)
+        self.assertEqual(snapshot["character"], {"id": "player-character", "name": "Player Character"})
+
+        rendered = _render_home(snapshot, is_dm=False)
+        self.assertIn("Party Stash · 1 stack", rendered)
+        self.assertIn("Session 1 · in progress", rendered)
+        self.assertIn("You are playing **Player Character**", rendered)
 
     def test_discord_response_helper_omits_empty_view(self) -> None:
         from quartermaster.discord_common import _send_execution

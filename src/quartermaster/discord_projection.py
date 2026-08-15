@@ -113,7 +113,7 @@ def _content_for_event(event_type: str, payload: dict[str, Any]) -> str:
     """Render one outbox event, never wider than Discord will accept.
 
     Every line here quotes canonical state, and canonical state holds text a
-    person typed: an item name has no length limit on the `/grant` command, so
+    person typed: an item name has no length limit on the grant modal, so
     even a one-line renderer can cross 2000 characters. Discord refuses that
     identically every time, which costs the event eight retries and a dead
     letter, and the per-destination FIFO gate holds every later event in that

@@ -377,12 +377,15 @@ class InventoryService:
 
         Until this existed, possession moved one way only. A take or a claim
         transfers ownership to the taker's active character, and nothing —
-        including the DM — could move it back: `character-resolve` refuses
-        active characters, and `/grant` mints a new item rather than returning
+        including the DM — could move it back: resolving belongings refuses
+        active characters, and a grant mints a new item rather than returning
         one, so using it to undo a mistaken take quietly breaks conservation.
         A misread `Take all` was therefore permanent. That is also what made the
         take-all confirmation prompt load-bearing; it is a good prompt, but it
         was the only thing standing between the table and an unfixable stash.
+
+        This is the path for a quantity someone names outright. The component
+        path carries a handle instead — see `create_give_handles`.
         """
         if quantity <= 0:
             raise InventoryError("quantity must be positive")
@@ -420,6 +423,34 @@ class InventoryService:
         ).fetchone()
         if source is None:
             raise InventoryError(f"{giver['name']} is not holding {item_name.strip()}")
+        return self._move_from_character(
+            connection,
+            operation_id,
+            actor_id,
+            giver=giver,
+            source=source,
+            quantity=quantity,
+            destination=destination,
+        )
+
+    def _move_from_character(
+        self,
+        connection: Any,
+        operation_id: str,
+        actor_id: str | None,
+        *,
+        giver: Any,
+        source: Any,
+        quantity: int,
+        destination: str,
+    ) -> dict[str, Any]:
+        """Move a quantity out of a character's stack, wherever the request came from.
+
+        The typed path resolves the stack by name and the component path resolves
+        it by handle; from here they are the same transfer, and keeping one body
+        is what stops the two from disagreeing about who may receive what.
+        """
+        giver_id = str(giver["id"])
         held = int(source["quantity"])
         if held < quantity:
             raise InventoryError(f"{giver['name']} holds only {held}")
@@ -487,6 +518,194 @@ class InventoryService:
                 connection, target_id="party-stash", target_type="STATE", destination="party-inventory"
             )
         return result
+
+    def holdings(self, *, actor_id: str | None, limit: int = 25) -> dict[str, Any]:
+        """What the actor's active character is carrying, for the give controls.
+
+        Returns the character as well as the stacks, because "you have no
+        registered character" and "your character is carrying nothing" are
+        different answers and a panel that conflates them tells a player to go
+        and take something they will then be refused.
+        """
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self.store.read() as connection:
+            holder = active_claimant(connection, actor_id)
+            if holder is None:
+                return {"character": None, "items": [], "total_items": 0}
+            rows = connection.execute(
+                """SELECT id, item_name, quantity, provenance, version, updated_at
+                    FROM inventory_stacks
+                    WHERE owner_type = 'CHARACTER' AND owner_id = ?
+                    ORDER BY last_acquired_at DESC, item_name LIMIT ?""",
+                (str(holder["id"]), limit),
+            ).fetchall()
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM inventory_stacks WHERE owner_type = 'CHARACTER' AND owner_id = ?",
+                    (str(holder["id"]),),
+                ).fetchone()[0]
+            )
+        return {
+            "character": {"id": str(holder["id"]), "name": str(holder["name"])},
+            "items": [dict(row) for row in rows],
+            "total_items": total,
+        }
+
+    def create_give_handles(self, *, stack_id: str, actor_id: str | None) -> dict[str, Any]:
+        """Mint the give controls for one held stack against what it holds now.
+
+        A typed give names its own quantity, so there is nothing on screen to go
+        stale. A button does not: "Give all" means the number the player was
+        looking at when the panel rendered, and between rendering and pressing
+        another character can hand them more of the same item. The relative
+        handle is what makes that difference visible rather than silent, exactly
+        as it already is for Take all.
+        """
+        with self.store.transaction() as connection:
+            giver = active_claimant(connection, actor_id)
+            if giver is None:
+                raise InventoryError("an active registered character is required to give items")
+            row = connection.execute(
+                "SELECT * FROM inventory_stacks WHERE id = ? AND owner_type = 'CHARACTER' AND owner_id = ?",
+                (stack_id, str(giver["id"])),
+            ).fetchone()
+            if row is None:
+                raise InventoryError(f"{giver['name']} is no longer holding that item")
+            snapshot = {"quantity": row["quantity"], "version": row["version"]}
+            handles = {
+                "one": self.handles.create_in_transaction(
+                    connection,
+                    workflow_type="stash",
+                    action="give",
+                    actor_id=actor_id,
+                    payload={
+                        "stack_id": stack_id,
+                        "item_name": row["item_name"],
+                        "amount": 1,
+                        "mode": "ABSOLUTE",
+                    },
+                    read_set_snapshot=snapshot,
+                    single_use=True,
+                    ttl_seconds=300,
+                )
+            }
+            if int(row["quantity"]) > 1:
+                handles["all"] = self.handles.create_in_transaction(
+                    connection,
+                    workflow_type="stash",
+                    action="give",
+                    actor_id=actor_id,
+                    payload={
+                        "stack_id": stack_id,
+                        "item_name": row["item_name"],
+                        "amount": "all",
+                        "mode": "RELATIVE",
+                    },
+                    read_set_snapshot=snapshot,
+                    single_use=True,
+                    ttl_seconds=300,
+                )
+            return {
+                "item": dict(row),
+                "character": {"id": str(giver["id"]), "name": str(giver["name"])},
+                "handles": handles,
+            }
+
+    def give_with_handle_interaction(
+        self,
+        interaction_id: str,
+        *,
+        handle_id: str,
+        actor_id: str | None,
+        destination: str,
+    ) -> ReceiptResult:
+        return self._give_with_handle(interaction_id, handle_id=handle_id, actor_id=actor_id, destination=destination)
+
+    def confirm_give_with_handle_interaction(
+        self,
+        interaction_id: str,
+        *,
+        handle_id: str,
+        actor_id: str | None,
+        destination: str,
+    ) -> ReceiptResult:
+        return self._give_with_handle(
+            interaction_id,
+            handle_id=handle_id,
+            actor_id=actor_id,
+            destination=destination,
+            allow_relative_stale=True,
+        )
+
+    def _give_with_handle(
+        self,
+        interaction_id: str,
+        *,
+        handle_id: str,
+        actor_id: str | None,
+        destination: str,
+        allow_relative_stale: bool = False,
+    ) -> ReceiptResult:
+        normalized_destination = destination.strip()
+        if not normalized_destination:
+            raise InventoryError("a destination is required")
+        return self.receipts.execute_fast(
+            interaction_id,
+            actor_id=actor_id,
+            response_kind="stash",
+            mutation=lambda connection, operation_id: self.handles.consume_and_mutate_in_transaction(
+                connection,
+                handle_id,
+                actor_id=actor_id,
+                mutation=lambda transaction, handle: self._give_handle_in_transaction(
+                    transaction,
+                    operation_id,
+                    actor_id,
+                    handle,
+                    normalized_destination,
+                    allow_relative_stale=allow_relative_stale,
+                ),
+            ),
+        )
+
+    def _give_handle_in_transaction(
+        self,
+        connection: Any,
+        operation_id: str,
+        actor_id: str | None,
+        handle: Handle,
+        destination: str,
+        *,
+        allow_relative_stale: bool = False,
+    ) -> dict[str, Any]:
+        giver = active_claimant(connection, actor_id)
+        if giver is None:
+            raise InventoryError("an active registered character is required to give items")
+        stack_id = handle.payload["stack_id"]
+        source = connection.execute(
+            "SELECT * FROM inventory_stacks WHERE id = ? AND owner_type = 'CHARACTER' AND owner_id = ?",
+            (stack_id, str(giver["id"])),
+        ).fetchone()
+        if source is None:
+            raise InventoryError(f"{giver['name']} is no longer holding that item")
+        observed = int(handle.read_set_snapshot["quantity"])
+        current = int(source["quantity"])
+        if handle.payload["mode"] == "RELATIVE":
+            if current != observed and not allow_relative_stale:
+                raise SemanticStaleness(f"quantity changed from {observed} to {current}")
+            quantity = current
+        else:
+            quantity = int(handle.payload["amount"])
+        return self._move_from_character(
+            connection,
+            operation_id,
+            actor_id,
+            giver=giver,
+            source=source,
+            quantity=quantity,
+            destination=destination,
+        )
 
     def browse(self) -> list[dict[str, Any]]:
         with self.store.read() as connection:
