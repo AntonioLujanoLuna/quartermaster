@@ -243,10 +243,17 @@ class DiscordSurfaceTests(unittest.TestCase):
         )
 
     def test_player_commands_refuse_interactions_from_another_guild(self) -> None:
-        for name in ["stash", "loot", "treasury", "characters"]:
+        invocations: dict[str, dict] = {
+            "stash": {},
+            "loot": {},
+            "treasury": {},
+            "characters": {},
+            "item-give": {"item": "Rope", "quantity": 1},
+        }
+        for name, arguments in invocations.items():
             with self.subTest(command=name):
                 interaction = self.elsewhere()
-                run(self.command(name)(interaction))
+                run(self.command(name)(interaction, **arguments))
                 self.assertIn("configured for a different guild", interaction.text)
 
     def test_dm_commands_from_another_guild_refuse_with_the_authorization_message(self) -> None:
@@ -407,6 +414,72 @@ class DiscordSurfaceTests(unittest.TestCase):
         run(browse_interaction.kwargs["view"].children[0].callback(take_interaction))
         self.assertIn("active registered character is required", take_interaction.text)
         self.assertEqual(self.stash_quantities(), {"Rope": 1})
+
+    def test_a_player_can_put_back_what_they_took(self) -> None:
+        """The take-all confirmation is a good prompt; it was also the only door.
+
+        A player who took the whole stack had no way to return any of it, and
+        neither did the DM: `/character-resolve` refuses active characters and
+        `/grant` would create a second Rope rather than move this one back.
+        """
+        character_id = self.register_player_character()
+        run(self.command("grant")(self.dm(), item="Rope", quantity=4))
+        take_all = next(b for b in self.browse_buttons() if b.label == "Take all Rope")
+        run(take_all.callback(self.player()))
+        self.assertEqual(self.stash_quantities(), {})
+
+        interaction = self.player()
+        run(self.command("item-give")(interaction, item="Rope", quantity=3))
+        self.assertEqual(
+            interaction.text, "Tamsin gave 3 Rope to the Party Stash. 1 still held."
+        )
+        self.assertTrue(interaction.kwargs["ephemeral"])
+        self.assertEqual(self.stash_quantities(), {"Rope": 3})
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT quantity FROM inventory_stacks WHERE owner_id = ?", (character_id,)
+            ).fetchone()["quantity"],
+            1,
+        )
+
+    def test_giving_an_item_to_another_character_names_the_recipient(self) -> None:
+        self.register_player_character()
+        recipient_id = self.register_player_character(name="Berrian", user_id=BYSTANDER_ID)
+        run(self.command("grant")(self.dm(), item="Rope", quantity=2))
+        run(next(b for b in self.browse_buttons() if b.label == "Take all Rope").callback(self.player()))
+
+        interaction = self.player()
+        run(self.command("item-give")(interaction, item="Rope", quantity=2, to=recipient_id))
+        self.assertEqual(interaction.text, "Tamsin gave 2 Rope to Berrian. 0 still held.")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT quantity FROM inventory_stacks WHERE owner_id = ?", (recipient_id,)
+            ).fetchone()["quantity"],
+            2,
+        )
+
+    def test_giving_what_you_do_not_hold_is_refused(self) -> None:
+        self.register_player_character()
+        run(self.command("grant")(self.dm(), item="Rope", quantity=1))
+        interaction = self.player()
+        run(self.command("item-give")(interaction, item="Rope", quantity=1))
+        self.assertIn("could not be given", interaction.text)
+        self.assertIn("not holding", interaction.text)
+        self.assertEqual(self.stash_quantities(), {"Rope": 1})
+
+    def test_an_unexpected_component_failure_still_answers_the_player(self) -> None:
+        """A button that raises must not leave Discord's bare failure notice.
+
+        Slash commands route an unexpected exception to `bot.tree.error`.
+        Component callbacks had no equivalent, so anything a callback did not
+        name — a contended write, a renderer bug — surfaced as "This interaction
+        failed" and the player could not tell whether their take had committed.
+        """
+        view = PartyStashView(self.inventory, self.settings)
+        interaction = self.player()
+        run(view.on_error(interaction, RuntimeError("database is locked"), view.children[0]))
+        self.assertIn("could not complete that action", interaction.text)
+        self.assertTrue(interaction.kwargs["ephemeral"])
 
     def test_a_consumed_take_handle_is_refused_on_a_second_press(self) -> None:
         self.register_player_character()

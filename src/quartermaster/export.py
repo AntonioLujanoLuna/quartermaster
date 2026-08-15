@@ -34,7 +34,7 @@ def _render_export(connection: Any) -> str:
         "SELECT id, session_number, started_at FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
     ).fetchone()
     previous = connection.execute(
-        "SELECT session_number, ended_at, where_ended FROM sessions WHERE status = 'CLOSED' ORDER BY session_number DESC LIMIT 1"
+        "SELECT id, session_number, ended_at, where_ended FROM sessions WHERE status = 'CLOSED' ORDER BY session_number DESC LIMIT 1"
     ).fetchone()
     stacks = connection.execute(
         "SELECT item_name, quantity, provenance, owner_type, owner_id FROM inventory_stacks ORDER BY item_name, id"
@@ -60,15 +60,20 @@ def _render_export(connection: Any) -> str:
                ON balances.owner_type = 'CHARACTER' AND balances.owner_id = characters.id
             ORDER BY characters.name, characters.id"""
     ).fetchall()
+    # Combat belongs to the session the table is playing — which is the closed
+    # one for as long as the next has not started. Reading only the active
+    # session meant the whole record vanished at `/session-end`, so the document
+    # every truncated surface points at was empty of the fight it just held.
+    encounter_session = active if active is not None else previous
     encounters = (
         connection.execute(
             """SELECT status, channel_id, opened_at, closed_at, closed_reason, outcome
                  FROM combat_encounters
                 WHERE session_id = ?
              ORDER BY opened_at""",
-            (active["id"],),
+            (encounter_session["id"],),
         ).fetchall()
-        if active is not None
+        if encounter_session is not None
         else []
     )
     receipt_counts = connection.execute(
@@ -145,7 +150,7 @@ def _render_export(connection: Any) -> str:
         # Combat encounters are continuity, not mechanics: when the table was in
         # a fight and how it resolved. Avrae keeps everything that happened
         # inside it.
-        lines.extend(["", "### Combat encounters this session", ""])
+        lines.extend(["", f"### Combat encounters in session {encounter_session['session_number']}", ""])
         for row in encounters:
             if row["status"] == "OPEN":
                 lines.append(f"- Open since {row['opened_at']} in channel {row['channel_id']}.")

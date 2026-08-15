@@ -52,6 +52,11 @@ The adapter registers guild-scoped `/stash`, `/grant`, `/session-start`, and `/s
 
 Taking from the Party Stash transfers ownership to the taker's registered active character, exactly as a Loot Drop claim does; an actor with no active registered character cannot take. A Discord user may have at most one active character at a time, which is what makes an even treasury split even.
 
+Possession moves both ways. `/item-give` hands something the player's character is
+holding back to the Party Stash — the default — or on to another active character, without
+a DM in the loop and without minting anything: `/grant` creates an item, so undoing a
+mistaken take with it would inflate the campaign's inventory rather than move it.
+
 Every message Quartermaster sends is rendered within Discord's 2000-character limit. List
 surfaces — the Party Stash projection, `/stash`, `/loot`, `/characters` — drop whole entries
 from the end and say how many they dropped rather than letting Discord reject the message;

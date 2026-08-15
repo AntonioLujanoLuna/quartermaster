@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from quartermaster.characters import CharacterError, CharacterService
+from quartermaster.combat import CombatService
 from quartermaster.config import ConfigurationError, Settings
 from quartermaster.currency import CurrencyError, CurrencySemanticStaleness, CurrencyService
 from quartermaster.db import DATA_MIGRATIONS, MIGRATIONS, SCHEMA_VERSION, MigrationError, SQLiteStore
@@ -121,6 +123,14 @@ class QuartermasterCoreTests(unittest.TestCase):
                 (character_id, name, lifecycle),
             )
 
+    def _holding(self, owner_type: str, owner_id: str, normalized_name: str) -> int:
+        row = self.store.connection.execute(
+            """SELECT COALESCE(SUM(quantity), 0) AS quantity FROM inventory_stacks
+                WHERE owner_type = ? AND owner_id = ? AND normalized_name = ?""",
+            (owner_type, owner_id, normalized_name),
+        ).fetchone()
+        return int(row["quantity"])
+
     def _currency_total(self) -> dict[str, int]:
         """Sum every denomination across every owner, party and characters alike."""
         row = self.store.connection.execute(
@@ -207,6 +217,124 @@ class QuartermasterCoreTests(unittest.TestCase):
             self.inventory.take_interaction(
                 "ownership-unregistered", handle_id=unregistered, actor_id="unregistered"
             )
+
+    def test_give_moves_held_items_back_to_the_party_and_between_characters(self) -> None:
+        """Possession has to move both ways, and only ever move.
+
+        Before Give, a take was final: nothing could return an item to the
+        stash, and `/grant` is not that path — it mints a new item, so undoing a
+        misread `Take all` with it inflates the campaign's inventory. Every
+        assertion here is about the total staying put while ownership changes.
+        """
+        self._insert_character("give-recipient", "Berrian")
+        self.inventory.grant_interaction(
+            "give-grant", actor_id="dm", item_name="Silvered Dagger", quantity=5
+        )
+        prepared = self.inventory.prepare_take_view(actor_id="player")
+        take_all = prepared["take_all_handles"][prepared["items"][0]["id"]]
+        self.inventory.take_interaction("give-take-all", handle_id=take_all, actor_id="player")
+        total = self._item_total()
+        self.assertEqual(total, {"silvered dagger": 5})
+        self.assertEqual(self._holding("PARTY", "party", "silvered dagger"), 0)
+
+        returned = self.inventory.give_interaction(
+            "give-back", actor_id="player", item_name="Silvered Dagger", quantity=3
+        )
+        self.assertEqual(returned.logical_response["destination_name"], "the Party Stash")
+        self.assertEqual(returned.logical_response["remaining"], 2)
+        self.assertEqual(self._item_total(), total)
+        self.assertEqual(self._holding("PARTY", "party", "silvered dagger"), 3)
+        self.assertEqual(self._holding("CHARACTER", "player-character", "silvered dagger"), 2)
+
+        handed_on = self.inventory.give_interaction(
+            "give-onward",
+            actor_id="player",
+            item_name="silvered  DAGGER",
+            quantity=2,
+            destination="give-recipient",
+        )
+        self.assertEqual(handed_on.logical_response["destination_name"], "Berrian")
+        self.assertEqual(self._item_total(), total)
+        self.assertEqual(self._holding("CHARACTER", "give-recipient", "silvered dagger"), 2)
+        # The emptied stack is gone rather than left at zero, so browse and the
+        # export do not carry a row for something nobody holds.
+        self.assertEqual(self._holding("CHARACTER", "player-character", "silvered dagger"), 0)
+
+    def test_give_refuses_what_the_giver_cannot_actually_hand_over(self) -> None:
+        self._insert_character("give-dead", "Wraith", lifecycle="DEAD")
+        self.inventory.grant_interaction(
+            "give-refuse-grant", actor_id="dm", item_name="Brass Key", quantity=1
+        )
+        prepared = self.inventory.prepare_take_view(actor_id="player")
+        self.inventory.take_interaction(
+            "give-refuse-take",
+            handle_id=prepared["handles"][prepared["items"][0]["id"]],
+            actor_id="player",
+        )
+        before = self._item_total()
+
+        with self.assertRaisesRegex(InventoryError, "not holding"):
+            self.inventory.give_interaction(
+                "give-missing", actor_id="player", item_name="Iron Key", quantity=1
+            )
+        with self.assertRaisesRegex(InventoryError, "holds only 1"):
+            self.inventory.give_interaction(
+                "give-too-many", actor_id="player", item_name="Brass Key", quantity=2
+            )
+        with self.assertRaisesRegex(InventoryError, "active registered character"):
+            self.inventory.give_interaction(
+                "give-unregistered", actor_id="stranger", item_name="Brass Key", quantity=1
+            )
+        # Specification 32.1: a non-active character cannot ordinarily receive.
+        with self.assertRaisesRegex(InventoryError, "only active characters"):
+            self.inventory.give_interaction(
+                "give-to-dead",
+                actor_id="player",
+                item_name="Brass Key",
+                quantity=1,
+                destination="give-dead",
+            )
+        with self.assertRaisesRegex(InventoryError, "must differ"):
+            self.inventory.give_interaction(
+                "give-to-self",
+                actor_id="player",
+                item_name="Brass Key",
+                quantity=1,
+                destination="player-character",
+            )
+        self.assertEqual(self._item_total(), before)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM interaction_receipts"
+            ).fetchone()[0],
+            2,
+            "a refused give must leave no receipt behind",
+        )
+
+    def test_every_domain_event_type_has_a_renderer(self) -> None:
+        """An event with no renderer still delivers — as raw JSON, at the table.
+
+        The fallback exists so an unrenderable event cannot block its
+        destination, which means nothing fails when a new event type ships
+        without a line of its own: the session log simply starts printing
+        internal UUIDs and Discord user IDs. Four event types had already
+        arrived that way. This reads the event types the package actually
+        appends, so the next one cannot.
+        """
+        from quartermaster.discord_projection import _EVENT_RENDERERS
+
+        source_root = Path(__file__).parents[1] / "src" / "quartermaster"
+        appended = {
+            match
+            for path in source_root.glob("*.py")
+            for match in re.findall(r'event_type="([A-Z_]+)"', path.read_text(encoding="utf-8"))
+        }
+        self.assertTrue(appended, "no domain events were found to check")
+        self.assertEqual(
+            appended - set(_EVENT_RENDERERS),
+            set(),
+            "these event types would be delivered to Discord as raw JSON",
+        )
 
     def test_browse_handles_fit_the_control_budget_and_cover_a_leading_run(self) -> None:
         """Handles must describe controls that can actually exist, in reading order.
@@ -564,6 +692,31 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertNotIn("(CHARACTER:player-character)", output)
         self.assertIn("Unclaimed Idol: 3 unclaimed of 3", output)
         self.assertIn("Player Character [ACTIVE]", output)
+
+    def test_export_keeps_the_combat_record_after_the_session_closes(self) -> None:
+        """The fight has to still be in the record once the session ends.
+
+        Encounters were read against the active session only, so `/session-end`
+        — which closes the encounter and the session together — emptied the
+        combat section of the one document that is supposed to survive an
+        outage, at exactly the moment the DM writes up what happened.
+        """
+        combat = CombatService(self.store, self.receipts)
+        sessions = SessionService(self.store, self.receipts, self.loot, combat)
+        started = sessions.start_interaction("combat-export-start", actor_id="dm")
+        combat.open_interaction("combat-export-open", actor_id="dm", channel_id="9001")
+        combat.close_interaction("combat-export-close", actor_id="dm", outcome="Owlbear routed")
+
+        during = render_export(self.store)
+        self.assertIn(
+            f"### Combat encounters in session {started.logical_response['session_number']}", during
+        )
+        self.assertIn("Owlbear routed", during)
+
+        sessions.end_interaction("combat-export-end", actor_id="dm", where_ended="The ridge")
+        after = render_export(self.store)
+        self.assertIn("Owlbear routed", after)
+        self.assertIn("in channel 9001", after)
 
     def test_export_says_so_when_there_is_no_open_loot_or_roster(self) -> None:
         with self.store.transaction() as connection:
@@ -978,6 +1131,7 @@ class QuartermasterCoreTests(unittest.TestCase):
                 "combat",
                 "stash",
                 "grant",
+                "item-give",
                 "loot",
                 "loot-drop",
                 "loot-close",

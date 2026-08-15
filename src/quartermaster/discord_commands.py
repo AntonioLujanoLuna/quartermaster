@@ -230,6 +230,52 @@ def register_commands(
         except InventoryError as error:
             await _send_error(interaction, f"Party Stash could not be opened: {error}")
 
+    @bot.tree.command(
+        name="item-give",
+        description="Give an item you are holding back to the Party Stash, or to another character",
+    )
+    @app_commands.guilds(guild)
+    @app_commands.describe(
+        item="An item your active character is holding",
+        quantity="Positive quantity",
+        to="`party` for the Party Stash, or an active character ID",
+    )
+    async def item_give(
+        interaction: discord.Interaction,
+        item: str,
+        quantity: app_commands.Range[int, 1, 1000000],
+        to: str = "party",
+    ) -> None:
+        # A player moving what they are holding is not a DM action: the take
+        # that put it there was not one either, and needing the DM to undo a
+        # misclick is how the stash stops matching the table.
+        if not _in_configured_guild(interaction, settings):
+            await _send_error(interaction, "This bot is configured for a different guild.")
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                settings,
+                lambda: services.inventory.give_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    item_name=item,
+                    quantity=quantity,
+                    destination=to,
+                ),
+                ephemeral=True,
+            )
+            response = execution.value.logical_response
+            await _send_execution(
+                interaction,
+                execution,
+                f"{response['character_name']} gave {response['quantity']} {response['item_name']}"
+                f" to {response['destination_name']}. {response['remaining']} still held.",
+                ephemeral=True,
+            )
+        except InventoryError as error:
+            await _send_error(interaction, f"That item could not be given: {error}")
+
     @bot.tree.command(name="loot", description="View open Loot Drops")
     @app_commands.guilds(guild)
     async def loot_command(interaction: discord.Interaction) -> None:

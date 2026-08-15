@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 
 import discord
@@ -33,10 +34,43 @@ from .rendering import DISCORD_VIEW_COMPONENT_LIMIT
 from .response import DeferredExecutionError
 from .sessions import SessionError
 
+logger = logging.getLogger(__name__)
+
 MAX_VIEW_BUTTONS = DISCORD_VIEW_COMPONENT_LIMIT
 
 
-class TakeView(discord.ui.View):
+class QuartermasterView(discord.ui.View):
+    """A view whose buttons answer even when something unforeseen breaks.
+
+    Slash commands route an unexpected exception to `bot.tree.error`, which
+    replies and logs. Component callbacks have no equivalent: each one catches
+    the domain errors it names, and anything else — a `sqlite3.OperationalError`
+    from a contended write, a bug in a renderer — reaches discord.py's default
+    `View.on_error`, which logs and leaves the player looking at Discord's bare
+    "This interaction failed" with no idea whether their take committed. Every
+    view inherits this so the answer is the same on both surfaces.
+    """
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        logger.exception(
+            "Quartermaster component %s failed for interaction %s",
+            getattr(item, "custom_id", type(item).__name__),
+            interaction.id,
+            exc_info=error,
+        )
+        await _send_error(
+            interaction,
+            "Quartermaster could not complete that action. Nothing was changed unless you "
+            "were told otherwise; open the surface again to see current state.",
+        )
+
+
+class TakeView(QuartermasterView):
     def __init__(
         self,
         inventory: InventoryService,
@@ -111,7 +145,7 @@ class TakeView(discord.ui.View):
         return callback
 
 
-class TakeConfirmationView(discord.ui.View):
+class TakeConfirmationView(QuartermasterView):
     def __init__(self, inventory: InventoryService, settings: Settings, handle_id: str) -> None:
         super().__init__(timeout=300)
         self.inventory = inventory
@@ -140,7 +174,7 @@ class TakeConfirmationView(discord.ui.View):
             await _send_error(interaction, f"That confirmation could not be completed: {error}")
 
 
-class PartyStashView(discord.ui.View):
+class PartyStashView(QuartermasterView):
     def __init__(self, inventory: InventoryService, settings: Settings) -> None:
         super().__init__(timeout=300)
         self.inventory = inventory
@@ -179,7 +213,7 @@ class PartyStashView(discord.ui.View):
             await _send_error(interaction, f"Party Stash could not be opened: {error}")
 
 
-class LootDropView(discord.ui.View):
+class LootDropView(QuartermasterView):
     def __init__(self, loot: LootDropService, settings: Settings, actor_id: str, drops: list[dict], handles: dict[str, str]) -> None:
         super().__init__(timeout=300)
         self.loot = loot
@@ -380,7 +414,7 @@ async def _launcher_backup(interaction: discord.Interaction, services: BotServic
         await _send_error(interaction, str(error))
 
 
-class LauncherMoreView(discord.ui.View):
+class LauncherMoreView(QuartermasterView):
     def __init__(
         self,
         services: BotServices,
@@ -449,6 +483,16 @@ class GrantLootModal(discord.ui.Modal, title="Grant loot"):
         self.inventory = inventory
         self.settings = settings
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        """A modal submission has the same silent-failure shape as a button."""
+        logger.exception(
+            "Quartermaster grant modal failed for interaction %s", interaction.id, exc_info=error
+        )
+        await _send_error(
+            interaction,
+            "Quartermaster could not record that grant. Open the Party Stash to see current state.",
+        )
+
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not await _launcher_admin(interaction, self.settings):
             return
@@ -484,7 +528,7 @@ class GrantLootModal(discord.ui.Modal, title="Grant loot"):
             await _send_error(interaction, f"Loot could not be granted: {error}")
 
 
-class CombatCloseoutView(discord.ui.View):
+class CombatCloseoutView(QuartermasterView):
     """The end-of-combat controls: spoils into the stash, or the open drops.
 
     Combat ending is the moment loot exists, and it was also the moment the
@@ -515,7 +559,7 @@ class CombatCloseoutView(discord.ui.View):
             await _launcher_loot(interaction, self.services, self.loot, self.settings)
 
 
-class QuartermasterLauncherView(discord.ui.View):
+class QuartermasterLauncherView(QuartermasterView):
     def __init__(
         self,
         services: BotServices,

@@ -47,6 +47,49 @@ def active_claimant(connection: Any, actor_id: str | None) -> Any:
     ).fetchone()
 
 
+def credit_stack(
+    connection: Any,
+    *,
+    owner_type: str,
+    owner_id: str,
+    item_name: str,
+    normalized_name: str,
+    quantity: int,
+    provenance: str | None,
+    now: str,
+) -> None:
+    """Move a quantity into an owner's holdings, merging with any equal stack.
+
+    Every path that puts an item somewhere goes through here — a take, a claim,
+    a give, a closed Loot Drop returning what nobody wanted — so the merge rule
+    is defined once. Splitting it per destination is how one path ends up
+    creating a second stack of the same item beside the first.
+    """
+    connection.execute(
+        """INSERT INTO inventory_stacks(
+            id, item_name, normalized_name, variant_metadata, quantity,
+            provenance, owner_type, owner_id, version, last_acquired_at, updated_at
+        ) VALUES (?, ?, ?, '{}', ?, ?, ?, ?, 1, ?, ?)
+        ON CONFLICT(owner_type, owner_id, normalized_name, variant_metadata) DO UPDATE SET
+            quantity = inventory_stacks.quantity + excluded.quantity,
+            version = inventory_stacks.version + 1,
+            provenance = COALESCE(excluded.provenance, inventory_stacks.provenance),
+            last_acquired_at = excluded.last_acquired_at,
+            updated_at = excluded.updated_at""",
+        (
+            str(uuid.uuid4()),
+            item_name,
+            normalized_name,
+            quantity,
+            provenance,
+            owner_type,
+            owner_id,
+            now,
+            now,
+        ),
+    )
+
+
 def credit_character_stack(
     connection: Any,
     *,
@@ -57,18 +100,16 @@ def credit_character_stack(
     provenance: str | None,
     now: str,
 ) -> None:
-    """Move a quantity into a character's holdings, merging with any equal stack."""
-    connection.execute(
-        """INSERT INTO inventory_stacks(
-            id, item_name, normalized_name, variant_metadata, quantity,
-            provenance, owner_type, owner_id, version, last_acquired_at, updated_at
-        ) VALUES (?, ?, ?, '{}', ?, ?, 'CHARACTER', ?, 1, ?, ?)
-        ON CONFLICT(owner_type, owner_id, normalized_name, variant_metadata) DO UPDATE SET
-            quantity = inventory_stacks.quantity + excluded.quantity,
-            version = inventory_stacks.version + 1,
-            last_acquired_at = excluded.last_acquired_at,
-            updated_at = excluded.updated_at""",
-        (str(uuid.uuid4()), item_name, normalized_name, quantity, provenance, owner_id, now, now),
+    """Credit a character, for the paths that can only ever mean a character."""
+    credit_stack(
+        connection,
+        owner_type="CHARACTER",
+        owner_id=owner_id,
+        item_name=item_name,
+        normalized_name=normalized_name,
+        quantity=quantity,
+        provenance=provenance,
+        now=now,
     )
 
 
@@ -322,6 +363,130 @@ class InventoryService:
             "character_id": str(taker["id"]),
             "character_name": taker["name"],
         }
+
+    def give_interaction(
+        self,
+        interaction_id: str,
+        *,
+        actor_id: str | None,
+        item_name: str,
+        quantity: int,
+        destination: str = "party",
+    ) -> ReceiptResult:
+        """Hand something the actor's character holds back, or on to someone else.
+
+        Until this existed, possession moved one way only. A take or a claim
+        transfers ownership to the taker's active character, and nothing —
+        including the DM — could move it back: `character-resolve` refuses
+        active characters, and `/grant` mints a new item rather than returning
+        one, so using it to undo a mistaken take quietly breaks conservation.
+        A misread `Take all` was therefore permanent. That is also what made the
+        take-all confirmation prompt load-bearing; it is a good prompt, but it
+        was the only thing standing between the table and an unfixable stash.
+        """
+        if quantity <= 0:
+            raise InventoryError("quantity must be positive")
+        normalized_destination = destination.strip()
+        if not normalized_destination:
+            raise InventoryError("a destination is required")
+        return self.receipts.execute_fast(
+            interaction_id,
+            actor_id=actor_id,
+            response_kind="stash",
+            mutation=lambda connection, operation_id: self._give_in_transaction(
+                connection, operation_id, actor_id, item_name, quantity, normalized_destination
+            ),
+        )
+
+    def _give_in_transaction(
+        self,
+        connection: Any,
+        operation_id: str,
+        actor_id: str | None,
+        item_name: str,
+        quantity: int,
+        destination: str,
+    ) -> dict[str, Any]:
+        normalized = normalize_name(item_name)
+        giver = active_claimant(connection, actor_id)
+        if giver is None:
+            raise InventoryError("an active registered character is required to give items")
+        giver_id = str(giver["id"])
+        source = connection.execute(
+            """SELECT * FROM inventory_stacks
+                WHERE owner_type = 'CHARACTER' AND owner_id = ?
+                  AND normalized_name = ? AND variant_metadata = '{}'""",
+            (giver_id, normalized),
+        ).fetchone()
+        if source is None:
+            raise InventoryError(f"{giver['name']} is not holding {item_name.strip()}")
+        held = int(source["quantity"])
+        if held < quantity:
+            raise InventoryError(f"{giver['name']} holds only {held}")
+
+        if destination.casefold() == "party":
+            destination_type, destination_id, destination_name = "PARTY", "party", "the Party Stash"
+        else:
+            recipient = connection.execute(
+                "SELECT id, name, lifecycle FROM characters WHERE id = ?", (destination,)
+            ).fetchone()
+            if recipient is None:
+                raise InventoryError("recipient character not found")
+            if recipient["lifecycle"] != "ACTIVE":
+                # Specification 32.1: a non-active character cannot ordinarily
+                # receive transfers, and belongings resolution is the deliberate
+                # exception the DM drives.
+                raise InventoryError("only active characters can receive items")
+            if str(recipient["id"]) == giver_id:
+                raise InventoryError("the recipient must differ from the giver")
+            destination_type, destination_id = "CHARACTER", str(recipient["id"])
+            destination_name = str(recipient["name"])
+
+        now = iso_now()
+        remaining = held - quantity
+        if remaining == 0:
+            connection.execute("DELETE FROM inventory_stacks WHERE id = ?", (source["id"],))
+        else:
+            connection.execute(
+                "UPDATE inventory_stacks SET quantity = ?, version = version + 1, updated_at = ? WHERE id = ?",
+                (remaining, now, source["id"]),
+            )
+        credit_stack(
+            connection,
+            owner_type=destination_type,
+            owner_id=destination_id,
+            item_name=source["item_name"],
+            normalized_name=source["normalized_name"],
+            quantity=quantity,
+            provenance=source["provenance"],
+            now=now,
+        )
+        result = {
+            "status": "GIVEN",
+            "item_name": source["item_name"],
+            "quantity": quantity,
+            "remaining": remaining,
+            "character_id": giver_id,
+            "character_name": giver["name"],
+            "destination_type": destination_type,
+            "destination_id": destination_id,
+            "destination_name": destination_name,
+        }
+        append_event(
+            connection,
+            operation_id=operation_id,
+            actor_id=actor_id,
+            event_type="ITEM_GIVEN",
+            payload=result,
+            destination=session_event_destination(connection),
+        )
+        # The pinned surface renders party holdings, so it only changes when the
+        # Party Stash is one end of the transfer.
+        if destination_type == "PARTY":
+            mark_projection_dirty(
+                connection, target_id="party-stash", target_type="STATE", destination="party-inventory"
+            )
+        return result
 
     def browse(self) -> list[dict[str, Any]]:
         with self.store.read() as connection:

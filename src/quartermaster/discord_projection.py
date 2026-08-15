@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from time import monotonic
 from typing import Any
 
 import discord
 
+from .combat import format_duration
 from .config import Settings
 from .currency import format_currency
 from .db import SQLiteStore
@@ -61,34 +63,68 @@ def _content_for_state(target_id: str, payload: dict[str, Any]) -> str:
     raise ProjectionConfigurationError(f"unknown state target {target_id}")
 
 
+def _combat_closed_line(payload: dict[str, Any]) -> str:
+    ran = format_duration(payload.get("elapsed_seconds"))
+    sentence = "Combat closed" + (f" after {ran}" if ran else "")
+    if payload.get("reason") == "SESSION_CLOSED":
+        sentence += " with the session"
+    return sentence + (f": {payload['outcome']}." if payload.get("outcome") else ".")
+
+
+# Every event that reaches the session log renders through this table. An event
+# type that is missing from it still delivers, as its raw JSON payload — which
+# is how a Discord user ID or an internal UUID ends up read out at the table —
+# so `test_every_domain_event_type_has_a_renderer` fails the build rather than
+# letting a new event ship that way.
+_EVENT_RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
+    "ITEM_GRANTED": lambda payload: f"DM added {payload['quantity']} {payload['item_name']}.",
+    "ITEM_TAKEN": lambda payload: (
+        f"A player took {payload['quantity']} {payload['item_name']}. {payload['remaining']} remain."
+    ),
+    "ITEM_GIVEN": lambda payload: (
+        f"{payload['character_name']} gave {payload['quantity']} {payload['item_name']} "
+        f"to {payload['destination_name']}."
+    ),
+    "SESSION_STARTED": lambda payload: f"Session {payload['session_number']} started.",
+    "SESSION_CLOSED": lambda payload: f"Session {payload['session_number']} closed.",
+    "LOOT_DROP_CREATED": lambda payload: f"New Loot Drop created ({len(payload['items'])} item entries).",
+    "LOOT_CLAIMED": lambda payload: (
+        f"A player claimed {payload['quantity']} {payload['item_name']} from a Loot Drop."
+    ),
+    "LOOT_DROP_CLOSED": lambda payload: f"Loot Drop closed ({payload['reason']}).",
+    "TREASURY_ADJUSTED": lambda payload: f"Treasury updated: {format_currency(payload['after'])}.",
+    "TREASURY_SPLIT": lambda payload: (
+        f"Treasury split among {len(payload['recipients'])} active characters."
+    ),
+    "CURRENCY_TRANSFERRED": lambda payload: f"Currency given to {payload['character_name']}.",
+    "BELONGINGS_RESOLVED": lambda payload: (
+        f"Belongings resolved from {payload['source_character_name']} to {payload['destination_name']}."
+    ),
+    "CHARACTER_CREATED": lambda payload: f"{payload['name']} joined the roster.",
+    "CHARACTER_LIFECYCLE_CHANGED": lambda payload: (
+        f"{payload['name']} moved from {payload['from']} to {payload['to']}."
+    ),
+    "COMBAT_OPENED": lambda payload: f"Combat opened in <#{payload['channel_id']}>.",
+    "COMBAT_CLOSED": _combat_closed_line,
+}
+
+
 def _content_for_event(event_type: str, payload: dict[str, Any]) -> str:
-    if event_type == "ITEM_GRANTED":
-        return f"DM added {payload['quantity']} {payload['item_name']}."
-    if event_type == "ITEM_TAKEN":
-        return f"A player took {payload['quantity']} {payload['item_name']}. {payload['remaining']} remain."
-    if event_type == "SESSION_STARTED":
-        return f"Session {payload['session_number']} started."
-    if event_type == "SESSION_CLOSED":
-        return f"Session {payload['session_number']} closed."
-    if event_type == "LOOT_DROP_CREATED":
-        return f"New Loot Drop created ({len(payload['items'])} item entries)."
-    if event_type == "LOOT_CLAIMED":
-        return f"A player claimed {payload['quantity']} {payload['item_name']} from a Loot Drop."
-    if event_type == "LOOT_DROP_CLOSED":
-        return f"Loot Drop closed ({payload['reason']})."
-    if event_type == "TREASURY_ADJUSTED":
-        return f"Treasury updated: {format_currency(payload['after'])}."
-    if event_type == "TREASURY_SPLIT":
-        return f"Treasury split among {len(payload['recipients'])} active characters."
-    if event_type == "CURRENCY_TRANSFERRED":
-        return f"Currency given to {payload['character_name']}."
-    if event_type == "BELONGINGS_RESOLVED":
-        return f"Belongings resolved from {payload['source_character_name']} to {payload['destination_name']}."
-    # An event with no renderer of its own falls back to its raw payload, which
-    # has no bound at all: a Loot Drop of many items or a belongings resolution
-    # carrying every stack a character held would otherwise be rejected by
-    # Discord and dead-lettered after eight attempts.
-    return clamp_discord_content(f"{event_type}: {json.dumps(payload, sort_keys=True)}")
+    """Render one outbox event, never wider than Discord will accept.
+
+    Every line here quotes canonical state, and canonical state holds text a
+    person typed: an item name has no length limit on the `/grant` command, so
+    even a one-line renderer can cross 2000 characters. Discord refuses that
+    identically every time, which costs the event eight retries and a dead
+    letter, and the per-destination FIFO gate holds every later event in that
+    thread behind it until an operator requeues.
+    """
+    renderer = _EVENT_RENDERERS.get(event_type)
+    if renderer is None:
+        # An event with no renderer of its own falls back to its raw payload,
+        # which is unbounded and unreadable; the clamp keeps it deliverable.
+        return clamp_discord_content(f"{event_type}: {json.dumps(payload, sort_keys=True)}")
+    return clamp_discord_content(renderer(payload))
 
 
 class DiscordProjectionTransport:

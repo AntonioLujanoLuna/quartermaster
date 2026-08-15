@@ -19,7 +19,7 @@ Two rules keep it useful:
 
 ## Current state
 
-Canonical state is SQLite at schema 11. Discord messages are disposable projections.
+Canonical state is SQLite at schema 12. Discord messages are disposable projections.
 
 **Runtime and durability.** Configuration is validated at startup. FAST interactions run
 their mutation and receipt in one transaction; DEFERRED interactions persist `PROCESSING`
@@ -28,11 +28,13 @@ receipt interrupted mid-flight, marks the matching provider operations `UNKNOWN`
 releases any projection claim left behind by the previous run. Mutations are addressed by
 opaque single-use handles carrying the read set they were rendered against.
 
-**Domain.** Party Stash grant/browse/take, Loot Drops (create, claim, manual close,
+**Domain.** Party Stash grant/browse/take/give, Loot Drops (create, claim, manual close,
 session close, absolute expiry), sessions, integer-only treasury with adjust/split/give,
 character registration and lifecycle, and explicit belongings resolution for non-active
 characters. Taking from the stash and claiming a drop both transfer ownership to the
-actor's registered active character and both require one.
+actor's registered active character and both require one. `/item-give` is the way back:
+a player returns what they hold to the Party Stash or hands it to another active
+character, and every path that credits a holder shares one merge rule in `credit_stack`.
 
 **Projection.** State targets are scheduled by normalized lateness; events deliver FIFO
 per destination and bind to durable per-session threads. Undeliverable events dead-letter
@@ -65,8 +67,55 @@ durable but has no live caller, and its health check cannot fail on this build. 
 extension scaffold at `integrations/avrae/quartermaster_cog.py` is parked: Gate 1 was
 answered "no, for now" on 2026-08-14, and it has never been loaded in an Avrae deployment.
 
-**Checks.** 181 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Checks.** 189 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request.
+
+## Fifth pass on 2026-08-15
+
+One missing capability and three defects, each covered by a test that fails against the
+old behaviour.
+
+- **Possession only moved one way.** A take or a claim transfers ownership to the actor's
+  active character, and nothing moved it back: `/character-resolve` refuses active
+  characters by design, and `/grant` mints a new item, so using it to undo a mistaken
+  `Take all` inflates the campaign's inventory instead of correcting it. A misread button
+  was therefore permanent, for the player and for the DM — which is also what quietly made
+  the take-all confirmation prompt the only thing standing between the table and an
+  unfixable stash. `/item-give` closes the door: the giver's active character hands a
+  quantity back to the Party Stash or on to another active character, refusing a
+  non-active recipient per specification 32.1. `credit_stack` is now the single merge rule
+  every crediting path shares, so the Loot Drop return, the claim, the take, and the give
+  cannot disagree about when two stacks are the same stack.
+
+- **Four event types were being read out at the table as raw JSON.** The outbox renderer
+  falls back to the payload for any event type it does not know, which is the right
+  behaviour — an unrenderable event must not block its destination — but it also means
+  nothing fails when a new event ships without a line. `CHARACTER_CREATED`,
+  `CHARACTER_LIFECYCLE_CHANGED`, `COMBAT_OPENED`, and `COMBAT_CLOSED` had all arrived that
+  way, so the session log printed internal UUIDs and a player's Discord user ID. The
+  renderers are now a table, and a test reads the event types the package actually appends
+  and fails if any of them is missing from it.
+
+- **A known event type could still be refused by Discord.** Only the JSON fallback was
+  clamped to 2000 characters. Every renderer quotes canonical state, and `/grant` puts no
+  bound on an item name, so a long enough name produced an event Discord rejects
+  identically every attempt: eight retries, a dead letter, and the per-destination FIFO
+  gate holding every later event in that thread behind it. `_content_for_event` clamps
+  whatever it returns.
+
+- **The export lost the combat record at `/session-end`.** Encounters were read against
+  the active session only, and ending a session closes its open combat, so the section
+  emptied at exactly the moment the DM writes up what happened. It now reads the session
+  the table is playing — the active one, or the most recent closed one — and names it.
+
+Also corrected:
+
+- Component callbacks now answer when something unforeseen breaks. A slash command routes
+  an unexpected exception to `bot.tree.error`; a button had no equivalent, so anything a
+  callback did not name reached discord.py's default handler and the player was left with
+  Discord's bare "This interaction failed", unable to tell whether their take committed.
+  Every view inherits `QuartermasterView.on_error`, and the grant modal has the same
+  handler. This was the "shape decision" the previous pass recorded and did not take.
 
 ## Fourth correction pass on 2026-08-15
 
@@ -233,12 +282,13 @@ the next session decides deliberately rather than rediscovering them.
 - **`local_metric_buckets` (migration 8) has no reader and no writer**, and
   `internal_hard_deadline_seconds` and `ack_latency_ms` are likewise computed or validated
   and never consumed. Latency budgets stay estimates until something records them.
-- **Component callbacks have no equivalent of `bot.tree.error`.** Slash commands route an
-  unexpected exception to a handler that replies and logs; a button callback catches only
-  the domain errors it names, so anything else — a `sqlite3.OperationalError` from a
-  contended write, say — reaches discord.py's default `View.on_error`, which logs and
-  leaves the player looking at Discord's bare "This interaction failed". Every view would
-  need the same `on_error`, which is a shape decision rather than a fix.
+- **`/item-give` takes an item name and a character ID typed by hand.** So do
+  `/character-lifecycle`, `/character-resolve`, and `/treasury-give`. Autocomplete on those
+  parameters is the obvious next ergonomic step, and it is worth waiting for one session of
+  real use to say whether typing an ID at the table is actually the friction it looks like.
+- **A give is not guarded by a read set.** Take and claim carry a handle with the quantity
+  they were rendered against; a give is typed with an explicit quantity, so there is nothing
+  on screen to go stale. If a component path for giving ever exists, it needs a handle.
 
 ## Not yet verified live
 
@@ -272,6 +322,12 @@ session:
     control reads acceptably at the table.
 12. Run `/export` mid-session with an open Loot Drop and an item a player has taken, and
     confirm the drop, the holder's name, and the roster all read correctly.
+13. `Take all` a stack, then `/item-give` part of it back, and confirm the pinned Party
+    Stash reflects the return and the session log line reads acceptably at the table.
+14. `/item-give` to another player's character, and confirm the recipient's holdings in
+    `/export` and that the giver is left with what they should be.
+15. Register a character and change a lifecycle with the session log in view, and confirm
+    those lines now read as sentences rather than JSON.
 
 ## Live Discord setup
 
