@@ -52,12 +52,16 @@ boundary clamps anything else. `rendering.py` holds both rules.
 CLI; validated timestamped backups on a schedule with retention; `/quartermaster` as the
 DM launcher. See [the runbook](runbook.md).
 
-**Avrae.** Guild-scoped `/combat` renders read-only handoff cards pointing at native Avrae
-commands. The provider operation boundary is durable but has no live gateway behind it. No
-mechanics are mirrored. The extension scaffold at `integrations/avrae/quartermaster_cog.py`
-has never been loaded in an Avrae deployment.
+**Avrae.** Guild-scoped `/combat` has two halves. Start, End, and Status read and write
+Quartermaster's own `combat_encounters` record — session, channel, duration, outcome, and
+nothing Avrae owns; Start and End are DM-only. The other six actions render read-only
+handoff cards pointing at native Avrae commands. Ending combat reports outstanding Loot
+Drops and offers the Party Stash and Loot Drop controls. The provider operation boundary is
+durable but has no live caller, and its health check cannot fail on this build. The
+extension scaffold at `integrations/avrae/quartermaster_cog.py` is parked: Gate 1 was
+answered "no, for now" on 2026-08-14, and it has never been loaded in an Avrae deployment.
 
-**Checks.** 139 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Checks.** 177 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request.
 
 ## Third correction pass on 2026-08-14
@@ -245,12 +249,16 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
 ## Next priorities
 
 1. Work through "Not yet verified live" above.
-2. The Avrae extension spike, which is the next real gate: decide whether self-hosting or
-   forking Avrae is acceptable, load the cog in a disposable guild, and prove one
-   authenticated harmless native state change through the provider boundary. Do not add
-   launcher combat controls or combat reference projections before that.
+2. Play a session with the combat record and see whether the closeout gets used. If the DM
+   never presses **Record spoils** after a fight, the control is in the wrong place. That
+   observation is worth more than any further combat feature.
 3. Choose evidence-based latency and freshness budgets from observed play if the current
    estimates prove wrong.
+
+The Avrae extension spike is no longer a priority: Gate 1 was answered "no, for now", so
+self-hosting, the Cog, provider gateway implementations, and combat reference projections
+are all parked. See [the integration plan](avrae-integration-plan.md) for the reasoning and
+for the one hosted-path question still worth answering.
 
 Your Pack, Journal, Parking Lot, Downtime, faction clocks, rich continuity, and Undo remain
 evidence-gated. Do not start them.

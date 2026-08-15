@@ -1,8 +1,12 @@
 # Quartermaster and Avrae Integration Plan
 
-Status: implementation in progress. The Quartermaster boundary, hosted handoff, and self-hosted Avrae context-probe scaffold are implemented; live Avrae execution remains gated on a disposable deployment.
+Status: the hosted-Avrae path is the committed one. Gate 1 has been answered "no, for now"
+(see [Gate 1 decision](#gate-1-decision-2026-08-14)), so the self-hosted extension work is
+parked rather than pending, and the hosted fallback is being built out as the destination
+instead of a waiting room. The provider boundary in `integration.py` remains a contract with
+no live caller.
 
-Updated: 2026-08-11
+Updated: 2026-08-14
 
 ## Purpose
 
@@ -32,7 +36,21 @@ The current cards use the documented native forms such as `!i begin`, `!i join`,
 
 `integrations/avrae/quartermaster_cog.py` is a disposable Avrae-side extension scaffold. Its `/qm-combat-probe` command receives a real Avrae interaction, preserves the actor/guild/channel identity, loads native combat with `Combat.from_ctx(inter)`, and records a Quartermaster provider receipt and correlation ID. It reports native combat presence only; it does not copy HP, initiative, conditions, resources, or combatants into Quartermaster.
 
-The scaffold is intentionally not loaded by the current hosted Quartermaster process and has not yet been run inside an Avrae deployment. The next gate is to install the Quartermaster core into a self-hosted Avrae environment, load the Cog in a disposable guild, and verify both the no-combat and active-combat paths. Only after that should the Cog perform one explicitly selected, harmless native state change through Avrae's own model commit path.
+The scaffold is not loaded by the current hosted Quartermaster process and has never been run inside an Avrae deployment. It is now parked behind the Gate 1 decision below rather than queued as the next task. Nothing in the running bot has ever exercised it, and its assumptions about Avrae's internals — that `CombatNotFound` is importable from `cogs5e.initiative`, that `Combat.from_ctx` accepts a slash interaction, that two OS processes may share one SQLite file — are unverified. Treat the file as a record of the intended shape, not as working code.
+
+## Implementation slice 4: the Quartermaster combat record
+
+Schema 12 adds `combat_encounters`: session, channel, open/closed status, who opened and closed it, timestamps, a close reason, and an optional DM outcome note. It has no column for HP, initiative, conditions, resources, or combatants, and a test asserts the exact column set so it cannot quietly gain one.
+
+`/combat` now does three things beyond printing a card:
+
+- **Start combat** opens the encounter and then renders `!i begin`. DM-only, because it writes canonical state.
+- **End combat** closes the encounter, takes an optional outcome note, renders `!i end`, reports any Loot Drops still outstanding in the session, and attaches the Party Stash and Loot Drop controls. DM-only.
+- **Combat status** answers from Quartermaster's own record — which session, which channel, how long the fight has been running, what loot is outstanding, and what the previous combat resolved to — and names Avrae as the owner of everything mechanical.
+
+The other six actions remain pure handoff cards open to any player. Closing a session closes any encounter still open, with reason `SESSION_CLOSED`, the same way it closes outstanding Loot Drops.
+
+This is the closeout the fallback was missing: combat ending is the moment loot exists, and it used to be the moment Quartermaster stopped talking. None of it requires an Avrae API, and none of it makes Quartermaster authoritative for a mechanic.
 
 ## Research findings
 
@@ -118,18 +136,19 @@ If one-click mechanics are a non-negotiable goal, the preferred path is:
 
 This is materially larger than adding a wrapper around the current Quartermaster bot. The Avrae repository's self-hosting documentation calls for MongoDB, Redis, Python, and other operational dependencies, with Windows described as compatible but untested. That deployment cost is a first-class decision.
 
-### Fallback shape if Avrae remains hosted
+### Committed shape: hosted Avrae
 
-If we keep using the official hosted Avrae bot, Quartermaster can still provide:
+Gate 1 chose this one. With the official hosted Avrae bot, Quartermaster provides:
 
 - a unified launcher;
-- combat setup and closeout workflows;
+- a combat record of its own — session, channel, duration, outcome — with no Avrae state in it;
+- combat setup and closeout workflows, including the spoils handoff at the moment combat ends;
 - channel and command guidance;
-- links or copyable command cards;
+- copyable native command cards;
 - continuity capture;
 - loot and treasury handoff.
 
-This improves the user experience but does not provide true one-click execution of Avrae mechanics. We should describe it as a guided wrapper, not a full integration.
+This is a guided wrapper around a combat workflow Quartermaster genuinely owns half of, not one-click execution of Avrae mechanics. Describing it as a full integration would be wrong, and the surfaces say so in the text a player reads.
 
 ## Integration contract to design before implementation
 
@@ -182,6 +201,30 @@ The `/quartermaster` launcher becomes the table's front door:
 The combat buttons should not ask Quartermaster to calculate mechanics. They should dispatch to the Avrae provider or, during the hosted-Avrae fallback phase, produce a guided handoff.
 
 ## Research and decision gates
+
+### Gate 1 decision, 2026-08-14
+
+**Answered: no, for now.** The table is not taking on a self-hosted Avrae fork.
+
+The price is MongoDB, Redis, a forked Avrae, and a fork-sync obligation that does not end.
+The integration seams the spike would use — `Combat.from_ctx`, `Combat.commit` — are Avrae
+internals, not a supported API, so every upstream pull is a chance for the Cog to break. For
+one home table, that is an operational burden that outlives the benefit.
+
+The consequence is that one-click execution of Avrae mechanics is off the table, and should
+be described that way rather than as work that is coming. Everything downstream of this gate
+— slices beyond 3, gates 2 through 5 — is parked, not scheduled.
+
+Revisit only if someone at the table actively wants to operate that infrastructure. Nothing
+in the current build depends on the answer changing.
+
+One direction remains genuinely unexplored and does not need a fork: Avrae aliases can emit
+signed invocation data, which would let combat events flow Avrae → Quartermaster rather than
+the reverse. The catch is that Draconic aliases appear to have no outbound network access, so
+the signature would land as channel text and Quartermaster would need message-content intent
+to read it. That is worth half an hour against current Avrae documentation before the door is
+considered shut. It is an observation channel, not an execution one, and it would not change
+the authority boundary.
 
 ### Gate 1: deployment choice
 
@@ -263,10 +306,24 @@ The integration is not ready for table use until all of the following are true:
 
 ## Immediate next implementation work
 
-1. Confirm whether self-hosting a maintained Avrae fork is acceptable.
-2. Decide whether the desired single front door should be the current Quartermaster bot or a Quartermaster Cog within a self-hosted Avrae process.
-3. Load `integrations/avrae/quartermaster_cog.py` in a disposable Avrae guild and verify the native context probe end to end.
-4. Prove one explicitly selected harmless native state change through Avrae's own model commit path, then inventory the table's actual Avrae commands and combat habits.
-5. Add only the first pilot operations with verified actor authorization, idempotency, timeout, and recovery semantics; update the product specification after that boundary is accepted.
+Gate 1 is answered, so the queue is no longer "prove the spike". It is "make the fallback
+worth having", which is work the hosted bot can do on its own:
 
-Until then, the current Quartermaster implementation remains the continuity core and should not gain speculative combat tables or mirrored mechanics state.
+1. Play a real session with the combat record and see whether the closeout actually gets
+   used. If the DM never presses **Record spoils**, the button is in the wrong place.
+2. Decide whether the encounter deserves a name or a short label. Right now two fights in one
+   session are distinguishable only by timestamp, which is fine for the status card and thin
+   for the export.
+3. Consider surfacing the open encounter on the session projection, so the channel shows a
+   fight in progress without anyone running a command.
+4. Spend the half hour on the Avrae alias signature question above, and write the answer down
+   either way so it stops being an open loop.
+
+Explicitly not queued: loading the Cog, self-hosting Avrae, provider gateway implementations,
+combat reference projections, and any surface that would hold an Avrae-owned number.
+
+The provider boundary in `integration.py` stays as a contract with no live caller. It is
+cheap to carry, its recovery semantics are the hard part and are already correct, and
+removing it would cost a migration to destroy work we would have to redo. It should not be
+read as evidence that an integration is running — the health check that watches it cannot
+fail on the current build, and says so in a comment.

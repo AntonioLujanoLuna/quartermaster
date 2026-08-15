@@ -677,19 +677,137 @@ class DiscordSurfaceTests(unittest.TestCase):
 
     # Avrae handoff -------------------------------------------------------
 
+    def combat(self, interaction: FakeInteraction, value: str, **kwargs: object) -> None:
+        run(self.command("combat")(interaction, action=app_commands.Choice(name=value, value=value), **kwargs))
+
+    def encounter_statuses(self) -> list[str]:
+        return [
+            row["status"]
+            for row in self.store.connection.execute(
+                "SELECT status FROM combat_encounters ORDER BY opened_at"
+            )
+        ]
+
     def test_combat_handoff_requires_an_active_session(self) -> None:
         interaction = self.player()
-        run(self.command("combat")(interaction, action=app_commands.Choice(name="Start combat", value="start")))
+        self.combat(interaction, "join")
         self.assertIn("No active Quartermaster session", interaction.text)
 
     def test_combat_handoff_renders_the_native_avrae_command(self) -> None:
         run(self.command("session-start")(self.dm()))
         interaction = self.player()
-        run(self.command("combat")(interaction, action=app_commands.Choice(name="Join combat", value="join")))
+        self.combat(interaction, "join")
         self.assertIn("**AVRAE HANDOFF · JOIN**", interaction.text)
         self.assertIn("`!i join`", interaction.text)
         self.assertIn(f"<#{CHANNEL_ID}>", interaction.text)
         self.assertIn("Avrae remains authoritative", interaction.text)
+
+    def test_combat_handoff_actions_stay_open_to_players(self) -> None:
+        run(self.command("session-start")(self.dm()))
+        for value in ["join", "next", "attack", "cast", "check", "save", "status"]:
+            with self.subTest(action=value):
+                interaction = self.player()
+                self.combat(interaction, value)
+                self.assertNotIn("Only configured DM administrators", interaction.text)
+
+    # Combat record -------------------------------------------------------
+
+    def test_opening_and_closing_combat_are_refused_for_a_non_dm(self) -> None:
+        run(self.command("session-start")(self.dm()))
+        for value in ["start", "end"]:
+            with self.subTest(action=value):
+                interaction = self.bystander()
+                self.combat(interaction, value)
+                self.assertIn("Only configured DM administrators", interaction.text)
+                self.assertTrue(interaction.kwargs["ephemeral"])
+        self.assertEqual(self.encounter_statuses(), [])
+
+    def test_combat_refuses_interactions_from_another_guild(self) -> None:
+        interaction = self.elsewhere()
+        self.combat(interaction, "status")
+        self.assertIn("configured for a different guild", interaction.text)
+
+    def test_starting_combat_records_it_and_hands_the_dm_the_avrae_command(self) -> None:
+        run(self.command("session-start")(self.dm()))
+        interaction = self.dm()
+        self.combat(interaction, "start")
+        self.assertIn("**COMBAT OPEN**", interaction.text)
+        self.assertIn(f"<#{CHANNEL_ID}>", interaction.text)
+        self.assertIn("`!i begin`", interaction.text)
+        self.assertEqual(self.encounter_statuses(), ["OPEN"])
+
+    def test_starting_combat_without_a_session_records_nothing(self) -> None:
+        interaction = self.dm()
+        self.combat(interaction, "start")
+        self.assertIn("No active Quartermaster session", interaction.text)
+        self.assertEqual(self.encounter_statuses(), [])
+
+    def test_starting_a_second_combat_names_the_one_already_open(self) -> None:
+        run(self.command("session-start")(self.dm()))
+        self.combat(self.dm(), "start")
+        interaction = self.dm()
+        self.combat(interaction, "start")
+        self.assertIn("**COMBAT ALREADY OPEN**", interaction.text)
+        self.assertIn("End combat before opening another", interaction.text)
+        self.assertEqual(self.encounter_statuses(), ["OPEN"])
+
+    def test_combat_status_reports_quartermaster_state_and_names_avraes(self) -> None:
+        run(self.command("session-start")(self.dm()))
+        self.combat(self.dm(), "start")
+        interaction = self.player()
+        self.combat(interaction, "status")
+        self.assertIn("**COMBAT STATUS**", interaction.text)
+        self.assertIn("Session 1 is active", interaction.text)
+        self.assertIn(f"Combat is open in <#{CHANNEL_ID}>", interaction.text)
+        self.assertIn("Avrae holds initiative, HP, conditions", interaction.text)
+
+    def test_combat_status_without_an_open_combat_offers_the_way_in(self) -> None:
+        run(self.command("session-start")(self.dm()))
+        interaction = self.player()
+        self.combat(interaction, "status")
+        self.assertIn("No Quartermaster combat is open", interaction.text)
+
+    def test_combat_status_lists_outstanding_loot_for_the_session(self) -> None:
+        run(self.command("session-start")(self.dm()))
+        run(self.command("loot-drop")(self.dm(), item="Crown", quantity=2))
+        interaction = self.player()
+        self.combat(interaction, "status")
+        self.assertIn("Open Loot Drops in this session:", interaction.text)
+        self.assertIn("2 unclaimed across 1 entry", interaction.text)
+
+    def test_ending_combat_closes_the_record_and_offers_the_loot_controls(self) -> None:
+        run(self.command("session-start")(self.dm()))
+        self.combat(self.dm(), "start")
+        interaction = self.dm()
+        self.combat(interaction, "end", outcome="the ogre fled")
+        self.assertIn("**COMBAT CLOSED**", interaction.text)
+        self.assertIn("Outcome: the ogre fled", interaction.text)
+        self.assertIn("`!i end`", interaction.text)
+        self.assertIn("Spoils:", interaction.text)
+        self.assertEqual(self.encounter_statuses(), ["CLOSED"])
+        view = interaction.kwargs["view"]
+        self.assertEqual(
+            {button.label for button in view.children}, {"Record spoils", "Open Loot"}
+        )
+
+    def test_ending_combat_without_one_open_offers_no_closeout_controls(self) -> None:
+        run(self.command("session-start")(self.dm()))
+        interaction = self.dm()
+        self.combat(interaction, "end")
+        self.assertIn("no open Quartermaster combat to close", interaction.text)
+        self.assertIsNone(interaction.kwargs.get("view"))
+
+    def test_ending_the_session_closes_a_combat_left_open(self) -> None:
+        run(self.command("session-start")(self.dm()))
+        self.combat(self.dm(), "start")
+        run(self.command("session-end")(self.dm(), where_ended="The inn"))
+        self.assertEqual(self.encounter_statuses(), ["CLOSED"])
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT closed_reason FROM combat_encounters"
+            ).fetchone()["closed_reason"],
+            "SESSION_CLOSED",
+        )
 
     # Deferred workflows --------------------------------------------------
 

@@ -10,7 +10,7 @@ from threading import RLock
 
 from .naming import normalize_name
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 class MigrationError(RuntimeError):
@@ -270,6 +270,28 @@ MIGRATIONS: dict[int, str] = {
     """,
     11: """
     ALTER TABLE projection_targets ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;
+    """,
+    # A combat encounter records that a fight happened, where, and for how long.
+    # It deliberately has no column for HP, initiative, conditions, resources, or
+    # combatants: Avrae owns every one of those, and a column here would become a
+    # second authoritative copy the moment someone wrote to it.
+    12: """
+    CREATE TABLE combat_encounters (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id),
+        channel_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('OPEN', 'CLOSED')),
+        opened_by TEXT,
+        opened_at TEXT NOT NULL,
+        closed_by TEXT,
+        closed_at TEXT,
+        closed_reason TEXT,
+        outcome TEXT
+    );
+    CREATE UNIQUE INDEX one_open_combat_per_session_idx
+        ON combat_encounters(session_id) WHERE status = 'OPEN';
+    CREATE INDEX combat_encounters_session_idx
+        ON combat_encounters(session_id, status, opened_at);
     """,
 }
 

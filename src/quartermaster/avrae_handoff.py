@@ -11,11 +11,35 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .db import SQLiteStore
-from .integration import SUPPORTED_PROVIDER_OPERATIONS, ProviderIntegrationError
+
+# The native command each supported action maps to, and the sentence a player
+# needs in order to run it. This is the module's own source of truth: the
+# provider boundary in `integration.py` names the same actions, but a kind added
+# there without a card here must fail as a handoff error rather than as a
+# KeyError on lookup. A test holds the two sets together.
+NATIVE_COMMANDS: dict[str, tuple[str | None, str]] = {
+    "start": ("!i begin", "The DM starts the initiative tracker here."),
+    "join": ("!i join", "Join the active initiative tracker with your active character."),
+    "next": ("!i next", "Advance the active combatant after the current turn is complete."),
+    "attack": ("!attack <attack name> -t <target name>", "Replace the placeholders with the native attack arguments."),
+    "cast": ("!cast <spell name> -t <target name>", "Replace the placeholders with the native spell arguments."),
+    "check": ("!check <skill>", "Replace `<skill>` with the skill to roll."),
+    "save": ("!save <ability>", "Replace `<ability>` with the saving-throw ability."),
+    "end": ("!i end", "Avrae will request confirmation before ending the combat."),
+    "status": (None, "Read Avrae's pinned initiative summary in this channel."),
+}
 
 
 class AvraeHandoffError(RuntimeError):
     """Raised when a hosted-Avrae handoff cannot be prepared."""
+
+
+def native_command(operation_kind: str) -> str | None:
+    """The native Avrae command for one action, without touching the database."""
+    operation_kind = operation_kind.strip().lower()
+    if operation_kind not in NATIVE_COMMANDS:
+        raise AvraeHandoffError(f"unsupported Avrae handoff action: {operation_kind}")
+    return NATIVE_COMMANDS[operation_kind][0]
 
 
 @dataclass(frozen=True)
@@ -52,28 +76,16 @@ class AvraeHandoffCard:
 class AvraeHandoffService:
     """Build native Avrae command cards for the current active session."""
 
-    _COMMANDS: dict[str, tuple[str | None, str]] = {
-        "start": ("!i begin", "The DM starts the initiative tracker here."),
-        "join": ("!i join", "Join the active initiative tracker with your active character."),
-        "next": ("!i next", "Advance the active combatant after the current turn is complete."),
-        "attack": ("!attack <attack name> -t <target name>", "Replace the placeholders with the native attack arguments."),
-        "cast": ("!cast <spell name> -t <target name>", "Replace the placeholders with the native spell arguments."),
-        "check": ("!check <skill>", "Replace `<skill>` with the skill to roll."),
-        "save": ("!save <ability>", "Replace `<ability>` with the saving-throw ability."),
-        "end": ("!i end", "Avrae will request confirmation before ending the combat."),
-        "status": (None, "Read Avrae's pinned initiative summary in this channel."),
-    }
-
     def __init__(self, store: SQLiteStore) -> None:
         self.store = store
 
     def build(self, operation_kind: str, *, channel_id: str) -> AvraeHandoffCard:
         operation_kind = operation_kind.strip().lower()
-        if operation_kind not in SUPPORTED_PROVIDER_OPERATIONS:
-            raise ProviderIntegrationError(f"unsupported provider operation: {operation_kind}")
+        if operation_kind not in NATIVE_COMMANDS:
+            raise AvraeHandoffError(f"unsupported Avrae handoff action: {operation_kind}")
         if not channel_id.strip():
             raise AvraeHandoffError("channel is required for an Avrae handoff")
-        command, instruction = self._COMMANDS[operation_kind]
+        command, instruction = NATIVE_COMMANDS[operation_kind]
         with self.store.transaction(immediate=False) as connection:
             active = connection.execute(
                 "SELECT session_number FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"

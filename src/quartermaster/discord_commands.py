@@ -10,6 +10,7 @@ from discord.ext import commands
 
 from .avrae_handoff import AvraeHandoffError, AvraeHandoffService
 from .characters import CharacterError, CharacterService
+from .combat import CombatError, CombatService
 from .config import Settings
 from .currency import CurrencyError, CurrencyService, format_currency
 from .discord_common import (
@@ -19,6 +20,9 @@ from .discord_common import (
     _is_dm,
     _launcher_admin,
     _render_characters,
+    _render_combat_closed,
+    _render_combat_opened,
+    _render_combat_status,
     _render_loot,
     _render_stash,
     _run_deferred,
@@ -29,6 +33,7 @@ from .discord_common import (
     _send_execution,
 )
 from .discord_views import (
+    CombatCloseoutView,
     LootDropView,
     PartyStashView,
     QuartermasterLauncherView,
@@ -45,14 +50,10 @@ from .sessions import SessionError
 
 async def _send_avrae_handoff(
     interaction: discord.Interaction,
-    services: BotServices,
     settings: Settings,
     handoff: AvraeHandoffService,
     operation_kind: str,
 ) -> None:
-    if not _in_configured_guild(interaction, settings):
-        await _send_error(interaction, "This bot is configured for a different guild.")
-        return
     try:
         execution = await _run_fast(
             interaction,
@@ -66,6 +67,77 @@ async def _send_avrae_handoff(
         await _send_error(interaction, f"Avrae handoff could not be prepared: {error}")
 
 
+async def _open_combat(
+    interaction: discord.Interaction,
+    settings: Settings,
+    combat_service: CombatService,
+) -> None:
+    try:
+        execution = await _run_fast(
+            interaction,
+            settings,
+            lambda: combat_service.open_interaction(
+                str(interaction.id),
+                actor_id=_actor_id(interaction),
+                channel_id=str(interaction.channel_id),
+            ),
+            ephemeral=True,
+        )
+        await _send_execution(
+            interaction,
+            execution,
+            _render_combat_opened(execution.value.logical_response),
+            ephemeral=True,
+        )
+    except CombatError as error:
+        await _send_error(interaction, f"Combat could not be opened: {error}")
+
+
+async def _close_combat(
+    interaction: discord.Interaction,
+    services: BotServices,
+    settings: Settings,
+    combat_service: CombatService,
+    loot: LootDropService,
+    outcome: str | None,
+) -> None:
+    try:
+        execution = await _run_fast(
+            interaction,
+            settings,
+            lambda: combat_service.close_interaction(
+                str(interaction.id),
+                actor_id=_actor_id(interaction),
+                outcome=outcome,
+            ),
+            ephemeral=True,
+        )
+        response = execution.value.logical_response
+        await _send_execution(
+            interaction,
+            execution,
+            _render_combat_closed(response),
+            ephemeral=True,
+            # The closeout controls only mean anything once a combat has
+            # actually closed and there are spoils to record.
+            view=CombatCloseoutView(services, settings, loot) if response["status"] == "CLOSED" else None,
+        )
+    except CombatError as error:
+        await _send_error(interaction, f"Combat could not be closed: {error}")
+
+
+async def _show_combat_status(
+    interaction: discord.Interaction,
+    settings: Settings,
+    combat_service: CombatService,
+) -> None:
+    try:
+        execution = await _run_fast(interaction, settings, combat_service.status, ephemeral=True)
+        await _send_execution(interaction, execution, _render_combat_status(execution.value), ephemeral=True)
+    except CombatError as error:
+        await _send_error(interaction, f"Combat status could not be read: {error}")
+
+
 def register_commands(
     bot: commands.Bot,
     guild: discord.Object,
@@ -76,6 +148,7 @@ def register_commands(
     currency: CurrencyService,
     loot: LootDropService,
     handoff: AvraeHandoffService,
+    combat_service: CombatService,
 ) -> None:
     """Register every guild-scoped Quartermaster command on the given bot tree."""
 
@@ -92,9 +165,12 @@ def register_commands(
             view=QuartermasterLauncherView(services, settings, characters, currency, loot),
         )
 
-    @bot.tree.command(name="combat", description="Open the Quartermaster to Avrae combat handoff")
+    @bot.tree.command(name="combat", description="Track table combat and hand off to Avrae")
     @app_commands.guilds(guild)
-    @app_commands.describe(action="The native Avrae combat action to prepare")
+    @app_commands.describe(
+        action="The combat action to take",
+        outcome="End combat only: an optional note on how the fight resolved",
+    )
     @app_commands.choices(
         action=[
             app_commands.Choice(name="Start combat", value="start"),
@@ -108,8 +184,30 @@ def register_commands(
             app_commands.Choice(name="Combat status", value="status"),
         ]
     )
-    async def combat(interaction: discord.Interaction, action: app_commands.Choice[str]) -> None:
-        await _send_avrae_handoff(interaction, services, settings, handoff, action.value)
+    async def combat_command(
+        interaction: discord.Interaction,
+        action: app_commands.Choice[str],
+        outcome: str | None = None,
+    ) -> None:
+        if not _in_configured_guild(interaction, settings):
+            await _send_error(interaction, "This bot is configured for a different guild.")
+            return
+        # Start and end write canonical state, so they are gated like every
+        # other mutation on this surface. The rest only render a command card.
+        if action.value in {"start", "end"} and not await _is_dm(interaction, settings):
+            await _send_error(
+                interaction,
+                "Only configured DM administrators can open or close Quartermaster combat.",
+            )
+            return
+        if action.value == "start":
+            await _open_combat(interaction, settings, combat_service)
+        elif action.value == "end":
+            await _close_combat(interaction, services, settings, combat_service, loot, outcome)
+        elif action.value == "status":
+            await _show_combat_status(interaction, settings, combat_service)
+        else:
+            await _send_avrae_handoff(interaction, settings, handoff, action.value)
 
     @bot.tree.command(name="stash", description="View the Party Stash")
     @app_commands.guilds(guild)

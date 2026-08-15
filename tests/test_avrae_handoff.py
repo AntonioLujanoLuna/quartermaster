@@ -7,8 +7,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from quartermaster.avrae_handoff import AvraeHandoffService
+from quartermaster.avrae_handoff import (
+    NATIVE_COMMANDS,
+    AvraeHandoffError,
+    AvraeHandoffService,
+    native_command,
+)
 from quartermaster.db import SQLiteStore
+from quartermaster.integration import SUPPORTED_PROVIDER_OPERATIONS
 from quartermaster.sessions import SessionService
 
 
@@ -56,3 +62,29 @@ class AvraeHandoffTests(unittest.TestCase):
         for operation_kind, command in expected.items():
             with self.subTest(operation_kind=operation_kind):
                 self.assertEqual(self.handoff.build(operation_kind, channel_id="789").command, command)
+
+    def test_an_unsupported_action_fails_as_a_handoff_error(self) -> None:
+        # The command surface only offers fixed choices, so this is reachable
+        # by the next person who adds one. It has to arrive as the error the
+        # caller already handles rather than as a provider-boundary error or a
+        # KeyError on the lookup table.
+        SessionService(self.store).start_session()
+        with self.assertRaises(AvraeHandoffError):
+            self.handoff.build("polymorph", channel_id="789")
+        with self.assertRaises(AvraeHandoffError):
+            native_command("polymorph")
+
+    def test_a_missing_channel_fails_as_a_handoff_error(self) -> None:
+        SessionService(self.store).start_session()
+        with self.assertRaises(AvraeHandoffError):
+            self.handoff.build("start", channel_id="   ")
+
+    def test_every_provider_operation_has_a_handoff_card(self) -> None:
+        # The two modules name the same actions for different reasons. If one
+        # gains an action the other has to gain it too, or the hosted fallback
+        # silently stops covering something the provider boundary accepts.
+        self.assertEqual(set(NATIVE_COMMANDS), set(SUPPORTED_PROVIDER_OPERATIONS))
+
+    def test_native_command_reads_the_table_without_touching_the_database(self) -> None:
+        self.assertEqual(native_command("end"), "!i end")
+        self.assertIsNone(native_command("status"))

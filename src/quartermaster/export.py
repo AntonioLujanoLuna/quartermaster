@@ -16,7 +16,7 @@ def render_export(store: SQLiteStore) -> str:
 
 def _render_export(connection: Any) -> str:
     active = connection.execute(
-        "SELECT session_number, started_at FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
+        "SELECT id, session_number, started_at FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
     ).fetchone()
     previous = connection.execute(
         "SELECT session_number, ended_at, where_ended FROM sessions WHERE status = 'CLOSED' ORDER BY session_number DESC LIMIT 1"
@@ -34,6 +34,17 @@ def _render_export(connection: Any) -> str:
                ON balances.owner_type = 'CHARACTER' AND balances.owner_id = characters.id
             ORDER BY characters.name, characters.id"""
     ).fetchall()
+    encounters = (
+        connection.execute(
+            """SELECT status, channel_id, opened_at, closed_at, closed_reason, outcome
+                 FROM combat_encounters
+                WHERE session_id = ?
+             ORDER BY opened_at""",
+            (active["id"],),
+        ).fetchall()
+        if active is not None
+        else []
+    )
     receipt_counts = connection.execute(
         "SELECT status, COUNT(*) AS count FROM interaction_receipts GROUP BY status ORDER BY status"
     ).fetchall()
@@ -75,6 +86,20 @@ def _render_export(connection: Any) -> str:
     if previous:
         endpoint = f"; where ended: {previous['where_ended']}" if previous["where_ended"] else ""
         lines.append(f"- Previous session: {previous['session_number']} (ended {previous['ended_at']}{endpoint}).")
+    if encounters:
+        # Combat encounters are continuity, not mechanics: when the table was in
+        # a fight and how it resolved. Avrae keeps everything that happened
+        # inside it.
+        lines.extend(["", "### Combat encounters this session", ""])
+        for row in encounters:
+            if row["status"] == "OPEN":
+                lines.append(f"- Open since {row['opened_at']} in channel {row['channel_id']}.")
+                continue
+            note = f"; outcome: {row['outcome']}" if row["outcome"] else ""
+            lines.append(
+                f"- {row['opened_at']} to {row['closed_at']} in channel {row['channel_id']}"
+                f" ({row['closed_reason']}){note}."
+            )
     lines.extend(["", "## Interaction receipts", ""])
     if receipt_counts:
         lines.extend(f"- {row['status']}: {row['count']}" for row in receipt_counts)

@@ -6,6 +6,7 @@ import uuid
 from typing import Any
 
 from .clock import iso_now
+from .combat import CombatService
 from .db import SQLiteStore
 from .events import append_event, mark_projection_dirty
 from .handles import HandleRepository
@@ -18,10 +19,17 @@ class SessionError(RuntimeError):
 
 
 class SessionService:
-    def __init__(self, store: SQLiteStore, receipts: ReceiptRepository | None = None, loot_drops: LootDropService | None = None) -> None:
+    def __init__(
+        self,
+        store: SQLiteStore,
+        receipts: ReceiptRepository | None = None,
+        loot_drops: LootDropService | None = None,
+        combat: CombatService | None = None,
+    ) -> None:
         self.store = store
         self.receipts = receipts
         self.loot_drops = loot_drops or LootDropService(store, receipts or ReceiptRepository(store), HandleRepository(store))
+        self.combat = combat or CombatService(store, receipts)
 
     def start_session(self, *, session_number: int | None = None, operation_id: str | None = None) -> dict[str, Any]:
         operation_id = operation_id or str(uuid.uuid4())
@@ -106,6 +114,9 @@ class SessionService:
             "UPDATE sessions SET status = 'CLOSED', ended_at = ?, where_ended = ? WHERE id = ? AND status = 'ACTIVE'",
             (now, where_ended, session_id),
         )
+        closed_combats = self.combat.close_session_encounters(
+            connection, session_id=session_id, operation_id=operation_id
+        )
         closed_drops = self.loot_drops.close_session_drops(connection, session_id=session_id, operation_id=operation_id)
         append_event(
             connection,
@@ -117,4 +128,10 @@ class SessionService:
         )
         mark_projection_dirty(connection, target_id="session-surface", target_type="STATE", destination=f"session:{session_id}")
         mark_projection_dirty(connection, target_id="party-stash", target_type="STATE", destination="party-inventory")
-        return {"status": "CLOSED", "session_id": session_id, "session_number": session["session_number"], "closed_drops": closed_drops}
+        return {
+            "status": "CLOSED",
+            "session_id": session_id,
+            "session_number": session["session_number"],
+            "closed_drops": closed_drops,
+            "closed_combats": closed_combats,
+        }
