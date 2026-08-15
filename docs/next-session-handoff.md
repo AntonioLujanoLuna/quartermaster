@@ -1,6 +1,6 @@
 # Next-session handoff
 
-Updated: 2026-08-14 · Schema 11
+Updated: 2026-08-15 · Schema 12
 
 ## How to use this document
 
@@ -46,11 +46,15 @@ whole current state.
 
 **Rendering.** Every Discord message is rendered within the platform's 2000-character
 limit. List surfaces drop whole lines from the end and say how many they dropped; the send
-boundary clamps anything else. `rendering.py` holds both rules.
+boundary clamps anything else. One view carries twenty-five controls, so browse and claim
+listings mint handles against that budget and name the entries they have no control for.
+`rendering.py` holds all three bounds.
 
 **Operations.** `health`, `maintenance`, `backup`, `restore`, and `requeue-events` on the
 CLI; validated timestamped backups on a schedule with retention; `/quartermaster` as the
-DM launcher. See [the runbook](runbook.md).
+DM launcher. The export is the full record every truncated surface points at: items with
+the character holding them named, open Loot Drops with what is still unclaimed, and the
+roster. See [the runbook](runbook.md).
 
 **Avrae.** Guild-scoped `/combat` has two halves. Start, End, and Status read and write
 Quartermaster's own `combat_encounters` record — session, channel, duration, outcome, and
@@ -61,8 +65,40 @@ durable but has no live caller, and its health check cannot fail on this build. 
 extension scaffold at `integrations/avrae/quartermaster_cog.py` is parked: Gate 1 was
 answered "no, for now" on 2026-08-14, and it has never been loaded in an Avrae deployment.
 
-**Checks.** 177 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Checks.** 181 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request.
+
+## Fourth correction pass on 2026-08-15
+
+Three defects, each fixed and covered by a test that fails against the old behaviour.
+
+- **A pin the bot was not allowed to make cost the Party Stash its convergence.** Pinning
+  needs Manage Messages, and a channel holds fifty pins. The pin failure was raised out of
+  `upsert_state`, so the delivery failed *after* the message was posted and the message id
+  was never recorded — which meant the next attempt sent another Party Stash rather than
+  editing the one already there. One duplicate per retry, forever, and a projection that
+  never converged: exactly the shape the previous pass fixed for stuck state targets,
+  reached through a permission nobody thinks to grant. Delivery now succeeds and the
+  failure is logged with what to repair, on every attempt, so it is not silent and the
+  surface re-pins itself the moment the permission comes back. The superseded test asserted
+  the raise; it now asserts one message and two warnings.
+
+- **Browse listed stacks it had no button for.** A stack above one offers Take 1 and Take
+  all, so twenty-five listed stacks want fifty controls and one view holds twenty-five.
+  Everything past the twelfth was rendered with nothing to press and nothing said, and the
+  Loot Drop listing had already been fixed for exactly this. Handles are now minted against
+  the control budget and only for a leading run — so the controls line up with the top of
+  the list rather than skipping a stack in the middle — and the message names the entries
+  that have none. `rendering.py` holds the component limit, because the code that mints
+  controls and the code that renders them have to agree.
+
+- **The export was not the record every surface says it is.** Each truncated list tells the
+  reader the export holds the full record. It did not: an open Loot Drop's items live
+  nowhere but `loot_drop_items` until it closes, so loot the party could still claim left no
+  trace in the document; ownership moves to a character on every take and every claim, and
+  the holder was rendered as a bare UUID; the roster appeared only for characters that
+  happened to hold currency. The export now names holders, lists open drops with what is
+  unclaimed, and carries every registered character.
 
 ## Third correction pass on 2026-08-14
 
@@ -206,7 +242,7 @@ the next session decides deliberately rather than rediscovering them.
 
 ## Not yet verified live
 
-Nothing in either correction pass has been exercised against the guild. Before the next
+Nothing in any correction pass has been exercised against the guild. Before the next
 session:
 
 1. `/stash` → `Browse`, and confirm both `Take 1` and the new `Take all` appear.
@@ -228,6 +264,14 @@ session:
 9. Revoke the bot's Send Messages permission on `#party-inventory`, watch the retry interval
    grow in the log, and confirm `health` reports `state_projections: FAILED` with the target
    named. Restore the permission and confirm it clears without operator action.
+10. Revoke Manage Messages on `#party-inventory` and grant an item. Confirm the pinned
+    projection keeps updating in place — one message, not a new one per delivery — and that
+    the log names the missing permission. Restore it and confirm the pin returns.
+11. Grant enough two-item stacks to fill the browse controls, press Browse, and confirm the
+    buttons line up with the top of the list and the closing line about entries with no
+    control reads acceptably at the table.
+12. Run `/export` mid-session with an open Loot Drop and an item a player has taken, and
+    confirm the drop, the holder's name, and the roster all read correctly.
 
 ## Live Discord setup
 

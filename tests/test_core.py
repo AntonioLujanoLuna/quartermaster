@@ -208,6 +208,37 @@ class QuartermasterCoreTests(unittest.TestCase):
                 "ownership-unregistered", handle_id=unregistered, actor_id="unregistered"
             )
 
+    def test_browse_handles_fit_the_control_budget_and_cover_a_leading_run(self) -> None:
+        """Handles must describe controls that can actually exist, in reading order.
+
+        A stack above one needs two buttons and one view holds twenty-five, so
+        minting a handle per stack promised controls the view could never
+        render. Minting them for a leading run instead keeps the controls lined
+        up with the top of the list rather than skipping a stack in the middle,
+        which reads as an item that cannot be taken at all.
+        """
+        # Granted newest first so the browse order — most recently acquired,
+        # then by name — is the same either way the tie breaks.
+        for index in reversed(range(6)):
+            self.inventory.grant_interaction(
+                f"budget-grant-{index}",
+                actor_id="dm",
+                item_name=f"Budget Relic {index}",
+                # Alternating, so the fill runs out of room on a two-control
+                # stack with one slot still free and a one-control stack behind it.
+                quantity=1 if index % 2 == 0 else 2,
+            )
+        prepared = self.inventory.prepare_take_view(actor_id="player", limit=6, control_budget=5)
+        self.assertEqual([item["item_name"] for item in prepared["items"]][:5], [f"Budget Relic {index}" for index in range(5)])
+        controls = len(prepared["handles"]) + len(prepared["take_all_handles"])
+        self.assertEqual(controls, 4)
+        controlled = [item["id"] in prepared["handles"] for item in prepared["items"]]
+        self.assertEqual(controlled, [True, True, True, False, False, False])
+        self.assertTrue(
+            set(prepared["take_all_handles"]) <= set(prepared["handles"]),
+            "a stack was offered Take all without Take 1",
+        )
+
     def test_item_operations_conserve_quantities_across_owners_and_drops(self) -> None:
         """Taking, claiming, and closing move items between holders without loss."""
         self.inventory.grant_interaction(
@@ -505,6 +536,41 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertIn("Party Stash", output)
         self.assertIn("Silvered Dagger x1", output)
         self.assertIn("Active session: 1", output)
+
+    def test_export_holds_the_record_every_truncated_surface_points_at(self) -> None:
+        """Each list surface tells the reader the export holds the full record.
+
+        It did not. An open Loot Drop's items live nowhere but `loot_drop_items`
+        until the drop closes, so the document had no trace of loot the party
+        could still claim. Ownership moves to a character on every take, and the
+        holder was rendered as a bare UUID. The roster only appeared for
+        characters that happened to hold currency.
+        """
+        self.inventory.grant_interaction(
+            "export-grant", actor_id="dm", item_name="Moonlit Blade", quantity=1
+        )
+        prepared = self.inventory.prepare_take_view(actor_id="player")
+        self.inventory.take_interaction(
+            "export-take",
+            handle_id=prepared["handles"][prepared["items"][0]["id"]],
+            actor_id="player",
+        )
+        self.loot.create_drop_interaction(
+            "export-drop", actor_id="dm", items=[("Unclaimed Idol", 3, "Temple hoard")]
+        )
+        output = render_export(self.store)
+
+        self.assertIn("Moonlit Blade x1 (held by Player Character)", output)
+        self.assertNotIn("(CHARACTER:player-character)", output)
+        self.assertIn("Unclaimed Idol: 3 unclaimed of 3", output)
+        self.assertIn("Player Character [ACTIVE]", output)
+
+    def test_export_says_so_when_there_is_no_open_loot_or_roster(self) -> None:
+        with self.store.transaction() as connection:
+            connection.execute("DELETE FROM characters")
+        output = render_export(self.store)
+        self.assertIn("- No open Loot Drops.", output)
+        self.assertIn("- No characters registered.", output)
 
     def test_treasury_adjustment_is_integer_atomic_and_replayed(self) -> None:
         first = self.currency.adjust_treasury_interaction(
@@ -1115,33 +1181,68 @@ class QuartermasterCoreTests(unittest.TestCase):
             asyncio.run(transport.check_surface_reachability())
         self.assertEqual(raised.exception.retry_after_seconds, 4.5)
 
-    def test_party_stash_pin_permission_failure_is_not_silently_ignored(self) -> None:
+    def test_party_stash_delivery_survives_a_pin_permission_failure(self) -> None:
+        """An unpinnable channel must not turn the projection into a message spammer.
+
+        Pinning needs Manage Messages. When the pin failed the delivery, the
+        message id was never recorded, so the next attempt sent another Party
+        Stash instead of editing the one already posted — one duplicate per
+        retry, forever, with the projection never converging. The pin is where
+        the surface sits; the message is the surface.
+        """
         from types import SimpleNamespace
 
         import discord
 
         class Message:
-            id = 456
-            pinned = False
+            def __init__(self, message_id: int) -> None:
+                self.id = message_id
+                self.pinned = False
+                self.edits: list[str] = []
 
             async def pin(self, *, reason: str) -> None:
                 raise discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "pin denied")
 
+            async def edit(self, *, content: str) -> None:
+                self.edits.append(content)
+
         class Channel:
+            def __init__(self) -> None:
+                self.sent: list[Message] = []
+                self.message = Message(456)
+
             async def send(self, _content: str) -> Message:
-                return Message()
+                self.sent.append(self.message)
+                return self.message
+
+            async def fetch_message(self, message_id: int) -> Message:
+                if message_id != self.message.id:
+                    raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "gone")
+                return self.message
+
+        channel = Channel()
 
         class Bot:
             async def fetch_channel(self, _channel_id: int) -> Channel:
-                return Channel()
+                return channel
 
         transport = DiscordProjectionTransport(
             Bot(),
             Settings(guild_id="123", database_path=self.db_path, party_inventory_channel_id="789"),
             self.store,
         )
-        with self.assertRaises(discord.Forbidden):
-            asyncio.run(transport.upsert_state("party-stash", "party-inventory", {"items": []}, None))
+        payload = {"items": [], "loot_drops": []}
+        with self.assertLogs("quartermaster.discord_projection", level="WARNING") as logs:
+            first = asyncio.run(transport.upsert_state("party-stash", "party-inventory", payload, None))
+            second = asyncio.run(transport.upsert_state("party-stash", "party-inventory", payload, first))
+        self.assertEqual(first, "456")
+        self.assertEqual(second, "456")
+        self.assertEqual(len(channel.sent), 1)
+        self.assertEqual(len(channel.message.edits), 1)
+        # Not silently ignored: the operator is told what to repair, every time
+        # the surface tries, so the log says so for as long as it is true.
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("Manage Messages", logs.output[0])
 
     def test_projection_runner_performs_scheduled_backup_and_surface_check(self) -> None:
         from quartermaster.discord_projection import ProjectionRunner

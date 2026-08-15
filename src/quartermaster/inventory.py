@@ -11,6 +11,7 @@ from .events import append_event, mark_projection_dirty, session_event_destinati
 from .handles import Handle, HandleRepository
 from .naming import normalize_name as _normalize_name
 from .receipts import ReceiptRepository, ReceiptResult
+from .rendering import DISCORD_VIEW_COMPONENT_LIMIT
 
 
 class InventoryError(RuntimeError):
@@ -140,15 +141,30 @@ class InventoryService:
                 ttl_seconds=300,
             )
 
-    def prepare_take_view(self, *, actor_id: str | None, limit: int = 25) -> dict[str, Any]:
+    def prepare_take_view(
+        self,
+        *,
+        actor_id: str | None,
+        limit: int = 25,
+        control_budget: int = DISCORD_VIEW_COMPONENT_LIMIT,
+    ) -> dict[str, Any]:
         """Snapshot the stash and mint the handles the browse controls will use.
 
         Take-all handles are RELATIVE and carry the quantity that was on screen,
         which is what lets a take of "everything" notice that the stash changed
         under the player and ask them to confirm the new amount instead.
+
+        A stack above one needs two controls, so the snapshot limit is not the
+        limit that matters: twenty-five stacks want fifty buttons and one view
+        holds twenty-five. Handles are therefore minted against the budget the
+        view can actually render, and only for a leading run of stacks, so the
+        controls line up with the top of the list the player is reading. The
+        caller is told which stacks got controls and can say so.
         """
         if limit <= 0:
             raise ValueError("limit must be positive")
+        if control_budget <= 0:
+            raise ValueError("control budget must be positive")
         with self.store.transaction() as connection:
             rows = connection.execute(
                 "SELECT id, item_name, quantity, provenance, version, updated_at FROM inventory_stacks WHERE owner_type = 'PARTY' AND owner_id = 'party' ORDER BY last_acquired_at DESC, item_name LIMIT ?",
@@ -164,7 +180,12 @@ class InventoryService:
             items = [dict(row) for row in rows]
             handles: dict[str, str] = {}
             take_all_handles: dict[str, str] = {}
+            remaining_controls = control_budget
             for row in rows:
+                controls_needed = 2 if int(row["quantity"]) > 1 else 1
+                if controls_needed > remaining_controls:
+                    break
+                remaining_controls -= controls_needed
                 snapshot = {"quantity": row["quantity"], "version": row["version"]}
                 handles[row["id"]] = self.handles.create_in_transaction(
                     connection,

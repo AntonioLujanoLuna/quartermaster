@@ -257,9 +257,29 @@ class DiscordProjectionTransport:
             raise
 
     async def _ensure_pinned(self, target_id: str, message: Any) -> None:
+        """Pin the Party Stash projection, without letting the pin own delivery.
+
+        Pinning needs Manage Messages, and a channel holds fifty pins. Failing
+        the delivery when the pin fails is worse than an unpinned surface in
+        both directions: the message id is never recorded, so the next attempt
+        sends a *new* message rather than editing the one just posted, and the
+        channel accumulates one duplicate Party Stash per retry for the life of
+        the misconfiguration while the projection never converges. The content
+        is the projection; the pin is where it sits. So the failure is logged on
+        every attempt — the surface re-pins itself the moment the permission
+        comes back — and delivery is allowed to succeed.
+        """
         if target_id != "party-stash" or getattr(message, "pinned", False):
             return
-        await message.pin(reason="Quartermaster permanent Party Stash projection")
+        try:
+            await message.pin(reason="Quartermaster permanent Party Stash projection")
+        except discord.HTTPException as error:
+            logger.warning(
+                "could not pin the Party Stash projection in %s: %s. "
+                "Grant Manage Messages, or unpin something if the channel is at its pin limit.",
+                getattr(message, "channel", "the party inventory channel"),
+                error,
+            )
 
     async def deliver_event(self, destination: str, event_type: str, payload: dict[str, Any]) -> None:
         channel = await self._fetch_channel(destination)

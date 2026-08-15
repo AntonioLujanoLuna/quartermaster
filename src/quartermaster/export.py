@@ -14,6 +14,21 @@ def render_export(store: SQLiteStore) -> str:
         return _render_export(connection)
 
 
+def _owner_label(row: Any, character_names: dict[str, str]) -> str:
+    """Name who holds a stack.
+
+    Ownership of an item moves to a character on every take and every claim, so
+    on a played campaign most stacks are character-held. Rendering that owner as
+    a bare UUID makes the document that is supposed to be the readable record
+    the one place the table cannot answer "who has the sword".
+    """
+    owner_id = str(row["owner_id"])
+    if row["owner_type"] == "PARTY":
+        return "Party Stash"
+    name = character_names.get(owner_id)
+    return f"held by {name}" if name else f"held by unknown character {owner_id}"
+
+
 def _render_export(connection: Any) -> str:
     active = connection.execute(
         "SELECT id, session_number, started_at FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
@@ -23,6 +38,17 @@ def _render_export(connection: Any) -> str:
     ).fetchone()
     stacks = connection.execute(
         "SELECT item_name, quantity, provenance, owner_type, owner_id FROM inventory_stacks ORDER BY item_name, id"
+    ).fetchall()
+    characters = connection.execute(
+        "SELECT id, name, discord_user_id, lifecycle FROM characters ORDER BY name, id"
+    ).fetchall()
+    character_names = {str(row["id"]): str(row["name"]) for row in characters}
+    open_drops = connection.execute(
+        """SELECT loot.id, loot.expires_at, item.item_name, item.quantity, item.remaining_quantity
+             FROM loot_drops AS loot
+             LEFT JOIN loot_drop_items AS item ON item.drop_id = loot.id
+            WHERE loot.status = 'OPEN'
+         ORDER BY loot.created_at, item.created_at, item.id"""
     ).fetchall()
     treasury = connection.execute(
         "SELECT cp, sp, ep, gp, pp FROM currency_balances WHERE owner_type = 'PARTY' AND owner_id = 'party'"
@@ -64,12 +90,41 @@ def _render_export(connection: Any) -> str:
     ]
     if stacks:
         lines.extend(
-            f"- {row['item_name']} x{row['quantity']} ({row['owner_type']}:{row['owner_id']})"
+            f"- {row['item_name']} x{row['quantity']} ({_owner_label(row, character_names)})"
             + (f" — {row['provenance']}" if row["provenance"] else "")
             for row in stacks
         )
     else:
         lines.append("- No inventory recorded yet.")
+    # Every surface that has to drop entries tells the reader this document
+    # holds the full record, so an open Loot Drop cannot be missing from it:
+    # while a drop is open its items exist nowhere else, and the only reason
+    # `/loot` truncates is that there are enough of them to matter.
+    lines.extend(["", "## Open Loot Drops", ""])
+    if open_drops:
+        current_drop: str | None = None
+        for row in open_drops:
+            drop_id = str(row["id"])
+            if drop_id != current_drop:
+                current_drop = drop_id
+                lines.append(f"- Drop {drop_id} (expires {row['expires_at']})")
+            if row["item_name"] is None:
+                lines.append("  - No items recorded on this drop.")
+                continue
+            lines.append(
+                f"  - {row['item_name']}: {row['remaining_quantity']} unclaimed of {row['quantity']}"
+            )
+    else:
+        lines.append("- No open Loot Drops.")
+    lines.extend(["", "## Characters", ""])
+    if characters:
+        lines.extend(
+            f"- {row['name']} [{row['lifecycle']}] · `{row['id']}`"
+            + (f" · Discord user {row['discord_user_id']}" if row["discord_user_id"] else "")
+            for row in characters
+        )
+    else:
+        lines.append("- No characters registered.")
     lines.extend(["", "## Treasury", ""])
     lines.append(f"- {format_currency(currency_from_row(treasury), include_electrum=True)}" if treasury else "- Treasury is not initialized.")
     if character_currency:

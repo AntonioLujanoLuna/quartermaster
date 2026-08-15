@@ -17,6 +17,11 @@ Two functions, used for two different reasons:
   the limit for content nobody thought of as a list — an error message quoting a
   long name, an event payload rendered as raw JSON — at the cost of cutting
   mid-line.
+
+The component limit lives here for the same reason: it is a platform bound, not
+a Discord-adapter detail, and the code that decides how many controls to mint
+has to agree with the code that renders them or a surface lists entries nobody
+can act on.
 """
 
 from __future__ import annotations
@@ -24,6 +29,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 DISCORD_MESSAGE_LIMIT = 2000
+
+# One Discord component view carries at most this many components.
+DISCORD_VIEW_COMPONENT_LIMIT = 25
 
 _ELLIPSIS = "\N{HORIZONTAL ELLIPSIS}"
 

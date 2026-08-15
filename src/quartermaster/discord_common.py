@@ -191,18 +191,37 @@ async def _send_deferred_backup(
         await interaction.response.send_message(message, ephemeral=True)
 
 
-def _render_stash(items: list[dict], *, total: int | None = None) -> str:
+def _render_stash(
+    items: list[dict],
+    *,
+    total: int | None = None,
+    controls: dict[str, str] | None = None,
+) -> str:
     """Render the stash, saying so when the browse view holds only part of it.
 
     `total` is the number of stacks the Party Stash actually holds. The browse
     snapshot is capped at what one component view can carry, and a player who is
     not told that reads a short list as the whole stash.
+
+    `controls` names the stacks that have a button in the view being sent with
+    this message. A stack above one costs two controls and one view holds
+    twenty-five, so a full snapshot can list stacks the view has no room for —
+    the same gap the Loot Drop listing names, and just as invisible if it is not
+    said out loud.
     """
     lines = ["**PARTY STASH**", ""]
     if not items:
         lines.append("Nothing is recorded yet.")
     else:
         lines.extend(f"• {item['item_name']} x{item['quantity']}" for item in items)
+    uncontrolled = 0 if controls is None else sum(1 for item in items if item["id"] not in controls)
+    if uncontrolled:
+        entries = "entry" if uncontrolled == 1 else "entries"
+        lines.append("")
+        lines.append(
+            f"The last {uncontrolled} {entries} above have no take control here. "
+            "Take what is showing and open this again."
+        )
     if total is not None and total > len(items):
         lines.append("")
         lines.append(f"Showing {len(items)} of {total} stacks. Take some, or ask the DM for the full export.")
