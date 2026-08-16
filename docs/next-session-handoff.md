@@ -98,8 +98,55 @@ and the unique half of 31 — are deliberately not built and are no longer liste
 work in the implementation plan; the reasoning and the cost of reversing it are recorded in
 section 2 of that plan.
 
-**Checks.** 264 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Continuity.** While no session is running, home names the last session and where it ended;
+**Last time** opens the panel that reads that endpoint back with the tail of what happened,
+rendered by `narrative.render_entry` — the same table the session log and the export go
+through. The window is the played session, bounded above by the next session's start, and the
+panel says how many earlier lines it is not showing. It is open to the whole table and links
+to the session log where one is configured.
+
+**Checks.** 273 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request.
+
+## Eleventh pass on 2026-08-16
+
+The three observations from the tenth pass, answered. Two were documents; the third was the
+one feature gap the product's own name argues for.
+
+- **A continuity companion could not tell you where you stopped.** Specification 29 was
+  built as one line on the session state projection and a paragraph in the export — the
+  pinned surface nobody reads at the start of an evening, and the document only a DM
+  downloads. The home panel, which is where every session actually begins, said "No session
+  in progress" and nothing else. The endpoint was already there: End Session asks a DM for
+  exactly one sentence and stores it on the session row, and it was being read back nowhere
+  the table looks.
+
+  Home now names the last session and where it ended, for as long as that is still the last
+  thing that happened — once the next session starts the question changes and the line goes.
+  **Last time** is the panel behind it: the endpoint, then the end of that session's ledger
+  as sentences, then whether a session is running now. `sessions.continuity` is the read;
+  `narrative.render_entry` is the renderer, moved out of the export so history is rendered
+  by one rule wherever it is read, which is the same reason `credit_stack` is one merge
+  rule. The recap is the tail rather than the head, because "where did we stop" is a
+  question about the end of an evening, and it says how many earlier lines it is not showing
+  and points at the export, like every other bounded surface here.
+
+  Deliberately not derived: "2 healing potions remain" and the rest of specification 29's
+  state bullets. Current state is on the panels that own it, and a second rendering of it
+  here would be a second thing to keep true.
+
+- **The plan described a source tree that does not exist.** It specified a directory per
+  layer — `domain/`, `application/`, `discord/` — and the code is one flat package. A reader
+  checking the plan against the repository found the first thing they looked at wrong, which
+  is how the rest of the document stops being trusted. It now records the boundaries as
+  modules and states the rule that is actually enforced: `discord_*` may import the rest,
+  nothing else may import `discord_*`.
+
+- **The release gate could be passed without anyone playing.** Every item on it was
+  answerable from CI, and nothing in this build has been exercised against the guild. "One
+  session played against the live guild" is now a gate item, pointing at the checklist
+  below, with the reason stated: a test suite cannot tell you a control is in the wrong
+  place or that a refusal reads as an accusation.
 
 ## Tenth pass on 2026-08-16
 
@@ -587,6 +634,12 @@ Panel surface:
 2b. Restart the bot with a panel open, then press something on it. It will still fail the way
     it always did — the view died with the process — and `/quartermaster` is the way back.
     Worth seeing once so it is recognised at the table rather than debugged.
+2c. End a session with a real endpoint sentence, then open `/quartermaster` as a player the
+    way you would at the start of the next evening. Home should name where you stopped, and
+    **Last time** should read as the end of that session rather than as a log dump. Whether
+    eight lines is the right number of them is a judgement only a real evening can make —
+    it is `CONTINUITY_RECAP_LINES` in `sessions.py` if it is wrong. Start the next session
+    and confirm the home line gives way to the session in progress.
 3. **Party Stash → Take something…**, and confirm both `Take 1` and `Take all` appear, that
    Refresh renews the controls after a take, and that a take reports what it moved.
 4. `Take all` on a stack the DM grows in between, and confirm the confirmation prompt reads
@@ -683,7 +736,9 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
 
 ## Next priorities
 
-1. Work through "Not yet verified live" above.
+1. Work through "Not yet verified live" above. This is now a release-gate item in the
+   implementation plan rather than a wish: everything else on that gate is answerable from
+   CI, and none of it can tell you a control is in the wrong place.
 2. Play one session on the panel and watch where the DM hesitates. The surface pass replaced
    a command list with a shape, and a shape is only right if the thing you want next is
    already on screen — how many presses a real grant, a real take, and a real end-of-session

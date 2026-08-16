@@ -553,6 +553,49 @@ def _render_characters(rows: list[dict]) -> str:
     )
 
 
+def _endpoint_summary(where_ended: str | None, *, limit: int = 90) -> str:
+    """The endpoint as one line, for a surface that has room for one line."""
+    if not where_ended:
+        return "no endpoint recorded"
+    text = " ".join(str(where_ended).split())
+    return text if len(text) <= limit else clamp_discord_content(text, limit=limit)
+
+
+def _render_last_time(continuity: dict) -> str:
+    """Where the table stopped, and what had happened by then.
+
+    This is the surface the product is named for. Everything on it is already
+    written down: the endpoint is the one narrative line End Session asks a DM
+    to type, and the recap is the end of that session's ledger read through the
+    same renderer the session log uses — so a recap cannot describe an evening
+    differently from the log the table watched it in.
+    """
+    previous = continuity["previous"]
+    lines = ["**LAST TIME**", ""]
+    if previous is None:
+        lines.append(
+            "No session has been closed yet, so there is nothing to pick up from. "
+            "Ending a session records where you stopped, and it shows up here."
+        )
+        return "\n".join(lines)
+    ended = str(previous["ended_at"] or "")[:10]
+    lines.append(f"Session {previous['session_number']}" + (f" · ended {ended}" if ended else ""))
+    lines.extend(["", "You ended:", previous["where_ended"] or "Nothing was recorded."])
+    recap = continuity["recap"]
+    if recap:
+        lines.extend(["", "What happened:"])
+        lines.extend(f"• {line}" for line in recap)
+        earlier = int(continuity["recap_total"]) - len(recap)
+        if earlier > 0:
+            entries = "line" if earlier == 1 else "lines"
+            lines.append(
+                f"({earlier} earlier {entries} not shown; the export holds the full record.)"
+            )
+    if continuity["active_session_number"] is not None:
+        lines.extend(["", f"Session {continuity['active_session_number']} is in progress now."])
+    return fit_discord_lines(lines, label="history")
+
+
 async def _require_dm(interaction: discord.Interaction, settings: Settings) -> bool:
     """Gate a DM control, and say so in one voice wherever it is pressed.
 

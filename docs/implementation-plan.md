@@ -22,25 +22,31 @@ Your Pack, Journal, Parking Lot, Downtime, faction clocks, rich continuity, and 
 
 Use a small Python service with a Discord adapter and SQLite persistence. Lock the exact Python, `discord.py`, SQLite, and component-support versions during the implementation spike; do not let library conventions leak into domain logic.
 
-Suggested boundaries:
+The boundaries below are what the code actually holds. They were planned as a directory per
+layer and built as one flat package, `src/quartermaster/`, because at this size a package per
+boundary buys nothing an import does not: what the plan is asserting is which module may call
+which, and that is enforced by review and by the import graph rather than by the tree.
 
 ```text
-src/
-  domain/          inventory, treasury, sessions, invariants, domain events
-  application/     workflows, authorization, receipts, handles, response policy
-  infrastructure/  SQLite connection, migrations, repositories, clock, IDs
-  discord/         commands, components, modals, response state machine, rendering
-  projections/     state scheduler, event outbox, Discord delivery
-  operations/      recovery, maintenance, backup, restore, export, health
-  instrumentation/ local aggregates and redacted logging
+src/quartermaster/
+  domain            inventory, loot, currency, characters, sessions, combat, events, naming
+  application       receipts, handles, response, integration, recovery, avrae_handoff
+  infrastructure    db (connection, pragmas, migrations, transactions), clock, config
+  discord           discord_commands, discord_panels, discord_views, discord_common,
+                    discord_adapter, discord_projection, rendering, narrative
+  projections       projections (state scheduler, event outbox), discord_projection
+  operations        operations (maintenance, backup, restore, health), export, __main__
 tests/
-  unit/            pure domain and policy tests
-  integration/     SQLite transaction and recovery tests
-  acceptance/      core failure gate and Discord adapter fakes
+  test_core         domain, policy, SQLite transaction, migration, and recovery tests
+  test_discord_surface  the panel surface driven the way the table drives it
+  test_integration, test_combat, test_avrae_handoff
 docs/
 ```
 
-The domain and application layers must be runnable with fake transport and clock implementations. Discord calls are adapters and never run inside a SQLite write transaction.
+Two rules are load-bearing regardless of the tree: the domain and application modules must be
+runnable with fake transport and clock implementations, and Discord calls are adapters that
+never run inside a SQLite write transaction. `discord_*` may import the rest; nothing else may
+import `discord_*`.
 
 ## Work sequence
 
@@ -135,6 +141,17 @@ Add DM launchers and the smallest useful read-only experience:
 
 Exit: restart reconstructs projections, missing Party Stash messages are recreated, stale sessions are never silently closed, and export is useful while the bot is unavailable.
 
+On "previous endpoint display": for most of this build that meant one line on a pinned state
+projection and a paragraph in the export, which is the DM's document. The product is named for
+continuity and the surface the table opens an evening on said only whether a session was
+running. Specification 29 is now built where it belongs — the home panel names where the last
+session stopped while no session is running, and a **Last time** panel reads that endpoint back
+with the tail of what happened, through the same renderer the session log uses. Nothing on it
+is authored twice: the endpoint is the one sentence End Session asks for, and the recap is
+derived from the ledger, so a recap cannot describe an evening differently from the log the
+table watched it in. The full record stays the export's job, and the panel says so when it is
+showing only part.
+
 ### 6. Shared inventory mutation
 
 Implement Grant, Take, and Loot Drop workflows in this order:
@@ -220,9 +237,11 @@ Every mutation should have tests at three levels:
 2. SQLite integration tests for transaction atomicity, constraints, migrations, receipts, handles, outbox insertion, recovery, and backup/restore.
 3. Adapter/acceptance tests with a fake Discord transport for response timing, follow-ups, edits, pins, retries, permissions, rate limits, and projection scheduling.
 
-The release gate is the specification's core failure gate plus export/restore equivalence, projection recreation, startup recovery, privacy-path checks, and measured acknowledgement latency inside the configured budget.
+The release gate is the specification's core failure gate plus export/restore equivalence, projection recreation, startup recovery, privacy-path checks, measured acknowledgement latency inside the configured budget, and one session played against the live guild.
 
-On that last item: the local metric histograms built for it were removed in August 2026, because at one table's interaction volume percentiles cannot carry meaning. The measurement is a log line per interaction carrying what its acknowledgement cost, and a warning whenever one crosses the configured internal hard deadline. That is enough to answer the gate from an evening of real play, which is the only place the answer exists; it is not enough to draw a distribution, and the plan no longer asks for one.
+On the latency item: the local metric histograms built for it were removed in August 2026, because at one table's interaction volume percentiles cannot carry meaning. The measurement is a log line per interaction carrying what its acknowledgement cost, and a warning whenever one crosses the configured internal hard deadline. That is enough to answer the gate from an evening of real play, which is the only place the answer exists; it is not enough to draw a distribution, and the plan no longer asks for one.
+
+On the played session: it is a gate item rather than a nice-to-have because every other item on this list is answerable from a test suite, and none of them can tell you that a control is in the wrong place, that a refusal reads as an accusation, or that the DM never presses the thing the design assumed they would. Nothing in this build has been exercised against the guild. The checklist that gate runs against lives in the next-session handoff, under "Not yet verified live"; a passing suite moves an item out of "unimplemented", never out of "unverified", and the plan should not be read as claiming otherwise. Until it is run, treat the gate as open regardless of what CI says.
 
 ## First implementation slice
 
@@ -244,6 +263,9 @@ This slice establishes the correctness and operational substrate before any inve
 - Replayed interactions and UI intents cannot duplicate mutations.
 - No control answers with silence: an unexpected failure, a spent or expired handle, and an
   expired view each say what happened and where to go next.
+- The table can pick up where it stopped: the endpoint End Session recorded, and what had
+  happened by then, are readable from the surface rather than only from the export.
+- One session has been played against the live guild.
 - State projections converge and event projections preserve order.
 - Export remains readable during outage.
 - The core failure gate passes on the target host.

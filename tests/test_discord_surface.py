@@ -36,6 +36,7 @@ from quartermaster.discord_panels import (
     DMToolsView,
     EstateView,
     HomeView,
+    LastTimeView,
     LifecycleView,
     LootAdminView,
     MaintenanceView,
@@ -377,6 +378,14 @@ class SurfaceTestCase(unittest.TestCase):
 
     def end_session(self, where_ended: str = "The inn") -> FakeInteraction:
         return self.submit(SessionEndModal(self.context), "dm", where_ended=where_ended)
+
+    def active_session_id(self) -> str:
+        row = self.store.connection.execute(
+            "SELECT id FROM sessions WHERE status = 'ACTIVE'"
+        ).fetchone()
+        if row is None:
+            raise AssertionError("no session is active")
+        return str(row["id"])
 
     def register(self, name: str = "Tamsin", user_id: int | None = PLAYER_ID) -> str:
         self.submit(
@@ -1172,6 +1181,117 @@ class SessionTests(SurfaceTestCase):
 
     def test_ending_with_no_active_session_says_so(self) -> None:
         self.assertEqual(self.end_session("Nowhere").text, "There is no active session.")
+
+
+class ContinuityTests(SurfaceTestCase):
+    """Where the table stopped, and what had happened by then.
+
+    End Session asks a DM for one sentence and everything else was written down
+    as it happened, so the only question is whether the table can read any of it
+    back without opening the export.
+    """
+
+    def played_a_session(self, where_ended: str = "Outside the Observatory") -> None:
+        self.register()
+        self.start_session()
+        self.grant("Rope", 2)
+        self.press(self.take_panel().view, "Take 1 Rope")
+        self.end_session(where_ended)
+
+    def last_time(self, who: str = "player") -> FakeInteraction:
+        return self.walk("Last time", who=who)
+
+    def test_home_says_nothing_about_continuity_before_a_session_has_closed(self) -> None:
+        home = self.home("player")
+        self.assertNotIn("Last time", home.text)
+        labels = [getattr(item, "label", None) for item in home.view.children]
+        self.assertNotIn("Last time", labels)
+
+    def test_home_names_where_the_table_stopped(self) -> None:
+        self.played_a_session("Outside the Observatory after opening the lower gate")
+        home = self.home("player")
+        self.assertIn(
+            "Last time · Session 1 · Outside the Observatory after opening the lower gate",
+            home.text,
+        )
+        self.assertIn("Last time", [getattr(item, "label", None) for item in home.view.children])
+
+    def test_home_stops_naming_last_time_once_the_next_session_is_running(self) -> None:
+        """Mid-session the question is what is happening, not what happened."""
+        self.played_a_session()
+        self.start_session()
+        home = self.home("player")
+        self.assertIn("Session 2 · in progress", home.text)
+        self.assertNotIn("Last time · Session 1", home.text)
+        # The panel is still there for anyone who wants it.
+        self.assertIn("Last time", [getattr(item, "label", None) for item in home.view.children])
+
+    def test_the_continuity_panel_reads_the_session_back_as_sentences(self) -> None:
+        self.played_a_session("Outside the Observatory")
+        panel = self.last_time()
+        self.assertIn("**LAST TIME**", panel.text)
+        self.assertIn("Session 1", panel.text)
+        self.assertIn("You ended:\nOutside the Observatory", panel.text)
+        self.assertIn("• DM added 2 Rope.", panel.text)
+        self.assertIn("• A player took 1 Rope. 1 remain.", panel.text)
+        self.assertIn("• Session 1 closed.", panel.text)
+        # The record a player reads is sentences, never the payloads behind them.
+        self.assertNotIn("{", panel.text)
+
+    def test_the_continuity_panel_is_open_to_the_whole_table(self) -> None:
+        self.played_a_session()
+        self.assertIn("**LAST TIME**", self.last_time("player").text)
+        self.assertIn("**LAST TIME**", self.last_time("dm").text)
+
+    def test_an_endpoint_nobody_recorded_is_said_rather_than_left_blank(self) -> None:
+        self.start_session()
+        self.sessions.end_session(self.active_session_id(), where_ended=None)
+        panel = self.last_time()
+        self.assertIn("You ended:\nNothing was recorded.", panel.text)
+
+    def test_the_recap_says_how_much_of_the_session_it_is_not_showing(self) -> None:
+        self.start_session()
+        for index in range(12):
+            self.grant(f"Rope {index}", 1)
+        self.end_session("The inn")
+        panel = self.last_time()
+        self.assertIn("earlier lines not shown", panel.text)
+        self.assertIn("the export holds the full record", panel.text)
+        # The tail is what a table wants: the end of the evening, not its start.
+        self.assertIn("• DM added 1 Rope 11.", panel.text)
+        self.assertNotIn("• DM added 1 Rope 0.", panel.text)
+
+    def test_the_recap_is_the_session_that_was_played_not_the_one_running(self) -> None:
+        self.played_a_session("The Sunken Tomb")
+        self.start_session()
+        self.grant("Lantern", 1)
+        panel = self.last_time()
+        self.assertIn("You ended:\nThe Sunken Tomb", panel.text)
+        self.assertIn("• DM added 2 Rope.", panel.text)
+        self.assertNotIn("Lantern", panel.text)
+        self.assertIn("Session 2 is in progress now.", panel.text)
+
+    def test_the_panel_points_at_the_log_the_recap_came_from(self) -> None:
+        self.played_a_session()
+        context = self._context(
+            Settings(
+                guild_id=str(GUILD_ID),
+                database_path=self.root / "quartermaster.sqlite",
+                backup_directory=self.root / "backups",
+                session_log_channel_id="6161",
+                soft_deadline_seconds=5.0,
+            )
+        )
+        links = [
+            item.url for item in LastTimeView(context).children if getattr(item, "url", None)
+        ]
+        self.assertEqual(links, [f"https://discord.com/channels/{GUILD_ID}/6161"])
+        # With no log channel configured there is nowhere to point, and the
+        # panel says nothing rather than offering a link into a void.
+        self.assertEqual(
+            [item.url for item in LastTimeView(self.context).children if getattr(item, "url", None)],
+            [],
+        )
 
 
 class TreasuryTests(SurfaceTestCase):

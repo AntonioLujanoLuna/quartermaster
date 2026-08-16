@@ -30,11 +30,13 @@ from .currency import CurrencyError, format_currency
 from .discord_common import (
     Quartermaster,
     _actor_id,
+    _endpoint_summary,
     _is_dm,
     _render_characters,
     _render_combat_closed,
     _render_combat_opened,
     _render_combat_status,
+    _render_last_time,
     _render_loot,
     _render_stash,
     _require_dm,
@@ -137,15 +139,17 @@ def _home_snapshot(context: Quartermaster, actor_id: str) -> dict[str, Any]:
     holdings = context.inventory.holdings(actor_id=actor_id)
     treasury = context.currency.view_treasury()
     purse = context.currency.purse(actor_id=actor_id)
-    with context.store.read() as connection:
-        active = connection.execute(
-            "SELECT session_number FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
-        ).fetchone()
+    # One read of continuity rather than one of the active session: home has to
+    # say whether the table is mid-session either way, and the endpoint of the
+    # last one is the first thing anybody wants at the start of an evening. The
+    # recap belongs to the Last time panel, so nothing here asks for one.
+    continuity = context.sessions.continuity(limit=1)
     return {
         "stash_count": len(items),
         "drop_count": len(drops),
         "unclaimed": sum(int(item["remaining_quantity"]) for drop in drops for item in drop["items"]),
-        "active_session_number": int(active["session_number"]) if active else None,
+        "active_session_number": continuity["active_session_number"],
+        "previous_session": continuity["previous"],
         "unresolved_estates": sum(1 for row in roster if row["lifecycle"] != "ACTIVE"),
         "treasury": treasury,
         "character": holdings["character"],
@@ -160,14 +164,19 @@ def _render_home(snapshot: dict[str, Any], *, is_dm: bool) -> str:
         if snapshot["active_session_number"] is not None
         else "No session in progress"
     )
+    previous = snapshot["previous_session"]
     stacks = snapshot["stash_count"]
     drops = snapshot["drop_count"]
-    lines = [
-        "**QUARTERMASTER**",
-        "",
-        session,
-        f"Party Stash · {stacks} {'stack' if stacks == 1 else 'stacks'}",
-    ]
+    lines = ["**QUARTERMASTER**", "", session]
+    # Where the table stopped is what an evening opens with, so it sits under
+    # the session line and only while it is still the last thing that happened:
+    # once a session is running, the panel behind Last time is the place for it.
+    if previous is not None and snapshot["active_session_number"] is None:
+        lines.append(
+            f"Last time · Session {previous['session_number']} · "
+            f"{_endpoint_summary(previous['where_ended'])}"
+        )
+    lines.append(f"Party Stash · {stacks} {'stack' if stacks == 1 else 'stacks'}")
     if drops:
         lines.append(
             f"Open Loot · {drops} {'drop' if drops == 1 else 'drops'} · {snapshot['unclaimed']} unclaimed"
@@ -201,7 +210,7 @@ def _render_home(snapshot: dict[str, Any], *, is_dm: bool) -> str:
 
 
 class HomeView(PanelView):
-    def __init__(self, context: Quartermaster, *, is_dm: bool) -> None:
+    def __init__(self, context: Quartermaster, *, is_dm: bool, has_history: bool = False) -> None:
         super().__init__(context)
         self.add_navigation(
             _open(open_stash, context),
@@ -221,6 +230,13 @@ class HomeView(PanelView):
         self.add_navigation(_open(open_treasury, context), label="Treasury", custom_id="qm:home:treasury", row=1)
         self.add_navigation(_open(open_characters, context), label="Characters", custom_id="qm:home:characters", row=1)
         self.add_navigation(_open(open_combat, context), label="Combat", custom_id="qm:home:combat", row=1)
+        if has_history:
+            # Rendered only once there is a closed session to read back. A
+            # control that opens a panel saying "nothing yet" is a control that
+            # teaches the table to stop pressing it.
+            self.add_navigation(
+                _open(open_last_time, context), label="Last time", custom_id="qm:home:last", row=2
+            )
         self.add_navigation(_open(open_home, context), label="Refresh", custom_id="qm:home:refresh", row=2)
         if is_dm:
             self.add_navigation(
@@ -245,8 +261,43 @@ async def open_home(interaction: discord.Interaction, context: Quartermaster) ->
     await _send_panel(
         interaction,
         _render_home(execution.value, is_dm=is_dm),
-        HomeView(context, is_dm=is_dm),
+        HomeView(context, is_dm=is_dm, has_history=execution.value["previous_session"] is not None),
         execution=execution,
+    )
+
+
+# Last time ------------------------------------------------------------------
+
+
+class LastTimeView(PanelView):
+    """The continuity panel: read it, or go and read the log it came from."""
+
+    def __init__(self, context: Quartermaster) -> None:
+        super().__init__(context)
+        settings = context.settings
+        if settings.session_log_channel_id:
+            # The recap is the end of the ledger; the log is all of it, in the
+            # channel the table watched it arrive in. A link is the only control
+            # here that leads out of Quartermaster, which is why it is a link.
+            self.add_item(
+                discord.ui.Button(
+                    label="Session log",
+                    style=discord.ButtonStyle.link,
+                    url=f"https://discord.com/channels/{settings.guild_id}/{settings.session_log_channel_id}",
+                )
+            )
+        self.add_navigation(_open(open_last_time, context), label="Refresh", custom_id="qm:last:refresh")
+        self.add_home()
+
+
+async def open_last_time(interaction: discord.Interaction, context: Quartermaster) -> None:
+    if not await _require_guild(interaction, context.settings):
+        return
+    execution = await _run_fast(
+        interaction, context.settings, context.sessions.continuity, ephemeral=True
+    )
+    await _send_panel(
+        interaction, _render_last_time(execution.value), LastTimeView(context), execution=execution
     )
 
 

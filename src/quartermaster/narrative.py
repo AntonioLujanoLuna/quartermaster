@@ -21,6 +21,7 @@ the per-destination FIFO gate holds every later event in that thread behind it.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -117,3 +118,20 @@ def render_event(event_type: str, payload: Mapping[str, Any]) -> str | None:
         # The payload does not carry what this renderer expects — an event
         # appended by an older build, or one whose shape moved underneath it.
         return None
+
+
+def render_entry(event_type: str, payload: Any) -> str:
+    """Render one stored ledger row, however little sense its payload makes.
+
+    A ledger row holds its payload as JSON text, and every surface that reads
+    history back — the export, the continuity recap — has to decode it, render
+    it, and survive the row that predates the renderer. Doing that in each of
+    them is how one of them ends up printing raw payloads at the table, which
+    is the defect this module was written to close.
+    """
+    try:
+        decoded = json.loads(payload)
+    except (TypeError, json.JSONDecodeError):
+        decoded = None
+    sentence = render_event(event_type, decoded) if isinstance(decoded, dict) else None
+    return sentence if sentence is not None else f"{event_type}: {payload}"
