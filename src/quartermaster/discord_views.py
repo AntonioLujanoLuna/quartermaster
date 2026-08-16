@@ -400,7 +400,13 @@ class GiveItemView(QuartermasterView):
         amount = discord.ui.Button(label="Give some…", style=discord.ButtonStyle.secondary, custom_id="qm:give:some", row=1)
         amount.callback = self._give_some
         self.add_item(amount)
-        self.add_navigation(back, label="◀ My Items", custom_id="qm:give:back", row=1)
+        # Using something up is not a give, so it sits on its own row rather
+        # than beside three controls the destination select governs: nothing
+        # about "to the Party Stash" applies to a potion that has been drunk.
+        use = discord.ui.Button(label="Use…", style=discord.ButtonStyle.danger, custom_id="qm:give:use", row=2)
+        use.callback = self._use
+        self.add_item(use)
+        self.add_navigation(back, label="◀ My Items", custom_id="qm:give:back", row=2)
 
     def _destination_name(self) -> str:
         if self.destination == PARTY_DESTINATION:
@@ -456,6 +462,9 @@ class GiveItemView(QuartermasterView):
         await interaction.response.send_modal(
             GiveQuantityModal(self.context, self.item, self.destination, self._destination_name())
         )
+
+    async def _use(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(UseItemModal(self.context, self.item))
 
 
 class GiveConfirmationView(QuartermasterView):
@@ -526,13 +535,128 @@ class GiveQuantityModal(QuartermasterModal, title="Give some of a stack"):
             await _send_error(interaction, f"That item could not be given: {error}")
 
 
+class UseItemModal(QuartermasterModal, title="Use something up"):
+    """Spend a quantity of what the caller is carrying, out of the campaign.
+
+    The quantity is typed rather than pressed. Every other quantity control on
+    this panel is a handle minted against a render, because a give can be
+    undone by giving it back and a stale one is worth a confirmation prompt;
+    this one cannot be undone by anything, so it asks the person removing the
+    items to say the number themselves.
+    """
+
+    quantity = discord.ui.TextInput(label="How many?", placeholder="1", max_length=7)
+    reason = discord.ui.TextInput(
+        label="What happened to them?", placeholder="Drunk in the tomb", required=False, max_length=200
+    )
+
+    def __init__(self, context: Quartermaster, item: dict) -> None:
+        super().__init__(context)
+        self.item = item
+        self.title = f"Use {item['item_name']}"[:45]
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            quantity = _positive_quantity(self.quantity.value)
+        except ValueError as error:
+            await _send_error(interaction, str(error))
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                self.settings,
+                lambda: self.context.inventory.consume_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    stack_id=str(self.item["id"]),
+                    quantity=quantity,
+                    reason=str(self.reason.value),
+                ),
+                ephemeral=True,
+            )
+            await _send_execution(
+                interaction, execution, _render_consumed(execution.value.logical_response), ephemeral=True
+            )
+        except InventoryError as error:
+            await _send_error(interaction, f"That could not be used up: {error}")
+
+
+class StashRemoveModal(QuartermasterModal, title="Remove from the Party Stash"):
+    """The DM's correction: take a quantity out of the shared stash for good.
+
+    `party_authorized` is only ever passed from here, after the same check
+    every other DM control makes when it is pressed. The domain refuses a
+    party-owned stack without it, so a panel left open across a role change
+    cannot spend a stale render on the one operation with no way back.
+    """
+
+    quantity = discord.ui.TextInput(label="How many?", placeholder="1", max_length=7)
+    reason = discord.ui.TextInput(
+        label="Why?", placeholder="Miscounted the grant", required=False, max_length=200
+    )
+
+    def __init__(self, context: Quartermaster, item: dict) -> None:
+        super().__init__(context)
+        self.item = item
+        self.title = f"Remove {item['item_name']}"[:45]
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _require_dm(interaction, self.settings):
+            return
+        try:
+            quantity = _positive_quantity(self.quantity.value)
+        except ValueError as error:
+            await _send_error(interaction, str(error))
+            return
+        try:
+            execution = await _run_fast(
+                interaction,
+                self.settings,
+                lambda: self.context.inventory.consume_interaction(
+                    str(interaction.id),
+                    actor_id=_actor_id(interaction),
+                    stack_id=str(self.item["id"]),
+                    quantity=quantity,
+                    reason=str(self.reason.value),
+                    party_authorized=True,
+                ),
+                ephemeral=True,
+            )
+            await _send_execution(
+                interaction, execution, _render_consumed(execution.value.logical_response), ephemeral=True
+            )
+        except InventoryError as error:
+            await _send_error(interaction, f"That could not be removed: {error}")
+
+
+def _render_consumed(response: dict) -> str:
+    if response["owner_type"] == "PARTY":
+        return (
+            f"Removed {response['quantity']} {response['item_name']} from the Party Stash. "
+            f"{response['remaining']} remain. This did not return anything to anyone."
+        )
+    return (
+        f"You used {response['quantity']} {response['item_name']}. "
+        f"{response['remaining']} still held."
+    )
+
+
 def render_give_item(item: dict, destination_name: str) -> str:
+    """The panel for one held stack: hand it on, or use it up.
+
+    The heading is the item rather than the verb, because there are now two
+    verbs. Naming what the give controls will do and what **Use…** will do on
+    the same screen is the difference between a player finding the way to
+    drink their own potion and a player concluding the only thing they can do
+    with it is give it away.
+    """
     return "\n".join(
         [
-            "**GIVE**",
+            f"**{str(item['item_name']).upper()}**",
             "",
-            f"{item['item_name']} · you hold {item['quantity']}",
-            f"Going to {destination_name}.",
+            f"You hold {item['quantity']}.",
+            f"Give → {destination_name}.",
+            "Use → gone from the campaign, on the record.",
         ]
     )
 
