@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 
 from .currency import currency_from_row, format_currency
 from .db import SCHEMA_VERSION, SQLiteStore
+from .narrative import render_event
+
+# What a reader wants from the history of a campaign with no session on record
+# is the last thing that happened, not all of it.
+_UNSCOPED_HISTORY_LIMIT = 25
 
 
 def render_export(store: SQLiteStore) -> str:
@@ -27,6 +33,60 @@ def _owner_label(row: Any, character_names: dict[str, str]) -> str:
         return "Party Stash"
     name = character_names.get(owner_id)
     return f"held by {name}" if name else f"held by unknown character {owner_id}"
+
+
+def _history(connection: Any, active: Any, previous: Any) -> tuple[list[Any], str]:
+    """Read the history of the session the table is playing.
+
+    "Recent" used to mean the last ten ledger rows in the campaign, which is a
+    few minutes of a busy evening and says nothing about where those minutes
+    sat. What a DM reads this document for — during an outage, or writing the
+    session up afterwards — is what happened tonight, so the window is the
+    played session: the active one, or the most recent closed one for as long
+    as the next has not started. `ledger_entries` carries no session, but its
+    timestamps and the session's are written by the same clock in the same
+    format, so the session's own span is the window.
+    """
+    session = active if active is not None else previous
+    if session is None:
+        rows = connection.execute(
+            "SELECT event_type, payload, created_at FROM ledger_entries ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (_UNSCOPED_HISTORY_LIMIT,),
+        ).fetchall()
+        return list(reversed(rows)), f"most recent {_UNSCOPED_HISTORY_LIMIT}"
+    span = connection.execute(
+        "SELECT session_number, started_at FROM sessions WHERE id = ?", (session["id"],)
+    ).fetchone()
+    # The window has no upper bound on purpose. The played session is the
+    # newest one there is — an active session has nothing after it, and a
+    # closed one is only "played" while no later session has started — so
+    # everything from its start belongs to it. Closing a session writes
+    # `ended_at` and appends SESSION_CLOSED from two consecutive clock reads,
+    # and bounding the window by the first would drop the second: the export
+    # of a session would be missing the line saying it ended.
+    rows = connection.execute(
+        "SELECT event_type, payload, created_at FROM ledger_entries WHERE created_at >= ? ORDER BY created_at, rowid",
+        (span["started_at"],),
+    ).fetchall()
+    return list(rows), f"session {span['session_number']}"
+
+
+def _history_line(row: Any) -> str:
+    """Render one ledger entry the way the session log renders the same event.
+
+    The export is what every truncated surface points at, so it cannot be the
+    one place events are printed as their stored JSON: those payloads carry
+    internal UUIDs and Discord user IDs, and a person reading the record of
+    their own evening should not have to decode them. An entry nothing can
+    render still appears, as its payload — losing it would be worse.
+    """
+    payload = row["payload"]
+    try:
+        decoded = json.loads(payload)
+    except (TypeError, json.JSONDecodeError):
+        decoded = None
+    sentence = render_event(row["event_type"], decoded) if isinstance(decoded, dict) else None
+    return sentence if sentence is not None else f"{row['event_type']}: {payload}"
 
 
 def _render_export(connection: Any) -> str:
@@ -79,9 +139,7 @@ def _render_export(connection: Any) -> str:
     receipt_counts = connection.execute(
         "SELECT status, COUNT(*) AS count FROM interaction_receipts GROUP BY status ORDER BY status"
     ).fetchall()
-    history = connection.execute(
-        "SELECT event_type, payload, created_at FROM ledger_entries ORDER BY created_at DESC LIMIT 10"
-    ).fetchall()
+    history, history_scope = _history(connection, active, previous)
     generated = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     lines = [
@@ -165,9 +223,9 @@ def _render_export(connection: Any) -> str:
         lines.extend(f"- {row['status']}: {row['count']}" for row in receipt_counts)
     else:
         lines.append("- No interaction receipts.")
-    lines.extend(["", "## Recent relevant history", ""])
+    lines.extend(["", f"## Recent relevant history ({history_scope})", ""])
     if history:
-        lines.extend(f"- {row['created_at']} — {row['event_type']}: {row['payload']}" for row in history)
+        lines.extend(f"- {row['created_at']} — {_history_line(row)}" for row in history)
     else:
         lines.append("- No ledger events.")
     lines.extend(["", "This export is generated from SQLite canonical state; Discord messages are disposable projections.", ""])

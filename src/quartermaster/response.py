@@ -117,7 +117,16 @@ async def execute_fast(
 
     value = await task
     controller.respond(value)
-    return FastExecutionResult(value, False, started_at=started_at)
+    # The un-deferred path is the one worth measuring. It is the common case,
+    # and it is the case that can still lose Discord's window: a deferral has
+    # already spent the acknowledgement, whereas this latency is what stands
+    # between the table and "This interaction failed" on a committed mutation.
+    return FastExecutionResult(
+        value,
+        False,
+        started_at=started_at,
+        ack_latency_ms=(monotonic() - started_at) * 1000,
+    )
 
 
 async def execute_deferred(
