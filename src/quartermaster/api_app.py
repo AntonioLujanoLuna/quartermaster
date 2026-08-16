@@ -38,7 +38,7 @@ from .api_auth import (
     TokenError,
     is_dm,
 )
-from .config import Settings
+from .config import ConfigurationError, Settings
 from .db import SCHEMA_VERSION
 from .discord_common import Quartermaster
 from .export import render_export
@@ -68,10 +68,18 @@ class TokenRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
+    """Two tokens with two different audiences.
+
+    `token` is Quartermaster's, signed here, and the only one this API checks.
+    `discord_access_token` is Discord's, and exists solely so the client can
+    call the Embedded App SDK's `authenticate()` and read the instance roster.
+    """
+
     token: str
     expires_in: int
     actor_id: str
     is_dm: bool
+    discord_access_token: str
 
 
 def _state(request: Request) -> ApiState:
@@ -139,6 +147,7 @@ async def issue_token(state: State, request: TokenRequest) -> TokenResponse:
         expires_in=state.tokens.ttl_seconds,
         actor_id=actor.id,
         is_dm=actor.is_dm,
+        discord_access_token=confirmed.access_token,
     )
 
 
@@ -273,4 +282,17 @@ def create_app(
         )
 
     app.include_router(router)
+
+    if settings.activity_dist is not None:
+        # Serving the built page from the same origin as the API is what makes
+        # one URL mapping enough, and it keeps the client's fetches
+        # same-origin rather than relying on the CORS branch above. Mounted
+        # after the router, so `/api/...` never resolves to a file.
+        from fastapi.staticfiles import StaticFiles
+
+        distribution = settings.activity_dist.expanduser()
+        if not distribution.is_dir():
+            raise ConfigurationError(f"QM_ACTIVITY_DIST is not a directory: {distribution}")
+        app.mount("/", StaticFiles(directory=str(distribution), html=True), name="activity")
+
     return app

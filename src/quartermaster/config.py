@@ -42,6 +42,7 @@ class Settings:
     discord_client_secret: str | None = None
     api_bind: str = "127.0.0.1:8080"
     activity_origin: str | None = None
+    activity_dist: Path | None = None
     session_token_seconds: int = 3600
 
     @classmethod
@@ -78,6 +79,7 @@ class Settings:
             discord_client_secret=environment.get("QM_DISCORD_CLIENT_SECRET", "").strip() or None,
             api_bind=_bind(environment.get("QM_API_BIND", "")),
             activity_origin=_optional_origin(environment.get("QM_ACTIVITY_ORIGIN", "")),
+            activity_dist=_optional_path(environment.get("QM_ACTIVITY_DIST", "")),
             session_token_seconds=_positive_int(environment, "QM_SESSION_TOKEN_SECONDS", 3600),
         )
 

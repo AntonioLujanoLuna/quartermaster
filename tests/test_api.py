@@ -14,6 +14,7 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
@@ -112,8 +113,12 @@ class ApiTestCase(unittest.TestCase):
         )
         self.identity = FakeIdentityProvider(
             {
-                "player-code": Identity(user_id=PLAYER_ID, guild_roles=("1",)),
-                "dm-code": Identity(user_id=DM_ID, guild_roles=("1", DM_ROLE_ID)),
+                "player-code": Identity(
+                    user_id=PLAYER_ID, guild_roles=("1",), access_token="discord-player-token"
+                ),
+                "dm-code": Identity(
+                    user_id=DM_ID, guild_roles=("1", DM_ROLE_ID), access_token="discord-dm-token"
+                ),
             }
         )
         self.tokens = SessionTokens(CLIENT_SECRET, ttl_seconds=3600)
@@ -154,6 +159,15 @@ class TokenExchangeTests(ApiTestCase):
     def test_the_instance_the_party_launched_rides_on_the_token(self) -> None:
         token = self.authenticate("player-code")["token"]
         self.assertEqual(self.tokens.verify(token).instance_id, "instance-1")
+
+    def test_discords_own_token_comes_back_for_the_sdk_and_authorizes_nothing_here(self) -> None:
+        """The client needs it to read the roster; this API never accepts it."""
+        body = self.authenticate("player-code")
+        self.assertEqual(body["discord_access_token"], "discord-player-token")
+        response = self.client.get(
+            "/api/stash", headers={"Authorization": f"Bearer {body['discord_access_token']}"}
+        )
+        self.assertEqual(response.status_code, 401)
 
 
 class AuthorizationTests(ApiTestCase):
@@ -250,6 +264,43 @@ class ReadSurfaceTests(ApiTestCase):
         body = self.client.get("/api/health").json()
         self.assertEqual(body["status"], "ok")
         self.assertNotIn("stash_count", body)
+
+
+class StaticSurfaceTests(ApiTestCase):
+    """Serving the built page from the same origin as the API.
+
+    One origin is what makes one URL mapping enough, so the case that matters
+    is that mounting the page does not shadow the API underneath it.
+    """
+
+    def _app_serving(self, distribution: Path) -> TestClient:
+        settings = replace(self.settings, activity_dist=distribution)
+        context = replace(self.context, settings=settings)
+        return TestClient(create_app(context, self.identity, tokens=self.tokens))
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.dist = Path(self.directory.name) / "dist"
+        self.dist.mkdir()
+        (self.dist / "index.html").write_text("<!doctype html><title>Quartermaster</title>", encoding="utf-8")
+
+    def test_the_page_is_served_at_the_root(self) -> None:
+        response = self._app_serving(self.dist).get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Quartermaster", response.text)
+
+    def test_mounting_the_page_does_not_shadow_the_api(self) -> None:
+        client = self._app_serving(self.dist)
+        self.assertEqual(client.get("/api/health").json()["status"], "ok")
+        self.assertEqual(client.get("/api/stash").status_code, 401)
+
+    def test_a_missing_build_is_a_startup_error_not_a_blank_frame(self) -> None:
+        with self.assertRaises(ConfigurationError):
+            self._app_serving(self.dist / "nowhere")
+
+    def test_without_a_build_configured_the_api_still_serves(self) -> None:
+        self.assertEqual(self.client.get("/api/health").status_code, 200)
+        self.assertEqual(self.client.get("/").status_code, 404)
 
 
 class ActivityConfigurationTests(unittest.TestCase):

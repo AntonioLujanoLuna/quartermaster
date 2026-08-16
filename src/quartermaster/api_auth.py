@@ -42,10 +42,19 @@ class IdentityError(RuntimeError):
 
 @dataclass(frozen=True)
 class Identity:
-    """What Discord says about a caller, before Quartermaster interprets it."""
+    """What Discord says about a caller, before Quartermaster interprets it.
+
+    `access_token` is Discord's, not ours, and it goes back to the client on
+    purpose. The Embedded App SDK will not answer `getInstanceConnectedParticipants`
+    — the roster that makes the party visible to itself — until the client has
+    called `authenticate()` with it. It is scoped to `identify` and
+    `guilds.members.read`, it authorizes nothing in Quartermaster, and the
+    session token is what this API actually checks.
+    """
 
     user_id: str
     guild_roles: tuple[str, ...] = ()
+    access_token: str = ""
 
 
 @dataclass(frozen=True)
@@ -222,4 +231,8 @@ class DiscordIdentityProvider:
         if not user_id:
             raise IdentityError("Discord returned a member with no user")
         roles = member.get("roles") or []
-        return Identity(user_id=str(user_id), guild_roles=tuple(str(role) for role in roles))
+        return Identity(
+            user_id=str(user_id),
+            guild_roles=tuple(str(role) for role in roles),
+            access_token=str(access_token),
+        )

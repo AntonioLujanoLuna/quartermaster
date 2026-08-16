@@ -1,6 +1,8 @@
 # Moving the table surface into a Discord Activity
 
-Status: proposed. Nothing in this document is implemented.
+Status: Stages 1 and 2 implemented, and neither has been run against the guild.
+Stage 0 — hosting — is still open, and is what Stage 2 is waiting on. Stages 3
+to 6 are proposed.
 
 ## Why
 
@@ -238,15 +240,18 @@ publicly reachable HTTPS origin with a real certificate. Decide where it runs an
 database is backed up there before writing frontend code. *Exit: an origin exists and
 serves a static page through the Discord proxy.*
 
-**Stage 1 — API layer, no frontend.** `src/quartermaster/api/` with the read endpoints, the
-token exchange, and the authorization helper. Tested with pytest against the existing
-in-memory store fixtures. *Exit: every read the panels perform is available over HTTP, with
-`actor_id` derived from a token; `pytest -q` and `ruff check .` green.*
+**Stage 1 — API layer, no frontend.** *Done.* `api_auth` (session tokens, identity),
+`api_app` (routes), `api_server` (serving next to the bot), covered by `tests/test_api.py`.
+Every read in the table above is reachable, `actor_id` comes only from a signed token, and
+the home composition moved to `snapshots` so both surfaces read one of it. *Exit met:
+`pytest -q` and `ruff check .` green.*
 
-**Stage 2 — Walking skeleton.** Entry Point command that launches the Activity, the SDK
-handshake, and one read-only screen: the Party Stash, with the participant roster down the
-side. *Exit: the party launches it in the guild's voice channel and sees the real stash and
-each other.*
+**Stage 2 — Walking skeleton.** *Built, not yet launched.* `activity/` holds the SDK
+handshake and one read-only Party Stash screen with the instance roster beside it. The
+build is served by the API itself under `QM_ACTIVITY_DIST`, so the page and its data share
+an origin and one URL mapping covers both. *Exit still open: it needs an https origin and
+a real launch in the guild — see Stage 0. The Entry Point command is not registered yet
+either; `/quartermaster` still opens the panel.*
 
 **Stage 3 — Live feed.** The `domain_events.sequence` WebSocket, with reconnect-from-cursor.
 *Exit: a grant issued from the bot appears on an open Activity screen without a refresh.*

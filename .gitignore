@@ -13,3 +13,5 @@ backups/
 quartermaster-export.md
 .env
 .env.*
+node_modules/
+activity/dist/
