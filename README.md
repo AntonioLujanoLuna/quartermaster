@@ -128,3 +128,5 @@ because two copies of it are two chances to disagree about what an event means.
 The Discord transport is intentionally an adapter boundary at this stage. No network calls occur in the core package or in a database transaction. The adapter is split into `discord_common` (services, authorization, response helpers), `discord_views` (the leaf controls that act, and the modals they open), `discord_panels` (the panels those controls sit on, and the navigation between them), `discord_commands` (the one entry point), and `discord_adapter` (bot assembly and the runtime loop).
 
 For managed Windows startup, backup/restore, health, maintenance, dead-lettered events, and degraded operation, see [the operator runbook](docs/runbook.md).
+
+That boundary is also what makes a different surface thinkable. [The Activity migration plan](docs/activity-migration-plan.md) proposes moving play into a Discord Activity — a web UI embedded in the client, where the party joins by launching it rather than by each holding a private panel — and keeping the bot for the pinned projection, the session log, and asynchronous use. It is a proposal; none of it is implemented.
