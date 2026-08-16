@@ -126,6 +126,17 @@ class QuartermasterCoreTests(unittest.TestCase):
                 (character_id, name, lifecycle),
             )
 
+    def _split(self, interaction_id: str, amounts: dict[str, int], *, actor_id: str = "dm"):
+        """Prepare and commit a split, which is the only way one happens.
+
+        Every split reads the roster twice — once to show the shares, once to
+        pay them — so there is no unguarded entry point to call here.
+        """
+        prepared = self.currency.prepare_split(actor_id=actor_id, amounts=amounts)
+        return self.currency.split_relative_interaction(
+            interaction_id, handle_id=prepared["handle_id"], actor_id=actor_id
+        )
+
     def _holding(self, owner_type: str, owner_id: str, normalized_name: str) -> int:
         row = self.store.connection.execute(
             """SELECT COALESCE(SUM(quantity), 0) AS quantity FROM inventory_stacks
@@ -178,14 +189,11 @@ class QuartermasterCoreTests(unittest.TestCase):
         )
         self.assertEqual(self._currency_total(), seeded)
 
-        handle_id = self.currency.create_relative_split_handle(actor_id="dm", amounts={"gp": 30})
-        self.currency.split_relative_interaction("conserve-relative", handle_id=handle_id, actor_id="dm")
+        self._split("conserve-relative", {"gp": 30})
         self.assertEqual(self._currency_total(), seeded)
 
-        # An absolute split across three active characters leaves indivisible remainders.
-        self.currency.split_treasury_interaction(
-            "conserve-split", actor_id="dm", amounts={"cp": 7, "sp": 13, "gp": 60, "pp": 3}
-        )
+        # A split across three active characters leaves indivisible remainders.
+        self._split("conserve-split", {"cp": 7, "sp": 13, "gp": 60, "pp": 3})
         self.assertEqual(self._currency_total(), seeded)
 
         self.characters.transition_interaction(
@@ -1140,11 +1148,7 @@ class QuartermasterCoreTests(unittest.TestCase):
         self._insert_character("c4", "Departed", lifecycle="DEPARTED")
         self.currency.adjust_treasury_interaction("split-seed", actor_id="dm", deltas={"gp": 81})
 
-        result = self.currency.split_treasury_interaction(
-            "split-1",
-            actor_id="dm",
-            amounts={"gp": 81},
-        )
+        result = self._split("split-1", {"gp": 81})
         self.assertEqual(result.logical_response["remainder"]["gp"], 1)
         self.assertEqual(result.logical_response["distributed"]["gp"], 80)
         self.assertEqual(len(result.logical_response["recipients"]), 4)
@@ -1292,7 +1296,7 @@ class QuartermasterCoreTests(unittest.TestCase):
         self._insert_character("split-c1", "Split One")
         self._insert_character("split-c2", "Split Two")
         self.currency.adjust_treasury_interaction("relative-seed", actor_id="dm", deltas={"gp": 80})
-        handle_id = self.currency.create_relative_split_handle(actor_id="dm", amounts={"gp": 80})
+        handle_id = self.currency.prepare_split(actor_id="dm", amounts={"gp": 80})["handle_id"]
         self.currency.adjust_treasury_interaction("relative-change", actor_id="dm", deltas={"gp": 1})
         with self.assertRaises(CurrencySemanticStaleness):
             self.currency.split_relative_interaction(
@@ -1310,6 +1314,41 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertEqual(confirmed.logical_response["remainder"]["gp"], 2)
         # 81 gp held, 78 gp distributed three ways, 1 gp unsplit plus a 2 gp remainder.
         self.assertEqual(self.currency.view_treasury()["gp"], 3)
+
+    def test_a_split_preview_promises_exactly_what_the_split_pays(self) -> None:
+        """The preview is the DM's basis for pressing the button, so it has to be true."""
+        self._insert_character("preview-c1", "Aria")
+        self._insert_character("preview-c2", "Borin")
+        self._insert_character("preview-c3", "Retired", lifecycle="RETIRED")
+        self.currency.adjust_treasury_interaction("preview-seed", actor_id="dm", deltas={"gp": 82})
+
+        # setUp seeds one more active character, and the retired one is not paid.
+        prepared = self.currency.prepare_split(actor_id="dm", amounts={"gp": 82})
+        self.assertEqual(
+            [recipient["name"] for recipient in prepared["recipients"]],
+            ["Aria", "Borin", "Player Character"],
+        )
+        self.assertEqual(prepared["per_recipient"]["gp"], 27)
+        self.assertEqual(prepared["remainder"]["gp"], 1)
+        # Preparing reads and mints; it does not pay.
+        self.assertEqual(self.currency.view_treasury()["gp"], 82)
+
+        committed = self.currency.split_relative_interaction(
+            "preview-commit", handle_id=prepared["handle_id"], actor_id="dm"
+        ).logical_response
+        self.assertEqual(committed["per_recipient"], prepared["per_recipient"])
+        self.assertEqual(committed["remainder"], prepared["remainder"])
+        self.assertEqual(committed["recipients"], prepared["recipients"])
+        self.assertEqual(self.currency.view_treasury()["gp"], 1)
+
+    def test_a_split_of_more_than_the_treasury_holds_is_refused_before_a_handle_exists(self) -> None:
+        self._insert_character("short-c1", "Aria")
+        self.currency.adjust_treasury_interaction("short-seed", actor_id="dm", deltas={"gp": 5})
+        with self.assertRaises(CurrencyError):
+            self.currency.prepare_split(actor_id="dm", amounts={"gp": 6})
+        self.assertEqual(
+            self.store.connection.execute("SELECT COUNT(*) FROM interaction_handles").fetchone()[0], 0
+        )
 
     def test_export_and_party_stash_projection_include_treasury(self) -> None:
         self.currency.adjust_treasury_interaction("treasury-export", actor_id="dm", deltas={"gp": 80})
@@ -2244,9 +2283,7 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.characters.create_interaction("split-a", actor_id="dm", name="Aria", discord_user_id="user-1")
         self.characters.create_interaction("split-b", actor_id="dm", name="Cade", discord_user_id="user-2")
         self.currency.adjust_treasury_interaction("split-fund", actor_id="dm", deltas={"gp": 300})
-        result = self.currency.split_treasury_interaction(
-            "split-run", actor_id="dm", amounts={"gp": 300}
-        ).logical_response
+        result = self._split("split-run", {"gp": 300}).logical_response
 
         shares: dict[str, int] = {}
         with self.store.read() as connection:

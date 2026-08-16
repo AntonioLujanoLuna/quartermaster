@@ -197,54 +197,86 @@ class CurrencyService:
         mark_projection_dirty(connection, target_id="party-stash", target_type="STATE", destination="party-inventory")
         return {"status": "ADJUSTED", "before": before, "delta": dict(deltas), "after": after, "reason": reason}
 
-    def split_treasury_interaction(
-        self,
-        interaction_id: str,
-        *,
-        actor_id: str | None,
-        amounts: Mapping[str, int],
-    ) -> ReceiptResult:
-        normalized = _validate_nonnegative_amounts(amounts, electrum_enabled=self.electrum_enabled)
-        return self.receipts.execute_fast(
-            interaction_id,
-            actor_id=actor_id,
-            response_kind="treasury-split",
-            mutation=lambda connection, operation_id: self._split_in_transaction(
-                connection, operation_id, actor_id, normalized
-            ),
-        )
+    def preview_split(self, *, amounts: Mapping[str, int]) -> dict[str, Any]:
+        """What splitting `amounts` would do against the roster as it stands now.
 
-    def create_relative_split_handle(
-        self,
-        *,
-        actor_id: str | None,
-        amounts: Mapping[str, int],
-    ) -> str:
+        Nothing is minted and nothing moves. This is what the confirmation asks
+        again with when the roster it was prepared against has since changed:
+        the share is a function of how many characters are alive, so the second
+        question has to carry the second answer, not repeat the first.
+        """
+        normalized = _validate_nonnegative_amounts(amounts, electrum_enabled=self.electrum_enabled)
+        with self.store.read() as connection:
+            return self._describe_split(connection, normalized)
+
+    def prepare_split(self, *, actor_id: str | None, amounts: Mapping[str, int]) -> dict[str, Any]:
+        """Mint the handle a split commits through, and say what it would do.
+
+        A split reads the roster twice: once to show the DM who is being paid
+        and how much each of them gets, and again when the coin actually moves.
+        A character dying in between changes every share, and the DM pressed a
+        button that promised the old ones. The handle therefore carries the
+        roster and treasury version that were on screen, and
+        `split_relative_interaction` refuses to commit against a different one
+        without a second, explicit confirmation.
+        """
         normalized = _validate_nonnegative_amounts(amounts, electrum_enabled=self.electrum_enabled)
         with self.store.transaction() as connection:
-            treasury = connection.execute(
-                "SELECT version FROM currency_balances WHERE owner_type = 'PARTY' AND owner_id = 'party'"
-            ).fetchone()
-            if treasury is None:
-                raise CurrencyError("treasury balance is missing")
-            recipients = [
-                str(row["id"])
-                for row in connection.execute(
-                    "SELECT id FROM characters WHERE lifecycle = 'ACTIVE' ORDER BY name, id"
-                ).fetchall()
-            ]
-            if not recipients:
-                raise CurrencyError("at least one active character is required")
-            return self.handles.create_in_transaction(
+            preview = self._describe_split(connection, normalized)
+            handle_id = self.handles.create_in_transaction(
                 connection,
                 workflow_type="treasury",
                 action="split-relative",
                 actor_id=actor_id,
                 payload={"amounts": normalized},
-                read_set_snapshot={"treasury_version": int(treasury["version"]), "recipients": recipients},
+                read_set_snapshot={
+                    "treasury_version": preview["treasury_version"],
+                    "recipients": [recipient["id"] for recipient in preview["recipients"]],
+                },
                 single_use=True,
                 ttl_seconds=300,
             )
+        return {"handle_id": handle_id, **preview}
+
+    def _describe_split(self, connection: Any, amounts: Mapping[str, int]) -> dict[str, Any]:
+        """The arithmetic of a split, shared by the preview and the commit.
+
+        Both go through here so a preview cannot promise a share the commit
+        would not pay.
+        """
+        treasury_row = connection.execute(
+            "SELECT cp, sp, ep, gp, pp, version FROM currency_balances WHERE owner_type = 'PARTY' AND owner_id = 'party'"
+        ).fetchone()
+        if treasury_row is None:
+            raise CurrencyError("treasury balance is missing")
+        recipients = [
+            {"id": str(row["id"]), "name": row["name"]}
+            for row in connection.execute(
+                "SELECT id, name FROM characters WHERE lifecycle = 'ACTIVE' ORDER BY name, id"
+            ).fetchall()
+        ]
+        if not recipients:
+            raise CurrencyError("at least one active character is required")
+        treasury = currency_from_row(treasury_row)
+        if any(amounts[denomination] > treasury[denomination] for denomination in CURRENCY_DENOMINATIONS):
+            raise CurrencyError("treasury does not contain enough currency")
+        share = len(recipients)
+        per_recipient = {denomination: amounts[denomination] // share for denomination in CURRENCY_DENOMINATIONS}
+        # Specification 33.1: each denomination splits independently and the
+        # indivisible remainder stays with the source rather than being debited.
+        remainder = {denomination: amounts[denomination] % share for denomination in CURRENCY_DENOMINATIONS}
+        distributed = {
+            denomination: per_recipient[denomination] * share for denomination in CURRENCY_DENOMINATIONS
+        }
+        return {
+            "treasury": treasury,
+            "treasury_version": int(treasury_row["version"]),
+            "amounts": dict(amounts),
+            "recipients": recipients,
+            "per_recipient": per_recipient,
+            "remainder": remainder,
+            "distributed": distributed,
+        }
 
     def split_relative_interaction(
         self,
@@ -309,31 +341,12 @@ class CurrencyService:
         actor_id: str | None,
         amounts: Mapping[str, int],
     ) -> dict[str, Any]:
-        treasury_row = connection.execute(
-            "SELECT cp, sp, ep, gp, pp FROM currency_balances WHERE owner_type = 'PARTY' AND owner_id = 'party'"
-        ).fetchone()
-        if treasury_row is None:
-            raise CurrencyError("treasury balance is missing")
-        characters = connection.execute(
-            "SELECT id, name FROM characters WHERE lifecycle = 'ACTIVE' ORDER BY name, id"
-        ).fetchall()
-        if not characters:
-            raise CurrencyError("at least one active character is required")
-        before = currency_from_row(treasury_row)
-        if any(amounts[denomination] > before[denomination] for denomination in CURRENCY_DENOMINATIONS):
-            raise CurrencyError("treasury does not contain enough currency")
-        per_recipient = {
-            denomination: amounts[denomination] // len(characters) for denomination in CURRENCY_DENOMINATIONS
-        }
-        remainder = {
-            denomination: amounts[denomination] % len(characters) for denomination in CURRENCY_DENOMINATIONS
-        }
-        # Specification 33.1: each denomination splits independently and the
-        # indivisible remainder stays with the source rather than being debited.
-        distributed = {
-            denomination: per_recipient[denomination] * len(characters)
-            for denomination in CURRENCY_DENOMINATIONS
-        }
+        described = self._describe_split(connection, amounts)
+        before = described["treasury"]
+        characters = described["recipients"]
+        per_recipient = described["per_recipient"]
+        remainder = described["remainder"]
+        distributed = described["distributed"]
         after = {
             denomination: before[denomination] - distributed[denomination]
             for denomination in CURRENCY_DENOMINATIONS
@@ -363,7 +376,7 @@ class CurrencyService:
                 "distributed": distributed,
                 "per_recipient": per_recipient,
                 "remainder": remainder,
-                "recipients": [{"id": character["id"], "name": character["name"]} for character in characters],
+                "recipients": characters,
                 "after": after,
             },
             destination=session_event_destination(connection),
@@ -376,7 +389,7 @@ class CurrencyService:
             "distributed": distributed,
             "per_recipient": per_recipient,
             "remainder": remainder,
-            "recipients": [{"id": character["id"], "name": character["name"]} for character in characters],
+            "recipients": characters,
             "after": after,
         }
 

@@ -57,6 +57,7 @@ from quartermaster.discord_views import (
     TakeConfirmationView,
     TreasuryAdjustModal,
     TreasuryGiveModal,
+    TreasurySplitConfirmationView,
     TreasurySplitModal,
     UseItemModal,
 )
@@ -477,6 +478,10 @@ class AuthorizationTests(SurfaceTestCase):
             "Maintenance → Health": (MaintenanceView(self.context), "Health"),
             "Treasury → Adjust…": (TreasuryView(self.context, is_dm=True), "Adjust…"),
             "Treasury → Split…": (TreasuryView(self.context, is_dm=True), "Split…"),
+            "Split preview → Split the treasury": (
+                TreasurySplitConfirmationView(self.context, "any-handle", {"gp": 1}),
+                "Split the treasury",
+            ),
             "Treasury → Give to…": (TreasuryView(self.context, is_dm=True), "Give to…"),
             "Closeout → Record spoils": (CombatCloseoutView(self.context), "Record spoils"),
         }
@@ -1045,7 +1050,14 @@ class TreasuryTests(SurfaceTestCase):
         panel = self.walk("Treasury")
         self.assertIn("0 cp · 0 sp · 101 gp · 0 pp", panel.text)
 
-        split = self.submit(TreasurySplitModal(self.context), "dm", cp=0, sp=0, gp=101, pp=0)
+        preview = self.submit(TreasurySplitModal(self.context), "dm", cp=0, sp=0, gp=101, pp=0)
+        # The preview names who is being paid, and says plainly that it has not paid them.
+        self.assertIn("Among 2 active characters: Alpha, Beta", preview.text)
+        self.assertIn("Each receives 0 cp · 0 sp · 50 gp · 0 pp", preview.text)
+        self.assertIn("Nothing has moved yet.", preview.text)
+        self.assertEqual(self.currency.view_treasury()["gp"], 101)
+
+        split = self.press(preview.view, "Split the treasury", "dm")
         self.assertIn("Split among 2 active characters", split.text)
         self.assertIn("50 gp", split.text)
         # Specification 33.1: the indivisible remainder stays with the treasury.
@@ -1116,6 +1128,62 @@ class TreasuryTests(SurfaceTestCase):
         self.adjust_treasury(gp=10)
         interaction = self.submit(TreasurySplitModal(self.context), "dm", cp=0, sp=0, gp=10, pp=0)
         self.assertIn("at least one active character is required", interaction.text)
+
+    def test_a_death_between_the_preview_and_the_split_asks_again_with_the_new_share(self) -> None:
+        """The share is a function of the roster, so the roster is part of the question.
+
+        The DM sees who is being paid and what each of them gets. If somebody
+        dies before the button is pressed, the shares the DM agreed to no longer
+        exist — so the split refuses, states the new ones, and asks again.
+        """
+        self.register("Alpha", PLAYER_ID)
+        beta = self.register("Beta", BYSTANDER_ID)
+        self.adjust_treasury(gp=100)
+
+        preview = self.submit(TreasurySplitModal(self.context), "dm", cp=0, sp=0, gp=100, pp=0)
+        self.assertIn("Each receives 0 cp · 0 sp · 50 gp · 0 pp", preview.text)
+
+        self.set_lifecycle(beta, "DEAD")
+
+        stale = self.press(preview.view, "Split the treasury", "dm")
+        self.assertIn("changed since that preview", stale.text)
+        self.assertIn("Among 1 active character: Alpha", stale.text)
+        self.assertIn("Each receives 0 cp · 0 sp · 100 gp · 0 pp", stale.text)
+        # Nothing moved on the refusal: the treasury is still whole.
+        self.assertEqual(self.currency.view_treasury()["gp"], 100)
+
+        confirmed = self.press(stale.view, "Split the treasury", "dm")
+        self.assertIn("Split among 1 active character:", confirmed.text)
+        self.assertEqual(self.currency.view_treasury()["gp"], 0)
+        balances = {
+            row["owner_id"]: row["gp"]
+            for row in self.store.connection.execute(
+                "SELECT owner_id, gp FROM currency_balances WHERE owner_type = 'CHARACTER'"
+            )
+        }
+        self.assertEqual(balances.get(beta, 0), 0)
+
+    def test_a_split_preview_can_be_left_unconfirmed_and_nothing_happens(self) -> None:
+        self.register("Alpha", PLAYER_ID)
+        self.adjust_treasury(gp=40)
+        preview = self.submit(TreasurySplitModal(self.context), "dm", cp=0, sp=0, gp=40, pp=0)
+        self.assertIn("Nothing has moved yet.", preview.text)
+        self.assertEqual(self.currency.view_treasury()["gp"], 40)
+
+    def test_a_split_cannot_be_confirmed_twice(self) -> None:
+        self.register("Alpha", PLAYER_ID)
+        self.adjust_treasury(gp=40)
+        preview = self.submit(TreasurySplitModal(self.context), "dm", cp=0, sp=0, gp=40, pp=0)
+        self.press(preview.view, "Split the treasury", "dm")
+        again = self.press(preview.view, "Split the treasury", "dm")
+        self.assertIn("HANDLE_CONSUMED", again.text)
+        self.assertEqual(self.currency.view_treasury()["gp"], 0)
+
+    def test_splitting_more_than_the_treasury_holds_is_refused_before_the_preview(self) -> None:
+        self.register("Alpha", PLAYER_ID)
+        self.adjust_treasury(gp=5)
+        interaction = self.submit(TreasurySplitModal(self.context), "dm", cp=0, sp=0, gp=10, pp=0)
+        self.assertIn("does not contain enough currency", interaction.text)
 
     def test_a_player_sees_the_treasury_but_no_controls_over_it(self) -> None:
         self.adjust_treasury(gp=3)

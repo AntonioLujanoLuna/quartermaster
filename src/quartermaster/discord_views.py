@@ -8,13 +8,15 @@ what a panel is.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import discord
 
 from .characters import CharacterError
-from .currency import CurrencyError, format_currency
+from .currency import CurrencyError, CurrencySemanticStaleness, format_currency
 from .discord_common import (
     Quartermaster,
     _actor_id,
@@ -981,7 +983,45 @@ class TreasuryAdjustModal(QuartermasterModal, title="Adjust the treasury"):
             await _send_error(interaction, f"The treasury could not be adjusted: {error}")
 
 
+def _render_split_preview(preview: dict[str, Any]) -> str:
+    """Who the split pays, and what each of them gets, before anything moves."""
+    recipients = preview["recipients"]
+    names = ", ".join(recipient["name"] for recipient in recipients)
+    noun = "character" if len(recipients) == 1 else "characters"
+    lines = [
+        f"**Split {format_currency(preview['amounts'])}**",
+        "",
+        f"Among {len(recipients)} active {noun}: {names}",
+        f"Each receives {format_currency(preview['per_recipient'])}.",
+    ]
+    if any(preview["remainder"].values()):
+        lines.append(
+            f"The treasury keeps {format_currency(preview['remainder'])}, which will not divide evenly."
+        )
+    lines.extend(["", "Nothing has moved yet."])
+    return "\n".join(lines)
+
+
+def _render_split_result(response: dict[str, Any]) -> str:
+    recipients = len(response["recipients"])
+    noun = "character" if recipients == 1 else "characters"
+    return (
+        f"Split among {recipients} active {noun}: "
+        f"{format_currency(response['per_recipient'])} each."
+    )
+
+
 class TreasurySplitModal(QuartermasterModal, title="Split the treasury"):
+    """Collect the amounts, then show the shares before any coin moves.
+
+    Submitting used to be the split. The share each character gets depends on
+    how many are alive, and the DM cannot see the roster from inside a modal —
+    so a death between opening this and pressing submit silently changed
+    everyone's share and the first anyone knew of it was the receipt. The modal
+    now prepares the split and names the recipients; the button on the preview
+    is what commits it.
+    """
+
     cp = discord.ui.TextInput(label="Copper", placeholder="0", required=False, max_length=12)
     sp = discord.ui.TextInput(label="Silver", placeholder="0", required=False, max_length=12)
     gp = discord.ui.TextInput(label="Gold", placeholder="0", required=False, max_length=12)
@@ -1001,20 +1041,83 @@ class TreasurySplitModal(QuartermasterModal, title="Split the treasury"):
             execution = await _run_fast(
                 interaction,
                 self.settings,
-                lambda: self.context.currency.split_treasury_interaction(
-                    str(interaction.id), actor_id=_actor_id(interaction), amounts=amounts
+                lambda: self.context.currency.prepare_split(
+                    actor_id=_actor_id(interaction), amounts=amounts
                 ),
                 ephemeral=True,
             )
-            response = execution.value.logical_response
-            await _send_execution(
+        except CurrencyError as error:
+            await _send_error(interaction, f"The treasury could not be split: {error}")
+            return
+        preview = execution.value
+        await _send_execution(
+            interaction,
+            execution,
+            _render_split_preview(preview),
+            ephemeral=True,
+            view=TreasurySplitConfirmationView(self.context, preview["handle_id"], amounts),
+        )
+
+
+class TreasurySplitConfirmationView(QuartermasterView):
+    """The button that actually moves the coin.
+
+    Constructed twice on the unhappy path: once against the roster the DM was
+    shown, and once — with `confirm_current` set — against the roster as it is
+    now, after the first attempt found it had changed.
+    """
+
+    def __init__(
+        self,
+        context: Quartermaster,
+        handle_id: str,
+        amounts: dict[str, int],
+        *,
+        confirm_current: bool = False,
+    ) -> None:
+        super().__init__(context)
+        self.handle_id = handle_id
+        self.amounts = amounts
+        self.confirm_current = confirm_current
+
+    @discord.ui.button(label="Split the treasury", style=discord.ButtonStyle.danger, custom_id="qm:confirm-split")
+    async def confirm(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await _require_dm(interaction, self.settings):
+            return
+        try:
+            execution = await _run_fast(
                 interaction,
-                execution,
-                f"Split among {len(response['recipients'])} active characters: "
-                f"{format_currency(response['per_recipient'])} each.",
+                self.settings,
+                lambda: self.context.currency.split_relative_interaction(
+                    str(interaction.id),
+                    handle_id=self.handle_id,
+                    actor_id=_actor_id(interaction),
+                    confirm_current=self.confirm_current,
+                ),
                 ephemeral=True,
             )
-        except CurrencyError as error:
+            await _send_execution(
+                interaction, execution, _render_split_result(execution.value.logical_response), ephemeral=True
+            )
+        except CurrencySemanticStaleness:
+            # Off the event loop like every other database call, but not through
+            # `_run_fast`: the acknowledgement for this interaction may already
+            # have been spent deferring the attempt that just refused, and a
+            # second deferral of the same interaction is an error.
+            try:
+                preview = await asyncio.to_thread(self.context.currency.preview_split, amounts=self.amounts)
+            except CurrencyError as error:
+                await _send_error(interaction, f"The treasury could not be split: {error}")
+                return
+            await _send_staleness_prompt(
+                interaction,
+                "The treasury or the roster changed since that preview. This is the split "
+                f"against the party as it stands now.\n\n{_render_split_preview(preview)}",
+                TreasurySplitConfirmationView(
+                    self.context, self.handle_id, self.amounts, confirm_current=True
+                ),
+            )
+        except (HandleError, CurrencyError) as error:
             await _send_error(interaction, f"The treasury could not be split: {error}")
 
 
