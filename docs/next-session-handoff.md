@@ -29,7 +29,8 @@ releases any projection claim left behind by the previous run. Mutations are add
 opaque single-use handles carrying the read set they were rendered against.
 
 **Domain.** Party Stash grant/browse/take/give, Loot Drops (create, claim, manual close,
-session close, absolute expiry), sessions, integer-only treasury with adjust/split/give,
+session close, absolute expiry), sessions, integer-only treasury with adjust, give, and a
+split that previews its recipients and their shares and commits on a second press,
 character registration and lifecycle, and explicit belongings resolution for non-active
 characters. Taking from the stash and claiming a drop both transfer ownership to the
 actor's registered active character and both require one. **My Items** is the way back: a
@@ -89,8 +90,47 @@ durable but has no live caller, and its health check cannot fail on this build. 
 extension scaffold at `integrations/avrae/quartermaster_cog.py` is parked: Gate 1 was
 answered "no, for now" on 2026-08-14, and it has never been loaded in an Avrae deployment.
 
-**Checks.** 252 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Item shape.** Every item is a quantity stack. Unique item instances — specification 30.2
+and the unique half of 31 — are deliberately not built and are no longer listed as pending
+work in the implementation plan; the reasoning and the cost of reversing it are recorded in
+section 2 of that plan.
+
+**Checks.** 258 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request.
+
+## Ninth pass on 2026-08-16
+
+One missing confirmation, the last of the three read-set gaps, covered by tests that fail
+against the old behaviour.
+
+- **The split was the one relative operation with nothing in front of it.** `Take all` and
+  `Give all` both mean a number the actor was looking at, so both are minted against the
+  render and both ask again when it moves. A split is the same shape one level up: it means
+  "a share each", and the share is a function of how many characters are alive. The
+  machinery for it existed — `split_relative_interaction` compares the roster and treasury
+  version the handle was minted against — and nothing minted the handle, so the modal
+  committed against whatever the roster happened to be at submit time. A character dying
+  between the DM reading the roster and pressing Split changed everyone's share silently,
+  and the first anyone knew of it was the receipt.
+
+  Submitting the modal now prepares rather than pays. `prepare_split` mints the handle and
+  returns what it would do; the panel names the recipients, the share each of them gets,
+  what will not divide, and says plainly that nothing has moved. The button on that preview
+  is what commits. If the roster or the treasury changed in between, the split refuses,
+  recomputes against the party as it stands, and asks again with the *new* shares — the
+  second question has to carry the second answer, or it is just the first question repeated.
+
+  This is a confirmation in front of a DM control, which the surface had avoided until now:
+  every other DM action commits on submit. It is here because a split is the one DM action
+  whose meaning is set by state the DM cannot see from inside the modal, and because there
+  is no way back — putting 81 gp back after a wrong split is a debit per character, one at
+  a time, through a panel that only the holder can drive.
+
+  The unguarded entry point is gone rather than kept beside the guarded one:
+  `split_treasury_interaction` had no callers left once the modal moved, and leaving a
+  second way to split that skips the roster check is how the check stops being true.
+  `_describe_split` is now the one piece of arithmetic the preview and the commit share, so
+  a preview cannot promise a share the commit would not pay.
 
 ## Eighth pass on 2026-08-16
 

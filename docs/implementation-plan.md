@@ -69,7 +69,7 @@ Implement ordered migrations and a single database access module that applies pr
 Initial tables should cover:
 
 - schema metadata and migrations;
-- items/stacks and unique item instances;
+- items/stacks (see the note below on unique item instances);
 - characters and lifecycle state;
 - sessions;
 - ledger and append-only domain events;
@@ -81,6 +81,10 @@ Initial tables should cover:
 - backup/maintenance outcomes and local aggregate counters.
 
 Encode uniqueness, non-negative quantities, one active session, and active ownership constraints in the database wherever practical, then enforce them again in application/domain code.
+
+On unique item instances, specification 30.2 and the unique half of 31: not built, deliberately, and this plan no longer asks for them. Every item in the campaign is a quantity stack merged by `credit_stack` under the identity in specification 30.3. The only thing 30.2 carries that a stack does not is per-object state — attunement and per-instance notes — and nothing on the surface reads either; the table tracks attunement on character sheets, which is where the players already look for it. A second item shape would have to be threaded through every path items travel, and each of those paths is where the quantity arithmetic that the core failure gate covers actually lives.
+
+The cost of the decision is that reversing it is a migration, not a feature: unique objects that were recorded as stacks have no per-object identity to recover. If attunement, per-object notes, or one-of-a-kind provenance ever need to be canonical rather than remembered at the table, that is the evidence this gate wants, and the work belongs in section 9 rather than here.
 
 Exit: migrations create a fresh database, a transaction rollback leaves no partial mutation, and a consistent database export can be produced.
 
