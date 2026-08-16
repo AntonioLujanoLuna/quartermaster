@@ -39,6 +39,7 @@ from .discord_common import (
     _render_stash,
     _require_dm,
     _require_guild,
+    _rerender,
     _run_deferred,
     _run_fast,
     _send_deferred_backup,
@@ -109,10 +110,15 @@ def _open(panel: Panel, context: Quartermaster) -> Opener:
 
 
 class PanelView(QuartermasterView):
-    """A view that is somewhere the caller navigated to rather than a control."""
+    """A view that is somewhere the caller navigated to rather than a control.
+
+    Every panel is reachable from home, so an expired one always has somewhere
+    to send the caller: the way back out of an expiry is the same door they
+    came in by, rendered against state as it stands rather than as it stood.
+    """
 
     def __init__(self, context: Quartermaster) -> None:
-        super().__init__(context, timeout=PANEL_TIMEOUT)
+        super().__init__(context, timeout=PANEL_TIMEOUT, reopen=_open(open_home, context))
 
     def add_home(self, *, row: int | None = None) -> None:
         self.add_navigation(
@@ -803,7 +809,7 @@ class LifecycleView(PanelView):
             self.character_id = select.values[0]
             for option in select.options:
                 option.default = option.value == self.character_id
-            await interaction.response.edit_message(content=self._render(), view=self)
+            await _rerender(interaction, self._render(), self)
 
         return callback
 
@@ -812,7 +818,7 @@ class LifecycleView(PanelView):
             self.lifecycle = select.values[0]
             for option in select.options:
                 option.default = option.value == self.lifecycle
-            await interaction.response.edit_message(content=self._render(), view=self)
+            await _rerender(interaction, self._render(), self)
 
         return callback
 
@@ -937,7 +943,7 @@ class EstateView(PanelView):
             self.character_id = select.values[0]
             for option in select.options:
                 option.default = option.value == self.character_id
-            await interaction.response.edit_message(content=self.render(), view=self)
+            await _rerender(interaction, self.render(), self)
 
         return callback
 
@@ -946,7 +952,7 @@ class EstateView(PanelView):
             self.destination = select.values[0]
             for option in select.options:
                 option.default = option.value == self.destination
-            await interaction.response.edit_message(content=self.render(), view=self)
+            await _rerender(interaction, self.render(), self)
 
         return callback
 

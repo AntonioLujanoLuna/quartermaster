@@ -178,6 +178,36 @@ Complete the maintainer surface:
 
 Run the extended resilience suite as each corresponding feature lands. Pause Scene is not enabled by default; if enabled later, verify that actor identity is absent from every durable path, including receipts, events, outbox, projections, logs, and analytics.
 
+### 8a. Surface lifetime
+
+The plan was written for a command surface and the product is now one command and a panel,
+so the constraint that governs the surface is one the sequence above never names: **a
+component view has a lifetime, and a control that has outlived it is a dead end.** Past its
+timeout a view stops listening, discord.py never dispatches the press, nothing acknowledges
+the interaction, and Discord tells the player "This interaction failed" — the same sentence
+a crash produces, on the one surface where the difference between "refused" and "unknown"
+is the whole point.
+
+Every view therefore retires itself: on timeout it replaces its own controls with the
+reason they are gone and, where the view knows a way back, one control that renders the
+panel again out of current state. Three constraints hold it together:
+
+- A view is bound to the interaction that rendered it, because an ephemeral message can be
+  edited only through the interaction or webhook that produced it.
+- Navigation replaces a panel in place, so several views share one message across an
+  evening. Only the view currently on screen may retire itself; an earlier one timing out
+  later must leave the message alone.
+- Reopening mints new state. A take panel's controls are single-use handles, so its way
+  back is a fresh render, never a restored view.
+
+Deliberately not adopted: specification 22's 90-second confirmation TTL. A confirmation's
+real deadline is the handle it carries, which lives five minutes, and expiring the view
+first would take away a confirmation the table could still have answered.
+
+Still a dead end: a panel that outlives the process. Nothing in memory survives a restart,
+so an old ephemeral message keeps controls that answer to nobody, and the interaction that
+would edit it is gone. Reopening from `/quartermaster` is the only route back.
+
 ### 9. Evidence-gated expansion
 
 After real table use, evaluate each candidate independently using its zero-code baseline, observed friction, smallest experiment, success signal, and removal criterion. Do not create a combined "full feature" milestone.
@@ -212,6 +242,8 @@ This slice establishes the correctness and operational substrate before any inve
 - The table can play without Quartermaster.
 - Canonical state survives Discord delivery failure and restart.
 - Replayed interactions and UI intents cannot duplicate mutations.
+- No control answers with silence: an unexpected failure, a spent or expired handle, and an
+  expired view each say what happened and where to go next.
 - State projections converge and event projections preserve order.
 - Export remains readable during outage.
 - The core failure gate passes on the target host.

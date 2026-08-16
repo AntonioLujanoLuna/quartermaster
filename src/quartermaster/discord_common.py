@@ -184,6 +184,31 @@ async def _run_fast(
     return execution
 
 
+def _bind_view(
+    view: discord.ui.View | None,
+    editor: Callable[..., object],
+    *,
+    screen: int | None = None,
+) -> None:
+    """Hand a view the route back to the message it was just sent on.
+
+    A Quartermaster view retires its own controls when it expires, and an
+    ephemeral message can only be edited through the interaction or webhook
+    that produced it — which only the code doing the sending knows. This is
+    duck-typed because the response helpers live below the views that use
+    them: `discord_views` imports this module, not the other way round.
+    """
+    bind = getattr(view, "bind", None)
+    if bind is None:
+        return
+    bind(editor, screen=screen)
+
+
+def _message_id(message: object) -> int | None:
+    identifier = getattr(message, "id", None)
+    return int(identifier) if identifier is not None else None
+
+
 async def _send_execution(
     interaction: discord.Interaction,
     execution: FastExecutionResult,
@@ -197,9 +222,13 @@ async def _send_execution(
         kwargs["view"] = view
     content = clamp_discord_content(message)
     if execution.deferred:
-        await interaction.followup.send(content, **kwargs)
+        sent = await interaction.followup.send(content, wait=view is not None, **kwargs)
+        if view is not None:
+            _bind_view(view, sent.edit, screen=_message_id(sent))
     else:
         await interaction.response.send_message(content, **kwargs)
+        if view is not None:
+            _bind_view(view, interaction.edit_original_response)
 
 
 async def _send_panel(
@@ -221,13 +250,37 @@ async def _send_panel(
     """
     body = clamp_discord_content(content)
     deferred = execution is not None and execution.deferred
-    if not deferred and getattr(interaction, "message", None) is not None and not interaction.response.is_done():
+    message = getattr(interaction, "message", None)
+    if not deferred and message is not None and not interaction.response.is_done():
         await interaction.response.edit_message(content=body, view=view)
+        _bind_view(view, interaction.edit_original_response, screen=_message_id(message))
         return
     if interaction.response.is_done():
-        await interaction.followup.send(body, view=view, ephemeral=True)
+        sent = await interaction.followup.send(body, view=view, ephemeral=True, wait=True)
+        _bind_view(view, sent.edit, screen=_message_id(sent))
     else:
         await interaction.response.send_message(body, view=view, ephemeral=True)
+        _bind_view(view, interaction.edit_original_response)
+
+
+async def _rerender(
+    interaction: discord.Interaction,
+    content: str,
+    view: discord.ui.View,
+) -> None:
+    """Redraw a view on the message it is already on, and renew its way back.
+
+    A select that changes what a panel says redraws the same view rather than
+    navigating, so the view outlives the interaction it was first sent on.
+    Rebinding here keeps the route it would use to retire itself pointed at the
+    most recent interaction, whose token is the one still alive.
+    """
+    await interaction.response.edit_message(content=clamp_discord_content(content), view=view)
+    _bind_view(
+        view,
+        interaction.edit_original_response,
+        screen=_message_id(getattr(interaction, "message", None)),
+    )
 
 
 async def _run_deferred(

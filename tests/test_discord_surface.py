@@ -47,6 +47,7 @@ from quartermaster.discord_panels import (
 )
 from quartermaster.discord_views import (
     CharacterAddModal,
+    ExpiredView,
     GiveConfirmationView,
     GiveCurrencyModal,
     GiveQuantityModal,
@@ -74,8 +75,12 @@ OWNER_ID = 11
 PLAYER_ID = 22
 BYSTANDER_ID = 33
 CHANNEL_ID = 555
+#: Every component interaction in these tests comes off the same ephemeral
+#: message, because navigation replaces the panel in place.
+SCREEN_ID = 7777
 
 _interaction_ids = itertools.count(100_000)
+_message_ids = itertools.count(700_000)
 
 
 class FakeResponse:
@@ -113,12 +118,36 @@ class FakeResponse:
         self.modal = modal
 
 
+class FakeMessage:
+    """A message that has already been sent, and can still be edited.
+
+    A view retires its own controls when it expires, which means editing the
+    message it landed on rather than answering an interaction. Both routes
+    Discord offers for that — the interaction's original response and a
+    followup webhook message — end here.
+    """
+
+    def __init__(self) -> None:
+        self.id = next(_message_ids)
+        self.edits: list[tuple[str | None, dict]] = []
+
+    async def edit(self, *, content: str | None = None, view: object = None) -> FakeMessage:
+        self.edits.append((content, {"view": view}))
+        return self
+
+
 class FakeFollowup:
     def __init__(self) -> None:
         self.messages: list[tuple[str | None, dict]] = []
+        self.sent: list[FakeMessage] = []
 
-    async def send(self, content: str | None = None, **kwargs: object) -> None:
+    async def send(
+        self, content: str | None = None, *, wait: bool = False, **kwargs: object
+    ) -> FakeMessage | None:
         self.messages.append((content, dict(kwargs)))
+        message = FakeMessage()
+        self.sent.append(message)
+        return message if wait else None
 
 
 class FakeInteraction:
@@ -141,7 +170,15 @@ class FakeInteraction:
         self.client = SimpleNamespace()
         # A component interaction carries the message its control belongs to,
         # which is what lets a panel replace itself instead of stacking a new one.
-        self.message = SimpleNamespace(id=7777) if component else None
+        self.message = SimpleNamespace(id=SCREEN_ID) if component else None
+        self.edits: list[tuple[str | None, dict]] = []
+
+    async def edit_original_response(
+        self, *, content: str | None = None, view: object = None
+    ) -> FakeMessage:
+        """Edit what this interaction already answered with, as Discord allows."""
+        self.edits.append((content, {"view": view}))
+        return FakeMessage()
 
     @property
     def replies(self) -> list[tuple[str | None, dict]]:
@@ -269,10 +306,24 @@ class SurfaceTestCase(unittest.TestCase):
         run(self.command("quartermaster")(interaction))
         return interaction
 
+    def dispatch(self, view: discord.ui.View, item, interaction: FakeInteraction) -> FakeInteraction:
+        """Press one control the way discord.py does: check, then call.
+
+        `interaction_check` is where a view learns which message it is on, and
+        a harness that skipped it would let an expired panel wipe the one that
+        replaced it without any test noticing.
+        """
+
+        async def dispatched() -> None:
+            if await view.interaction_check(interaction):
+                await item.callback(interaction)
+
+        run(dispatched())
+        return interaction
+
     def press(self, view: discord.ui.View, label: str, who: str = "player") -> FakeInteraction:
         interaction = self.caller(who, component=True)
-        run(self.control(view, label).callback(interaction))
-        return interaction
+        return self.dispatch(view, self.control(view, label), interaction)
 
     def choose(
         self,
@@ -284,8 +335,7 @@ class SurfaceTestCase(unittest.TestCase):
         select = self.select(view, custom_id)
         select._values = list(values)
         interaction = self.caller(who, component=True)
-        run(select.callback(interaction))
-        return interaction
+        return self.dispatch(view, select, interaction)
 
     def walk(self, *labels: str, who: str = "player") -> FakeInteraction:
         """Open Quartermaster and press a path of controls, as a player would."""
@@ -459,6 +509,91 @@ class NavigationTests(SurfaceTestCase):
         interaction = self.dm(component=True)
         run(modal.on_error(interaction, RuntimeError("database is locked")))
         self.assertIn("could not record that", interaction.text)
+
+
+class ExpiryTests(SurfaceTestCase):
+    """What a panel does when it stops listening.
+
+    A view has a timeout, and past it discord.py never sees the press: nothing
+    acknowledges the interaction and Discord shows its bare "This interaction
+    failed" — the same sentence a crash produces, which is exactly the
+    ambiguity every other path in this surface exists to avoid.
+    """
+
+    def expire(self, view: discord.ui.View) -> None:
+        run(view.on_timeout())
+
+    def test_an_expired_panel_retires_its_controls_and_says_why(self) -> None:
+        home = self.home("player")
+        self.expire(home.view)
+        content, kwargs = home.edits[-1]
+        self.assertEqual(content, "This view has expired.")
+        self.assertIsInstance(kwargs["view"], ExpiredView)
+
+    def test_the_way_back_out_of_an_expired_panel_is_current_state(self) -> None:
+        """Reopening renders the panel again rather than restoring the old one."""
+        self.register()
+        home = self.home("player")
+        self.expire(home.view)
+        expired = home.edits[-1][1]["view"]
+
+        self.grant("Rope", 2)
+        reopened = self.press(expired, "Open again")
+        self.assertIn("**QUARTERMASTER**", reopened.text)
+        self.assertIn("Party Stash · 1 stack", reopened.text)
+
+    def test_an_expired_panel_never_wipes_the_panel_that_replaced_it(self) -> None:
+        """Navigation replaces a panel in place, so several views share a message.
+
+        Each of them times out on its own schedule long after the player moved
+        on. A retirement notice written over the panel they are actually
+        looking at would be a worse failure than the dead control it replaces.
+        """
+        home = self.home("player")
+        stash = self.press(home.view, "Party Stash")
+        self.expire(home.view)
+        self.assertEqual(home.edits, [])
+
+        # The panel on screen still retires itself when its own turn comes.
+        self.expire(stash.view)
+        self.assertEqual(stash.edits[-1][0], "This view has expired.")
+
+    def test_an_expired_take_panel_reopens_with_handles_that_work(self) -> None:
+        """Its controls were single-use, so the way back has to mint new ones."""
+        character_id = self.register()
+        self.grant("Rope", 2)
+        panel = self.take_panel()
+        spent = {item.custom_id for item in panel.view.children}
+
+        self.expire(panel.view)
+        expired = panel.edits[-1][1]["view"]
+        reopened = self.press(expired, "Open again")
+        renewed = {item.custom_id for item in reopened.view.children}
+        self.assertNotEqual(spent, renewed)
+
+        taken = self.press(reopened.view, "Take 1 Rope")
+        self.assertEqual(taken.text, "You took 1 Rope. 1 remain.")
+        self.assertEqual(self.held(character_id), {"Rope": 1})
+
+    def test_an_expired_confirmation_names_the_command_it_has_no_control_for(self) -> None:
+        """A confirmation is not a place; there is nothing to reopen it as."""
+        self.register()
+        self.grant("Rope", 2)
+        panel = self.take_panel()
+        self.grant("Rope", 5)
+        stale = self.press(panel.view, "Take all Rope")
+        confirmation = stale.view
+        self.assertIsInstance(confirmation, TakeConfirmationView)
+
+        self.expire(confirmation)
+        content, kwargs = stale.edits[-1]
+        self.assertEqual(content, "This view has expired. Run `/quartermaster` to open it again.")
+        self.assertIsNone(kwargs["view"])
+        self.assertEqual(self.stash_quantities(), {"Rope": 7})
+
+    def test_a_view_that_was_never_sent_expires_quietly(self) -> None:
+        """There is no message to write on, and nothing to tell anyone about."""
+        self.expire(HomeView(self.context, is_dm=False))
 
 
 class AuthorizationTests(SurfaceTestCase):

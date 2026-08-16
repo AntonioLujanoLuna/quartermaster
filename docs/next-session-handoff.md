@@ -69,7 +69,10 @@ its caller may press, and every DM control checks again when it is pressed, beca
 outlives the render that built it. Nothing is identified by hand: characters, players, held
 items, and open drops all come from select menus built out of canonical state. Navigation
 replaces the panel in place; a result is a separate ephemeral message, so reporting a
-committed mutation never depends on a re-render succeeding.
+committed mutation never depends on a re-render succeeding. A view that reaches its timeout —
+ten minutes for a panel, five for a control, matching the handles it carries — retires its own
+controls, says it has expired, and offers **Open again** where it knows the way back. Only the
+view currently on the message may do that; the panels it replaced expire silently.
 
 **Operations.** `health`, `maintenance`, `backup`, `restore`, and `requeue-events` on the
 CLI; validated timestamped backups on a schedule with retention; **DM Tools → Maintenance**
@@ -95,8 +98,51 @@ and the unique half of 31 — are deliberately not built and are no longer liste
 work in the implementation plan; the reasoning and the cost of reversing it are recorded in
 section 2 of that plan.
 
-**Checks.** 258 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Checks.** 264 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request.
+
+## Tenth pass on 2026-08-16
+
+One dead end, on the only surface the table uses, covered by tests that fail against the old
+behaviour.
+
+- **Every panel became a trap after ten minutes, and said nothing about it.** A component
+  view has a timeout — ten minutes for a panel, five for the control views whose handles
+  live that long — and past it discord.py stops listening. The press is never dispatched,
+  nothing acknowledges the interaction, and Discord shows "This interaction failed": the
+  same sentence a crash produces. That ambiguity is the one the fifth pass closed for
+  unexpected exceptions with `QuartermasterView.on_error`, and the timeout is the same hole
+  reached by a far more ordinary route — a panel left open while the table argues about
+  which door to open. A player pressing Take on it cannot tell a refusal from a mutation
+  that committed and lost its reply, which is exactly what "nothing was changed unless you
+  were told otherwise" exists to prevent.
+
+  `on_timeout` now retires the controls: the message becomes the reason they are gone, plus
+  an **Open again** control where the view knows a way back. Reopening renders the panel
+  from current state rather than restoring the old one — a take panel's controls are
+  single-use handles, so the only honest way back onto it is a fresh mint, which is why the
+  reopen for a take or a claim is its own Refresh.
+
+  Two things had to be true for this to be safe. A view can only edit the message it landed
+  on through the interaction that rendered it, so `bind` hands it that route at the moment
+  it is sent; `_send_panel`, `_send_execution`, `_rerender`, and the staleness prompt are
+  the four places that send one. And navigation replaces a panel in place, so several views
+  share a message over an evening and each times out on its own schedule long after the
+  player moved on: `_ON_SCREEN` records which view the message is showing, claimed at render
+  and again in `interaction_check`, and a view that no longer owns its message expires
+  silently. Writing a retirement notice over the panel someone is actually using would be a
+  worse failure than the dead control it replaces.
+
+  Deliberately not adopted: specification 22's 90-second confirmation TTL. A confirmation's
+  real deadline is the handle it carries, and expiring the view first takes away an answer
+  the table could still have given. A confirmation has no reopen either — it is not a place
+  — so its notice names `/quartermaster` instead.
+
+  Still a dead end, and knowingly: a panel that outlives the process. Views live in memory,
+  so a restart leaves an old ephemeral message holding controls that answer to nobody and no
+  interaction alive to edit it. The same is true of a view pressed often enough to refresh
+  its timer past the fifteen-minute life of the token that rendered it; that edit fails and
+  is logged. Both end where they began — reopen with `/quartermaster`.
 
 ## Ninth pass on 2026-08-16
 
@@ -532,6 +578,15 @@ Panel surface:
    **DM Tools** and the DM's does.
 2. Press through every panel and confirm each one replaces the message in place rather than
    leaving a column of ephemeral replies, and that the way back always works.
+2a. Open a panel, leave it for longer than its timeout — ten minutes for a panel, five for a
+    take or give view — then look at it. It should read as expired with a single **Open
+    again** control rather than still showing buttons. Press it and confirm the panel comes
+    back live. Then navigate two panels deep, wait out the timeout of the ones you left, and
+    confirm the panel on screen is untouched: this is the failure that would look like
+    Quartermaster wiping a panel out from under the table.
+2b. Restart the bot with a panel open, then press something on it. It will still fail the way
+    it always did — the view died with the process — and `/quartermaster` is the way back.
+    Worth seeing once so it is recognised at the table rather than debugged.
 3. **Party Stash → Take something…**, and confirm both `Take 1` and `Take all` appear, that
    Refresh renews the controls after a take, and that a take reports what it moved.
 4. `Take all` on a stack the DM grows in between, and confirm the confirmation prompt reads
