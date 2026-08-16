@@ -1,8 +1,11 @@
 # Moving the table surface into a Discord Activity
 
 Status: Stages 1, 2, 3, and 4 implemented, and none of them has been run against
-the guild. Stage 0 — hosting — is still open, and is what every stage past 1 is
-waiting on. Stages 5 and 6 are proposed.
+the guild. Stage 0 — hosting — is answered: a Cloudflare tunnel in front of the
+loopback API, with the process, the database, and the backups staying on the
+machine they are on today. The procedure is in [the runbook](runbook.md); what
+remains is to run it. Stages 5 and 6 are proposed and should wait for the first
+real launch.
 
 ## Why
 
@@ -288,11 +291,25 @@ only when the Activity is enabled — the export CLI must keep running without t
 
 Each stage is independently shippable and leaves the bot working.
 
-**Stage 0 — Hosting.** Not code, and the real blocker. Today Quartermaster is one process
-with a SQLite file and a Windows startup script (`docs/runbook.md`). An Activity needs a
-publicly reachable HTTPS origin with a real certificate. Decide where it runs and how the
-database is backed up there before writing frontend code. *Exit: an origin exists and
-serves a static page through the Discord proxy.*
+**Stage 0 — Hosting.** Not code, and it was the real blocker. *Decided: a named Cloudflare
+tunnel in front of the API, which keeps binding loopback.* The alternative was a VPS, and
+the reason it lost is the second half of the question rather than the first: an origin is
+easy to buy, but moving the process moves the SQLite file off the machine the entire
+backup, restore, and supervisor story is written against, and that rewrite is the expensive
+part of the decision. The tunnel answers the origin and leaves the database, the schedule,
+and the runbook exactly where they are — and if the table decides after one session that
+the Activity is not what it wants, it is uninstalled rather than decommissioned.
+
+What that costs, stated rather than discovered: a third-party dependency on the play path,
+and uptime bounded by one machine being on. Both are acceptable for a table that plays on
+a schedule and already depends on that machine for the bot. If the Activity turns out to be
+the surface the table lives in, a VPS becomes worth its migration; that is a decision to
+make with evidence rather than before.
+
+The procedure — building the bundle, the named tunnel, the ingress rule that must not match
+on hostname, and what the table sees when the tunnel is down — is in
+[the runbook](runbook.md). *Exit: an origin exists and serves a static page through the
+Discord proxy. Not yet run.*
 
 **Stage 1 — API layer, no frontend.** *Done.* `api_auth` (session tokens, identity),
 `api_app` (routes), `api_server` (serving next to the bot), covered by `tests/test_api.py`.
@@ -303,9 +320,10 @@ the home composition moved to `snapshots` so both surfaces read one of it. *Exit
 **Stage 2 — Walking skeleton.** *Built, not yet launched.* `activity/` holds the SDK
 handshake and one read-only Party Stash screen with the instance roster beside it. The
 build is served by the API itself under `QM_ACTIVITY_DIST`, so the page and its data share
-an origin and one URL mapping covers both. *Exit still open: it needs an https origin and
-a real launch in the guild — see Stage 0. The Entry Point command is not registered yet
-either; `/quartermaster` still opens the panel.*
+an origin and one URL mapping covers both. *Exit still open: it needs a real launch in the
+guild, which is now a procedure to run rather than a question to answer. Enabling
+Activities in the portal creates the Entry Point command that launches it; `/quartermaster`
+keeps opening the panel.*
 
 **Stage 3 — Live feed.** *Built, not yet launched.* `api_live` holds the pump and the
 subscriptions, `/api/live` is the socket, and `activity/src/live.js` is the client that
@@ -313,7 +331,7 @@ reconnects from its cursor and answers a notification by refetching. The screen 
 it is live, because a surface that reads live has to say when it has stopped. *Exit still
 open: `tests/test_api.py` proves a grant made through the service layer reaches an open
 socket, which is the criterion as far as a test can carry it — the rest of it is a grant
-issued from the bot in the guild appearing on a screen in Discord, and that needs Stage 0.*
+issued from the bot in the guild appearing on a screen in Discord, and that needs a launch.*
 
 Session tokens last an hour and an evening does not, so the client now re-runs the handshake
 when one is refused rather than going quiet — on the socket and on the reads both. That gap
@@ -333,14 +351,19 @@ the domain's answer and the end of it. The sentence still travels in `detail`, w
 reads already put theirs.
 
 *Exit still open: a full session's player actions running through the Activity with a
-ledger indistinguishable from a bot-driven session needs a session, which needs Stage 0.
+ledger indistinguishable from a bot-driven session needs a session played on it.
 `tests/test_api.py` proves the ledger half — that a take through the API lands the same
 rows a take through a panel does, that a quantity moving under a press is asked about
 rather than substituted, that one player's handle and one player's idempotency key are not
 another's, and that a take made on the Activity reaches the other screens at the table.*
 
 **Stage 5 — DM surface.** Grant, drops, session start/end, combat, corrections,
-maintenance. *Exit: a DM runs a session end to end without opening a panel.*
+maintenance. *Held until Stages 2 to 4 have been launched and played on.* Mutations were
+cheap to build blind because they add no domain code and every route is a call a panel
+already makes. The DM surface is not that: it is a judgement about what a DM should have in
+front of them mid-session, and the only thing that answers it is watching one hesitate.
+Building it now would be guessing at a layout for a screen nobody has seen.
+*Exit: a DM runs a session end to end without opening a panel.*
 
 **Stage 6 — Retire the panels.** Delete what Stage 4 and 5 replaced. Keep the entry point,
 the projection, and a deliberately small async surface (see below). *Exit:
@@ -350,17 +373,17 @@ Stages 1–3 are the ones worth doing before committing to the rest. If the prox
 handshake, or the hosting turns out to be intolerable, that is knowable by the end of
 Stage 2 and costs no domain changes to abandon.
 
-Stage 4 was nevertheless built before Stage 0 was answered, which is out of order and
-worth saying rather than leaving to be inferred. The previous pass recorded the objection
-in its own words — "Stage 4 adds mutations to a transport nobody has launched, which is the
-wrong order" — and it still stands: hosting is a decision about where this runs and how the
-database is backed up there, and no amount of code answers it. What Stage 4 did cost was
-bounded on purpose. It added no domain code, changed no service, and every route on it is
-the call a panel already makes; if the hosting question is answered "not this", the whole
-of it is deleted without touching anything that stores an item. What it buys is that the
-questions the transport can still get wrong — where a handle is minted, what a refusal
-looks like to a client, whose idempotency key is whose — are answered now, and are the kind
-of thing that is far more expensive to discover during a session than before one.
+Stage 4 was nevertheless built before Stage 0 was answered, which was out of order and is
+worth keeping on the record now that the order has stopped mattering. The objection stood
+at the time — "Stage 4 adds mutations to a transport nobody has launched" — and the reason
+it was tolerable is that its cost was bounded on purpose: no domain code, no changed
+service, every route a call a panel already makes, so an answer of "not this" deleted the
+whole of it without touching anything that stores an item. Stage 0 came back "this", so the
+bet is paid and the questions only a transport can get wrong — where a handle is minted,
+what a refusal looks like to a client, whose idempotency key is whose — were answered
+before a session rather than during one. That does not generalise, which is why Stage 5 is
+held: the same argument does not survive contact with a stage whose cost is a layout
+judgement rather than a route table.
 
 ## What the bot keeps forever
 
@@ -386,13 +409,19 @@ Activity also renders. The README's own argument against duplicated rendering �
 of it are two chances to disagree" — applies here. Keeping the retained surface small is
 not tidiness, it is the mitigation.
 
-**Mobile.** Activities run on mobile Discord, but in a cramped viewport. If a meaningful
-share of the table plays from a phone, the layout constraint is real and should be
-established in Stage 2 rather than discovered in Stage 5.
+**Mobile.** *Retired as a risk.* This table plays on PC, so the cramped-viewport constraint
+does not gate anything and the layout is not designed around it. The mobile checks stay on
+the verification list because a phone is what somebody reaches for when they are not at
+their desk, but a layout that is wrong there is a defect to fix later rather than a reason
+to hold a stage. Nothing in the screens assumes a wide viewport on purpose; nothing has
+confirmed one is not assumed by accident either.
 
 **Stack surface.** This adds a JavaScript toolchain, a web server, TLS, and a deployment
 story to a project that currently has one dependency and runs from a shell. That cost is
-paid once, but it is paid by whoever operates it, and the runbook grows accordingly.
+paid once, but it is paid by whoever operates it, and the runbook grows accordingly. The
+tunnel is the newest part of it and the part most likely to be the thing that is wrong on
+an evening when nothing else is: it is a second service to install, to keep running, and to
+suspect.
 
 **Verification.** Only required to be publicly discoverable in the App Launcher. A single
 campaign server installs it directly and skips this. Worth confirming before assuming

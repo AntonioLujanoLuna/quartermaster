@@ -133,11 +133,61 @@ refused. A player takes, gives, uses, claims, and moves coin from it; a DM regis
 character from the roster and gives coin from the treasury. Everything else a DM does is
 still a panel.
 
+How it is served is decided and not yet done: a named Cloudflare tunnel in front of the
+loopback API, chosen over a VPS because the process, the database, the backup schedule, and
+the supervisor all stay on the machine they are on today — the origin was never the
+expensive half of that question. [The runbook](runbook.md) holds the procedure, including
+the one setting that fails invisibly: Discord's proxy rewrites the `Host` header, so a
+`cloudflared` ingress rule keyed on hostname serves a browser and refuses Discord.
+
 **Checks.** 348 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request, and CI builds the Activity bundle — with `VITE_DISCORD_CLIENT_ID`
 set, which matters: without it the client id is statically undefined, `boot()` returns on
 its first line, and Vite tree-shakes the entire application out of the bundle it just
 proved compiles.
+
+## Fourteenth pass on 2026-08-16
+
+Decisions rather than code. Stage 0 had been the blocker through four built stages, and it
+was never a thing to implement.
+
+- **Hosting: a named Cloudflare tunnel, not a VPS.** The origin was the cheap half of the
+  question. The expensive half is that moving the process moves the SQLite file off the
+  machine the entire backup, restore, and supervisor story is written against, and a VPS
+  buys uptime by asking for that rewrite up front. The tunnel leaves all of it in place and
+  exposes one loopback port through a service that can be stopped. What it costs is a
+  third-party dependency on the play path and uptime bounded by one machine — acceptable
+  for a table that already depends on that machine for the bot, and revisitable with
+  evidence if the Activity turns out to be where the table lives.
+
+- **The code needed nothing.** Worth recording, because it is the test of the boundary the
+  plan claimed. The API already binds loopback, `QM_ACTIVITY_DIST` already serves the page
+  same-origin so one URL mapping covers both, and the dev server already strips `/.proxy`
+  exactly as Discord's proxy does — so one build behaves the same in development and behind
+  the real thing. Stage 0 turned out to be a runbook section and a portal setting.
+
+- **The failure that does not look like itself.** Discord's proxy rewrites the `Host`
+  header. A `cloudflared` ingress rule keyed on hostname — which is the shape every example
+  of a tunnel uses — matches when a browser asks and stops matching when Discord asks, so
+  the page loads perfectly outside the client and returns a gateway error inside it. A
+  single catch-all rule is correct either way, and it is in the runbook because the symptom
+  points at the build.
+
+- **Mobile is retired as a risk.** The table plays on PC. The mobile checks stay on the
+  verification list, demoted: a phone is what somebody reaches for away from their desk, so
+  a bad layout there is a defect to fix rather than a stage to hold.
+
+- **Stage 5 is held, and so is Stage 6's shape.** Stage 4 was built before Stage 0 was
+  answered and the bet paid, but it was safe for a specific reason — no domain code, every
+  route a call a panel already makes — and that reason does not carry to a surface whose
+  cost is a layout judgement. Both wait on one session played on what exists.
+
+- **One stale entry removed.** "Observed but not acted on" claimed the Discord Split
+  control skips the relative-split check. It does not: `discord_views.py` prepares the split
+  and commits through `split_relative_interaction`, with a staleness prompt that re-previews
+  against the current roster, and `split_treasury_interaction` no longer exists. The gap was
+  closed and the note outlived it, which is the drift this document's own rules exist to
+  prevent.
 
 ## Thirteenth pass on 2026-08-16
 
@@ -735,17 +785,9 @@ Also corrected:
 
 ## Observed but not acted on
 
-Neither of these is a defect; both are capability that exists without a caller, recorded so
-the next session decides deliberately rather than rediscovering them.
+This is capability that exists without a caller, recorded so the next session decides
+deliberately rather than rediscovering it.
 
-- **The relative treasury split has no producer in the Discord layer.**
-  `create_relative_split_handle` and `split_relative_interaction` implement a split that
-  notices the active recipient set changed since the DM looked and asks for confirmation.
-  The Split control calls `split_treasury_interaction` directly and skips that check, so a
-  character who died between the DM reading the roster and pressing Split silently changes
-  everyone's share. This is the same shape as the take-all gap, and as the give gap the
-  surface pass closed, but the fix is a product decision — it puts a confirmation step in
-  front of a DM control — so it is left for the table to choose.
 - **`local_metric_buckets` (migration 8) has no reader and no writer.** The
   histograms it was built for were removed deliberately on 2026-08-14: at one
   table's interaction volume percentiles cannot carry meaning. The table stays
@@ -819,12 +861,18 @@ Panel surface:
 12. **Combat**, and confirm the handoff cards are open to players while Start and End are not
     even rendered for them.
 
-Activity surface. None of it has run against Discord, and none of it can until Stage 0 of
-[the migration plan](activity-migration-plan.md) — an https origin Discord will frame — is
-answered. Everything here is a question the test suite cannot ask:
+Activity surface. None of it has run against Discord. It no longer waits on a decision —
+Stage 0 is answered and [the runbook](runbook.md) holds the procedure — so this list is now
+work rather than a blocked queue. Everything here is a question the test suite cannot ask,
+and items 23 to 26 are the ones that decide whether the transport is real; run them before
+a session rather than during one:
 
 23. Launch the Activity from a voice channel in the guild and confirm the handshake
     completes, the Party Stash renders, and the roster names who is actually present.
+    Before that, load the tunnel's hostname in an ordinary browser: it should serve the
+    page. A page that loads there and fails inside Discord is the `Host` header — the
+    `cloudflared` ingress rule is matching on hostname and Discord's proxy rewrites it.
+    That is the one failure on this list that looks like a broken build and is not.
 24. With two clients open, grant an item from `/quartermaster` and confirm both screens
     change without anyone touching them, and that the header says `Live` on both. This is
     Stage 3's exit criterion, and the half of it a test cannot reach.
@@ -834,9 +882,11 @@ answered. Everything here is a question the test suite cannot ask:
 26. Leave a screen open for longer than `QM_SESSION_TOKEN_SECONDS` — an hour by default —
     with the table quiet, then grant something. The screen should still update, because the
     client re-ran the handshake rather than going quiet.
-27. Launch it on mobile Discord. The layout constraint is real and Stage 2 said it should be
-    established here rather than discovered in Stage 5; the socket's behaviour when the
-    client backgrounds the app is the other half of that.
+27. Launch it on mobile Discord. *Not a gate: this table plays on PC.* Worth one look
+    because a phone is what somebody reaches for away from their desk, and a layout that is
+    unusable there is a defect to fix later rather than a reason to hold anything. The
+    socket's behaviour when the client backgrounds the app is the more interesting half,
+    and it is the half that would also affect a laptop that sleeps.
 28. Watch the log through an evening for live-feed lines. What is worth knowing is whether
     the wake-on-commit ever misses — the 30-second poll would cover it silently — and whether
     a reset is ever issued to a client that was merely slow rather than gone.
@@ -850,9 +900,10 @@ answered. Everything here is a question the test suite cannot ask:
 31. **Use…** something and confirm the prompt reads as a decision rather than a dialog box —
     it is the one action with no way back, and the reason it asks is that the panel's modal
     asked. Then check the session log renders the reason.
-32. Give coin from the Treasury screen and confirm the amount fields are usable on a phone.
-    Four number inputs in a row is the layout most likely to be wrong in a cramped viewport,
-    and it is worth finding out at the same time as item 27.
+32. Give coin from the Treasury screen and confirm the four amount fields are usable — on
+    PC, which is where it matters, and on a phone at the same time as item 27 if one is to
+    hand. Four number inputs in a row is the layout most likely to be wrong in a cramped
+    viewport, and the least likely to be wrong in a wide one.
 33. Type a quantity into a row, then have somebody else change something so the screen
     redraws underneath you. What you typed should still be there and the caret should not
     have moved. `state.inputs` and the focus restore in `draw()` are what make that true,
@@ -931,13 +982,19 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
    observation is worth more than any further combat feature.
 4. Choose evidence-based latency and freshness budgets from observed play if the current
    estimates prove wrong.
-5. Answer Stage 0 of the Activity migration — where it runs, on what https origin, and how
-   the database is backed up there. This is now the only thing standing between four built
-   stages and a table using them, and it is the one item on this list that no amount of code
-   moves: Stages 1 to 4 are built and none of them has been framed by Discord once. Stage 5,
-   the DM surface, should wait for it. Stage 4 did not, which was a judgement about what is
-   cheap to build blind and what is not — mutations are cheap because they add no domain
-   code, and the DM surface is where guessing starts to cost.
+5. Stand up the tunnel and launch the Activity once. Stage 0 is answered — a named
+   Cloudflare tunnel in front of the loopback API, procedure in [the runbook](runbook.md) —
+   so what is left is an evening's setup, not a decision. Four built stages have never been
+   framed by Discord, and items 23 to 26 above are what turn that from an assumption into a
+   fact. Do this before playing on it: item 23 in particular fails in a way that looks like
+   a broken build and is a routing rule.
+6. Then hold. Stage 5, the DM surface, waits for a session played on Stages 2 to 4. Stage 4
+   was built blind on purpose and the bet paid, but the argument that made it safe —
+   no domain code, every route a call a panel already makes — does not carry to a stage
+   whose real cost is deciding what a DM should have in front of them mid-session. What the
+   retained bot surface should be (Stage 6) waits on the same evidence, and for the same
+   reason: it is a question about what people reach for outside a voice channel, and nobody
+   has been in one yet.
 
 The Avrae extension spike is no longer a priority: Gate 1 was answered "no, for now", so
 self-hosting, the Cog, provider gateway implementations, and combat reference projections

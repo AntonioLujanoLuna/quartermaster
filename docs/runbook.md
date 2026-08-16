@@ -16,6 +16,67 @@ Do not run a second ad-hoc bot process against the same database. The database p
 
 Use the stop wrapper for intentional shutdown. It signals the supervisor, stops the full supervised process tree, and removes the PID/stop markers. If the bot exits unexpectedly, inspect `logs/quartermaster.supervisor.log` before restarting manually.
 
+## Serving the Activity
+
+The Activity is a second surface served by a second server inside the same process. It stays off until `QM_DISCORD_CLIENT_ID` and `QM_DISCORD_CLIENT_SECRET` are set, so a table that has not enabled it operates exactly as the rest of this document describes, and FastAPI need not be installed.
+
+Discord frames the page from `<application_id>.discordsays.com` and will only load an `https` origin. The API binds loopback — `QM_API_BIND`, default `127.0.0.1:8080` — and is never exposed directly; a Cloudflare tunnel holds the certificate and the public hostname in front of it. That is the whole of the hosting decision, and what it buys is that nothing else moves: the process, the database, the backups, and every command below stay on this machine, and the only thing reachable from outside is one loopback port through a process that can be stopped.
+
+Build the page first. The API serves it from the same origin as its own routes, which is what keeps every fetch same-origin and one URL mapping sufficient:
+
+```powershell
+cd activity
+npm ci
+npm run build
+```
+
+`VITE_DISCORD_CLIENT_ID` must be in the repository-root `.env` before that build. Vite replaces it at build time, so without it the boot sequence is statically unreachable and the bundler removes the whole application — a successful build of nothing.
+
+Then the values the bot reads:
+
+```powershell
+$env:QM_DISCORD_CLIENT_ID = "..."
+$env:QM_DISCORD_CLIENT_SECRET = "..."
+$env:QM_ACTIVITY_DIST = "activity\dist"
+$env:QM_API_BIND = "127.0.0.1:8080"
+```
+
+Leave `QM_ACTIVITY_ORIGIN` unset. It exists to open CORS for a frontend served from somewhere else; serving the built page from `QM_ACTIVITY_DIST` means there is no second origin to open it for.
+
+### The tunnel
+
+`cloudflared tunnel --url http://localhost:8080` is enough to see it work once, and prints a hostname that changes on every run. For a table that plays on a schedule, use a named tunnel so the hostname outlives the process: the portal's URL mapping names that hostname, and a mapping re-typed before every session is a session that starts late.
+
+```powershell
+cloudflared tunnel login
+cloudflared tunnel create quartermaster
+cloudflared tunnel route dns quartermaster qm.example.com
+cloudflared service install
+```
+
+The ingress rule in `C:\Users\<you>\.cloudflared\config.yml` must forward to the API without matching on hostname:
+
+```yaml
+tunnel: quartermaster
+credentials-file: C:\Users\<you>\.cloudflared\<tunnel-id>.json
+ingress:
+  - service: http://127.0.0.1:8080
+```
+
+This is the one setting that is not obvious and does not fail obviously. Discord's proxy rewrites the `Host` header when it forwards a request, so an ingress rule keyed on `hostname: qm.example.com` matches when a browser asks directly and stops matching when Discord asks. The symptom is a page that loads perfectly in a browser and returns a gateway error inside the client, which reads as a broken deployment rather than as a routing rule. A single catch-all rule is correct either way.
+
+Install it as a service so it returns with the machine, the same way the bot's supervisor does.
+
+### In the developer portal
+
+Activities enabled, and one URL mapping: prefix `/`, target the tunnel's hostname. The client requests `/.proxy/api/...`, the proxy strips that prefix, and the API receives `/api/...` — which is also what the Vite dev server does, so one build behaves the same in both places. No OAuth2 redirect is needed; the Activity takes its code grant through the SDK rather than through a browser redirect. Enabling Activities creates the Entry Point command that launches it. `/quartermaster` continues to open the panel.
+
+### When the tunnel is down
+
+Nothing that stores an item depends on it. The bot, the panels, the pinned projection, the session log, the CLI, and the scheduled backups are all on the far side of loopback and do not notice. What the table sees is the Activity failing to load, or an open screen whose header says `Reconnecting…` — that is the header doing its job rather than a fault to chase. Fall back to `/quartermaster` for the evening and read `cloudflared`'s own log. `health` is silent about the tunnel on purpose: it reports on the database and on Discord delivery, and neither is affected by a page nobody can reach.
+
+Backups are unchanged by any of this. The database never leaves the machine, so *Backup and restore* below remains the whole story and the tunnel adds nothing to restore.
+
 ## Health and maintenance
 
 Run these commands from the repository root:
