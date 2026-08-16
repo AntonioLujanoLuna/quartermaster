@@ -38,6 +38,11 @@ class Settings:
     backup_retention_count: int = 7
     backup_interval_seconds: int = 86_400
     discord_surface_health_max_age_seconds: int = 300
+    discord_client_id: str | None = None
+    discord_client_secret: str | None = None
+    api_bind: str = "127.0.0.1:8080"
+    activity_origin: str | None = None
+    session_token_seconds: int = 3600
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str]) -> Settings:
@@ -69,7 +74,30 @@ class Settings:
             discord_surface_health_max_age_seconds=_positive_int(
                 environment, "QM_DISCORD_SURFACE_HEALTH_MAX_AGE_SECONDS", 300
             ),
+            discord_client_id=_optional_id(environment.get("QM_DISCORD_CLIENT_ID", ""), "QM_DISCORD_CLIENT_ID"),
+            discord_client_secret=environment.get("QM_DISCORD_CLIENT_SECRET", "").strip() or None,
+            api_bind=_bind(environment.get("QM_API_BIND", "")),
+            activity_origin=_optional_origin(environment.get("QM_ACTIVITY_ORIGIN", "")),
+            session_token_seconds=_positive_int(environment, "QM_SESSION_TOKEN_SECONDS", 3600),
         )
+
+    def require_activity(self) -> tuple[str, str]:
+        """The credentials the Activity's token exchange cannot run without.
+
+        Kept off `require_discord_token` because the bot and the export CLI
+        both have to keep starting for a table that has not enabled the
+        Activity, and a required-everywhere secret is how that stops being
+        true.
+        """
+        if not self.discord_client_id:
+            raise ConfigurationError("QM_DISCORD_CLIENT_ID is required to serve the Activity")
+        if not self.discord_client_secret:
+            raise ConfigurationError("QM_DISCORD_CLIENT_SECRET is required to serve the Activity")
+        return self.discord_client_id, self.discord_client_secret
+
+    @property
+    def activity_enabled(self) -> bool:
+        return bool(self.discord_client_id and self.discord_client_secret)
 
     def require_discord_token(self) -> str:
         if not self.discord_token:
@@ -123,6 +151,31 @@ def _optional_id(raw: str, name: str) -> str | None:
         return None
     if not value.isdigit() or int(value) <= 0:
         raise ConfigurationError(f"{name} must be a positive numeric Discord ID")
+    return value
+
+
+def _bind(raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        return "127.0.0.1:8080"
+    host, separator, port = value.rpartition(":")
+    if not separator or not host or not port.isdigit() or not 0 < int(port) < 65_536:
+        raise ConfigurationError("QM_API_BIND must be host:port")
+    return value
+
+
+def _optional_origin(raw: str) -> str | None:
+    """The origin Discord's proxy loads the Activity from.
+
+    Required to be https because the client runs inside Discord, which will not
+    load a mixed-content frame, and an origin that only works in a local
+    browser is a Stage 2 discovery rather than a Stage 6 one.
+    """
+    value = raw.strip().rstrip("/")
+    if not value:
+        return None
+    if not value.startswith("https://") or len(value) <= len("https://"):
+        raise ConfigurationError("QM_ACTIVITY_ORIGIN must be an https:// origin")
     return value
 
 
