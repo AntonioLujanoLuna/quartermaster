@@ -105,8 +105,78 @@ through. The window is the played session, bounded above by the next session's s
 panel says how many earlier lines it is not showing. It is open to the whole table and links
 to the session log where one is configured.
 
-**Checks.** 273 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
-on every pull request.
+**Activity.** A second surface, off unless `QM_DISCORD_CLIENT_ID` and
+`QM_DISCORD_CLIENT_SECRET` are configured, and never on the path of a table that has not
+enabled it: FastAPI, uvicorn, and a WebSocket implementation are an optional extra. `api_app`
+serves every read a panel performs, with the actor taken only from a token this process
+signed — never from a body or a query string — and re-checks DM authority per request.
+`api_live` is the live feed: one pump reading `domain_events` above a cursor, woken by
+`SQLiteStore.add_commit_listener` rather than by a timer, fanned out to the sockets on
+`/api/live`. The socket carries change notifications and no payloads; a client answers one by
+refetching the read it has on screen. It presents its session token in the socket's first
+frame, replays a resuming client's gap up to a bound, and resets a client that falls too far
+behind rather than buffering for it. `activity/` is the frontend: the SDK handshake, one
+read-only Party Stash with the instance roster, a reconnecting socket that resumes from its
+cursor, a header that says whether it is live, and a re-handshake when a session token is
+refused. Nothing mutates through it.
+
+**Checks.** 322 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+on every pull request, and CI builds the Activity bundle.
+
+## Twelfth pass on 2026-08-16
+
+Stage 3 of the Activity migration: the live feed. The stage's own exit criterion is a grant
+issued from the bot appearing on an open Activity screen without a refresh, and everything
+below is what that sentence turned out to require.
+
+- **The screen was a snapshot, and six of them were six different snapshots.** This is the
+  fourth consequence the migration plan names — the table is not looking at one thing, it is
+  looking at six copies of one thing, each as stale as the last time its owner did something.
+  The cursor for fixing it already existed: `domain_events.sequence`, assigned inside the
+  transaction that made the change. `/api/live` is a WebSocket over it, and `api_live.py`
+  holds one pump for the process that reads above a cursor and fans out to the sockets.
+
+  It carries notifications rather than state — a sequence, an event type, when it landed —
+  and the client answers by asking for the read it has on screen again. Putting the payload
+  on the socket would have made it a second rendering of facts the reads already answer for,
+  which is the same argument `credit_stack` and `narrative.render_entry` settle one level
+  down.
+
+  It does not touch `event_outbox`. That belongs to the Discord projection and its
+  per-destination FIFO guarantees; this is a second reader of `domain_events`, not a second
+  writer to the outbox.
+
+- **The store learned one thing, deliberately small.** `add_commit_listener` says that a
+  write transaction committed, and nothing about what was in it, announced after the
+  connection lock is released and never allowed to fail the commit it is reporting. The
+  alternative was a timer reading the sequence every tick against the single connection the
+  gateway is also writing through — for the whole time the table is idle — which is exactly
+  the contention `expire_due_drops` was changed to stop causing. Woken instead of polled, an
+  idle table costs no queries at all. A 30-second poll survives as a safety net and only
+  ticks while somebody is listening.
+
+- **Three failure modes were answered rather than left to be discovered at the table.** A
+  client that cannot keep up loses its backlog and is told to read everything again, because
+  a bounded queue that drops is honest and an unbounded one holds the feed for the slowest
+  socket. A client resuming from a cursor is replayed up to a bound and past it told to
+  reload, because replaying an evening one row at a time to a client that will refetch anyway
+  is slower than the refetch. And a socket that connects while the pump is not running is
+  refused rather than accepted, because a screen that looks live and is frozen is worse than
+  one that says it could not open.
+
+- **The token expired an hour into an evening, and nothing noticed.** Session tokens last
+  `QM_SESSION_TOKEN_SECONDS`; a session at the table lasts longer. That gap has existed since
+  Stage 1, and a live screen is what made it visible — a screen that has stopped reading
+  still looks connected. The client now re-runs the SDK handshake when a token is refused, on
+  the reads and on the socket both, and retries the refused call once. Once, because a second
+  refusal after a fresh token is a real refusal rather than something to loop on.
+
+  The header says `Live`, `Connecting…`, or `Reconnecting…` for the same reason: a surface
+  that reads live has to say when it has stopped.
+
+- **The token goes in the socket's first frame.** A browser cannot set an `Authorization`
+  header on a WebSocket, and the alternative — a query string — writes a bearer credential
+  into every access log between the API and the player.
 
 ## Eleventh pass on 2026-08-16
 
@@ -678,6 +748,28 @@ Panel surface:
 12. **Combat**, and confirm the handoff cards are open to players while Start and End are not
     even rendered for them.
 
+Activity surface. None of it has run against Discord, and none of it can until Stage 0 of
+[the migration plan](activity-migration-plan.md) — an https origin Discord will frame — is
+answered. Everything here is a question the test suite cannot ask:
+
+23. Launch the Activity from a voice channel in the guild and confirm the handshake
+    completes, the Party Stash renders, and the roster names who is actually present.
+24. With two clients open, grant an item from `/quartermaster` and confirm both screens
+    change without anyone touching them, and that the header says `Live` on both. This is
+    Stage 3's exit criterion, and the half of it a test cannot reach.
+25. Kill the bot with a screen open. The header should say `Reconnecting…` rather than
+    freezing while looking current. Restart it and confirm the screen catches up on its own,
+    and that changes made while it was down are reflected — that is the cursor doing its job.
+26. Leave a screen open for longer than `QM_SESSION_TOKEN_SECONDS` — an hour by default —
+    with the table quiet, then grant something. The screen should still update, because the
+    client re-ran the handshake rather than going quiet.
+27. Launch it on mobile Discord. The layout constraint is real and Stage 2 said it should be
+    established here rather than discovered in Stage 5; the socket's behaviour when the
+    client backgrounds the app is the other half of that.
+28. Watch the log through an evening for live-feed lines. What is worth knowing is whether
+    the wake-on-commit ever misses — the 30-second poll would cover it silently — and whether
+    a reset is ever issued to a client that was merely slow rather than gone.
+
 Runtime, unchanged by this pass and still unverified:
 
 13. Restart across the schema-10 migration and confirm health, the unique index, and the
@@ -748,6 +840,11 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
    observation is worth more than any further combat feature.
 4. Choose evidence-based latency and freshness budgets from observed play if the current
    estimates prove wrong.
+5. Answer Stage 0 of the Activity migration — where it runs, on what https origin, and how
+   the database is backed up there. Stages 1 to 3 are built and none of them has been framed
+   by Discord once. Stage 4 adds mutations to a transport nobody has launched, which is the
+   wrong order: everything the proxy, the handshake, or the hosting has to say is knowable
+   now, and knowing it costs no domain changes to act on.
 
 The Avrae extension spike is no longer a priority: Gate 1 was answered "no, for now", so
 self-hosting, the Cog, provider gateway implementations, and combat reference projections

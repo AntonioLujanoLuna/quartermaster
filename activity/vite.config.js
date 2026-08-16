@@ -13,6 +13,9 @@ export default defineConfig({
       "/.proxy/api": {
         target: process.env.QM_API_URL || "http://127.0.0.1:8080",
         changeOrigin: true,
+        // The live feed upgrades on this same prefix, so the dev server has to
+        // carry the upgrade too or the screen loads and never moves.
+        ws: true,
         rewrite: (path) => path.replace(/^\/\.proxy/, ""),
       },
     },

@@ -37,6 +37,22 @@ function renderRoster(participants) {
   return aside;
 }
 
+// What the screen is allowed to claim about itself. A surface that reads live
+// has to say when it has stopped, or the table trusts a number that stopped
+// moving ten minutes ago — which is the failure the panels had by design.
+const LIVE_LABELS = {
+  live: "Live",
+  connecting: "Connecting…",
+  offline: "Reconnecting…",
+};
+
+function renderLive(status) {
+  const state = LIVE_LABELS[status] ? status : "connecting";
+  const badge = element("span", `live live-${state}`);
+  badge.append(element("span", "live-dot"), element("span", null, LIVE_LABELS[state]));
+  return badge;
+}
+
 function renderSummary(home) {
   const bar = element("div", "summary");
   if (!home) return bar;
@@ -90,15 +106,15 @@ export function renderStash(state) {
   const root = element("div", "layout");
 
   const header = element("header");
-  header.append(element("h1", null, "Party Stash"));
+  const title = element("div", "title");
+  title.append(element("h1", null, "Party Stash"), renderLive(state.live));
+  header.append(title);
   header.append(renderSummary(state.home));
   root.append(header);
 
   const main = element("main");
   main.append(renderItems(state.stash || { items: [] }));
-  main.append(
-    element("p", "count muted", `${state.stash?.total ?? 0} stacks · read-only for now`),
-  );
+  main.append(element("p", "count muted", `${state.stash?.total ?? 0} stacks · read-only for now`));
   root.append(main);
 
   root.append(renderRoster(state.participants));

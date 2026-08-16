@@ -6,20 +6,32 @@ are the same service calls the panels make — but everything around them: a
 caller who presents no token, a forged one, an expired one, a token that claims
 DM authority it was not issued with, and a request that tries to name an actor
 other than the one it proved.
+
+The live feed is driven the same way: a socket is opened, the domain is changed
+through the service layer the way the bot changes it, and the test waits for the
+socket to say so. That is the stage's exit criterion — a grant issued from the
+bot appears on an open Activity screen — expressed as far as a test can express
+it, which is up to the point where a browser would refetch.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import queue
 import sys
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from quartermaster.api_app import create_app
 from quartermaster.api_auth import (
@@ -29,6 +41,15 @@ from quartermaster.api_auth import (
     SessionTokens,
     TokenError,
     is_dm,
+)
+from quartermaster.api_live import (
+    CLOSED,
+    EVENTS,
+    IDLE,
+    RESET,
+    Change,
+    EventFeed,
+    Subscription,
 )
 from quartermaster.characters import CharacterService
 from quartermaster.combat import CombatService
@@ -301,6 +322,282 @@ class StaticSurfaceTests(ApiTestCase):
     def test_without_a_build_configured_the_api_still_serves(self) -> None:
         self.assertEqual(self.client.get("/api/health").status_code, 200)
         self.assertEqual(self.client.get("/").status_code, 404)
+
+
+def _next_message(socket, *, timeout: float = 5.0) -> dict:
+    """Read one frame, or fail rather than hanging the suite.
+
+    The test client's `receive_json` has no deadline, so a feed that says
+    nothing would stop the run rather than fail it. The reader is a daemon
+    thread for the same reason: on a failure it is abandoned, and abandoning a
+    non-daemon thread would hold the interpreter open at exit.
+    """
+    box: queue.Queue = queue.Queue(maxsize=1)
+
+    def pull() -> None:
+        try:
+            box.put(("message", socket.receive_json()))
+        except BaseException as error:  # noqa: BLE001 - reported on the calling thread
+            box.put(("error", error))
+
+    threading.Thread(target=pull, daemon=True).start()
+    try:
+        kind, value = box.get(timeout=timeout)
+    except queue.Empty:
+        raise AssertionError(f"the live feed said nothing within {timeout}s") from None
+    if kind == "error":
+        raise value
+    return value
+
+
+class LiveFeedTests(ApiTestCase):
+    """The socket that makes six copies of a screen one table.
+
+    Every test here opens a real socket against the app and changes the domain
+    through the same service calls the bot makes, because the thing worth
+    proving is that a change nobody told the API about still reaches a client.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        # Entered as a context manager, which is what runs the lifespan and so
+        # what starts the pump. The suite's other client deliberately does not.
+        self.served = self.stack.enter_context(TestClient(self.app))
+
+    def socket(self, *, token: str | None = None, code: str = "player-code", since: int | None = None):
+        path = "/api/live" if since is None else f"/api/live?since={since}"
+        socket = self.stack.enter_context(self.served.websocket_connect(path))
+        socket.send_json({"token": self.authenticate(code)["token"] if token is None else token})
+        return socket
+
+    def opened(self, **kwargs) -> tuple:
+        socket = self.socket(**kwargs)
+        return socket, _next_message(socket)
+
+    # Opening ----------------------------------------------------------------
+
+    def test_the_socket_states_who_you_proved_to_be_and_where_the_ledger_is(self) -> None:
+        _, hello = self.opened()
+        self.assertEqual(hello["type"], "hello")
+        self.assertEqual(hello["actor_id"], PLAYER_ID)
+        self.assertFalse(hello["is_dm"])
+        self.assertEqual(hello["sequence"], 0)
+
+    def test_the_feed_is_the_tables_rather_than_the_dms(self) -> None:
+        _, hello = self.opened(code="dm-code")
+        self.assertEqual(hello["actor_id"], DM_ID)
+        self.assertTrue(hello["is_dm"])
+
+    def test_a_forged_token_cannot_open_the_feed(self) -> None:
+        forged = SessionTokens("not-the-secret").issue(Actor(id=PLAYER_ID, is_dm=True))
+        socket = self.socket(token=forged)
+        with self.assertRaises(WebSocketDisconnect) as refusal:
+            _next_message(socket)
+        self.assertEqual(refusal.exception.code, 4401)
+
+    def test_an_opening_frame_that_is_not_a_token_is_refused(self) -> None:
+        socket = self.stack.enter_context(self.served.websocket_connect("/api/live"))
+        socket.send_text("hello?")
+        with self.assertRaises(WebSocketDisconnect) as refusal:
+            _next_message(socket)
+        self.assertEqual(refusal.exception.code, 4401)
+
+    def test_without_a_running_pump_the_socket_refuses_rather_than_going_quiet(self) -> None:
+        """A frozen screen that looks live is worse than one that says it is not."""
+        # A second assembly of the same context, whose lifespan is never
+        # entered, so its feed was never started.
+        unserved = TestClient(create_app(self.context, self.identity, tokens=self.tokens))
+        with unserved.websocket_connect("/api/live") as socket:
+            socket.send_json({"token": self.authenticate("player-code")["token"]})
+            with self.assertRaises(WebSocketDisconnect) as refusal:
+                _next_message(socket)
+        self.assertEqual(refusal.exception.code, 4503)
+
+    # Delivery ---------------------------------------------------------------
+
+    def test_a_grant_issued_from_the_bot_reaches_an_open_socket(self) -> None:
+        """Stage 3's exit criterion, as far as a test can carry it."""
+        socket, _ = self.opened()
+        self.grant("Rope", 2, interaction="grant-rope")
+        notice = _next_message(socket)
+        self.assertEqual(notice["type"], EVENTS)
+        self.assertEqual([event["event_type"] for event in notice["events"]], ["ITEM_GRANTED"])
+        self.assertEqual(notice["sequence"], notice["events"][-1]["sequence"])
+
+    def test_the_socket_carries_notifications_rather_than_state(self) -> None:
+        """No payload on the wire: the client refetches the read it has."""
+        socket, _ = self.opened()
+        self.grant("Rope", 2, interaction="grant-rope")
+        event = _next_message(socket)["events"][0]
+        self.assertEqual(set(event), {"sequence", "event_type", "created_at"})
+
+    def test_a_change_reaches_every_socket_at_the_table(self) -> None:
+        first, _ = self.opened()
+        second, _ = self.opened(code="dm-code")
+        self.grant("Rope", 2, interaction="grant-rope")
+        for socket in (first, second):
+            self.assertEqual(_next_message(socket)["type"], EVENTS)
+
+    def test_the_cursor_only_advances_over_what_was_actually_sent(self) -> None:
+        socket, hello = self.opened()
+        self.grant("Rope", 2, interaction="grant-rope")
+        first = _next_message(socket)
+        self.grant("Torch", 3, interaction="grant-torch")
+        second = _next_message(socket)
+        self.assertGreater(first["sequence"], hello["sequence"])
+        self.assertGreater(second["sequence"], first["sequence"])
+
+    # Resuming ---------------------------------------------------------------
+
+    def test_resuming_from_a_cursor_replays_the_gap_rather_than_the_campaign(self) -> None:
+        self.grant("Rope", 2, interaction="grant-rope")
+        self.grant("Torch", 3, interaction="grant-torch")
+        socket, hello = self.opened(since=1)
+        replay = _next_message(socket)
+        self.assertEqual(replay["type"], EVENTS)
+        self.assertEqual([event["sequence"] for event in replay["events"]], [2])
+        self.assertEqual(hello["sequence"], 2)
+
+    def test_a_client_that_is_already_current_is_told_nothing_to_replay(self) -> None:
+        self.grant("Rope", 2, interaction="grant-rope")
+        socket, hello = self.opened(since=1)
+        self.grant("Torch", 3, interaction="grant-torch")
+        # The next thing it hears is the new change, not a replay of the old one.
+        notice = _next_message(socket)
+        self.assertEqual(notice["type"], EVENTS)
+        self.assertEqual([event["sequence"] for event in notice["events"]], [2])
+        self.assertEqual(hello["sequence"], 1)
+
+    def test_a_gap_too_wide_to_replay_is_a_reset_rather_than_a_flood(self) -> None:
+        self.grant("Rope", 2, interaction="grant-rope")
+        self.grant("Torch", 3, interaction="grant-torch")
+        with mock.patch("quartermaster.api_app.REPLAY_LIMIT", 1):
+            socket, _ = self.opened(since=0)
+            reset = _next_message(socket)
+        self.assertEqual(reset["type"], RESET)
+        self.assertEqual(reset["sequence"], 2)
+
+
+class SubscriptionTests(unittest.TestCase):
+    """A client that cannot keep up, resolved without holding the feed.
+
+    Driven directly rather than through a socket: the case is a queue that
+    fills, and arranging that through a real client would mean arranging a slow
+    one.
+    """
+
+    def _change(self, sequence: int) -> Change:
+        return Change(sequence=sequence, event_type="ITEM_GRANTED", created_at="2026-08-16T00:00:00Z")
+
+    def test_a_backlog_that_overflows_becomes_a_reset(self) -> None:
+        async def scenario() -> tuple[str, ...]:
+            subscription = Subscription(depth=2)
+            for sequence in range(1, 6):
+                subscription.offer((self._change(sequence),))
+            first = await subscription.next(timeout=0.01)
+            second = await subscription.next(timeout=0.01)
+            return first[0], second[0]
+
+        self.assertEqual(asyncio.run(scenario()), (RESET, IDLE))
+
+    def test_a_quiet_feed_reports_idle_rather_than_waiting_forever(self) -> None:
+        async def scenario() -> str:
+            kind, _ = await Subscription().next(timeout=0.01)
+            return kind
+
+        self.assertEqual(asyncio.run(scenario()), IDLE)
+
+    def test_a_client_that_went_away_wakes_the_socket(self) -> None:
+        async def scenario() -> str:
+            subscription = Subscription()
+
+            async def leave() -> None:
+                await asyncio.sleep(0)
+                subscription.disconnect()
+
+            waiting = asyncio.ensure_future(subscription.next(timeout=5.0))
+            await leave()
+            kind, _ = await waiting
+            return kind
+
+        self.assertEqual(asyncio.run(scenario()), CLOSED)
+
+
+class CommitAnnouncementTests(unittest.TestCase):
+    """The store's half of the live feed.
+
+    This is the one thing `db.py` learned for the Activity, and what it learned
+    is deliberately small: that a write committed, and nothing about what was
+    in it. The alternative was a timer reading the sequence all evening against
+    the connection the gateway shares.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.store = SQLiteStore(Path(self.directory.name) / "quartermaster.sqlite").open()
+        self.addCleanup(self.store.close)
+        self.announcements: list[int] = []
+        self.listener = lambda: self.announcements.append(1)
+
+    def test_a_committed_write_is_announced(self) -> None:
+        self.store.add_commit_listener(self.listener)
+        with self.store.transaction() as connection:
+            connection.execute("INSERT INTO maintenance_runs(name) VALUES ('live-feed-test')")
+        self.assertEqual(len(self.announcements), 1)
+
+    def test_a_rolled_back_write_is_not(self) -> None:
+        self.store.add_commit_listener(self.listener)
+        with self.assertRaises(RuntimeError):
+            with self.store.transaction() as connection:
+                connection.execute("INSERT INTO maintenance_runs(name) VALUES ('live-feed-test')")
+                raise RuntimeError("changed my mind")
+        self.assertEqual(self.announcements, [])
+
+    def test_a_listener_that_raises_does_not_fail_the_write_it_is_told_about(self) -> None:
+        def broken() -> None:
+            raise RuntimeError("the socket went away")
+
+        self.store.add_commit_listener(broken)
+        self.store.add_commit_listener(self.listener)
+        with self.assertLogs("quartermaster.db", level="ERROR"):
+            with self.store.transaction() as connection:
+                connection.execute("INSERT INTO maintenance_runs(name) VALUES ('live-feed-test')")
+        with self.store.read() as connection:
+            written = connection.execute("SELECT COUNT(*) FROM maintenance_runs").fetchone()[0]
+        self.assertEqual(written, 1)
+        self.assertEqual(len(self.announcements), 1)
+
+    def test_a_removed_listener_is_not_told(self) -> None:
+        self.store.add_commit_listener(self.listener)
+        self.store.remove_commit_listener(self.listener)
+        with self.store.transaction() as connection:
+            connection.execute("INSERT INTO maintenance_runs(name) VALUES ('live-feed-test')")
+        self.assertEqual(self.announcements, [])
+
+    def test_a_commit_is_what_wakes_the_feed_rather_than_a_timer(self) -> None:
+        """The poll is an hour away, so the delivery can only be the hook."""
+
+        async def scenario() -> tuple[int, int]:
+            feed = EventFeed(self.store, idle_poll_seconds=3600.0)
+            await feed.start()
+            try:
+                subscription = feed.subscribe()
+                idle, _ = await subscription.next(timeout=0.05)
+                with self.store.transaction() as connection:
+                    connection.execute(
+                        "INSERT INTO domain_events(operation_id, event_type, payload, created_at)"
+                        " VALUES ('op', 'ITEM_GRANTED', '{}', '2026-08-16T00:00:00Z')"
+                    )
+                kind, changes = await subscription.next(timeout=5.0)
+                self.assertEqual((idle, kind), (IDLE, EVENTS))
+                return changes[0].sequence, feed.sequence
+            finally:
+                await feed.stop()
+
+        self.assertEqual(asyncio.run(scenario()), (1, 1))
 
 
 class ActivityConfigurationTests(unittest.TestCase):

@@ -57,10 +57,46 @@ header {
   border-bottom: 1px solid var(--line);
 }
 
+header .title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
 header h1 {
-  margin: 0 0 6px;
+  margin: 0;
   font-size: 20px;
   letter-spacing: 0.01em;
+}
+
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.live-live .live-dot {
+  background: #3ba55d;
+}
+
+.live-connecting .live-dot {
+  background: var(--accent);
+}
+
+.live-offline .live-dot {
+  background: #d83c3e;
 }
 
 .summary {

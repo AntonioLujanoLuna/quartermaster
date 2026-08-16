@@ -18,6 +18,11 @@ dependencies = [
 activity = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
+    # The live feed. uvicorn speaks HTTP without this and answers a WebSocket
+    # upgrade with 404, which would look like a missing route rather than a
+    # missing dependency. The test suite does not need it — Starlette's test
+    # client runs a socket in-process — so it is here rather than in dev.
+    "websockets>=13",
 ]
 
 [dependency-groups]
