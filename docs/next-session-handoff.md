@@ -108,20 +108,91 @@ to the session log where one is configured.
 **Activity.** A second surface, off unless `QM_DISCORD_CLIENT_ID` and
 `QM_DISCORD_CLIENT_SECRET` are configured, and never on the path of a table that has not
 enabled it: FastAPI, uvicorn, and a WebSocket implementation are an optional extra. `api_app`
-serves every read a panel performs, with the actor taken only from a token this process
-signed — never from a body or a query string — and re-checks DM authority per request.
-`api_live` is the live feed: one pump reading `domain_events` above a cursor, woken by
-`SQLiteStore.add_commit_listener` rather than by a timer, fanned out to the sockets on
-`/api/live`. The socket carries change notifications and no payloads; a client answers one by
-refetching the read it has on screen. It presents its session token in the socket's first
-frame, replays a resuming client's gap up to a bound, and resets a client that falls too far
-behind rather than buffering for it. `activity/` is the frontend: the SDK handshake, one
-read-only Party Stash with the instance roster, a reconnecting socket that resumes from its
-cursor, a header that says whether it is live, and a re-handshake when a session token is
-refused. Nothing mutates through it.
+serves every read a panel performs and the mutations a player makes, with the actor taken
+only from a token this process signed — never from a body or a query string — and re-checks
+DM authority per request. `api_live` is the live feed: one pump reading `domain_events` above
+a cursor, woken by `SQLiteStore.add_commit_listener` rather than by a timer, fanned out to
+the sockets on `/api/live`. The socket carries change notifications and no payloads; a client
+answers one by refetching the read it has on screen. It presents its session token in the
+socket's first frame, replays a resuming client's gap up to a bound, and resets a client that
+falls too far behind rather than buffering for it.
 
-**Checks.** 322 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
-on every pull request, and CI builds the Activity bundle.
+Mutations are keyed by an `Idempotency-Key` the client generates per action, namespaced by
+the actor the token proved, so a replay returns that actor's own receipt and nobody else's.
+Handles are minted when a player acts rather than when a screen renders, so a read set means
+"what was true when you pressed"; a claim mints inside the request that spends it, because
+its handle carries no relative meaning to preserve. `party_authorized` is written by the
+route and never read from a body. A refusal answers with a code as well as a sentence —
+`STALE` is a question to put to the player, `HANDLE` means prepare the action again,
+`REFUSED` is the domain's answer.
+
+`activity/` is the frontend: the SDK handshake, four screens — Party Stash, My Items, Loot,
+Treasury — the instance roster beside them, a reconnecting socket that resumes from its
+cursor, a header that says whether it is live, and a re-handshake when a session token is
+refused. A player takes, gives, uses, claims, and moves coin from it; a DM registers a
+character from the roster and gives coin from the treasury. Everything else a DM does is
+still a panel.
+
+**Checks.** 348 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+on every pull request, and CI builds the Activity bundle — with `VITE_DISCORD_CLIENT_ID`
+set, which matters: without it the client id is statically undefined, `boot()` returns on
+its first line, and Vite tree-shakes the entire application out of the bundle it just
+proved compiles.
+
+## Thirteenth pass on 2026-08-16
+
+Stage 4 of the Activity migration: the mutations. The stage adds no domain code and changes
+no service — every route is a call a panel already makes — so all of it is about the
+transport, and the transport is where the things below could go wrong.
+
+- **Out of order, and deliberately so.** The previous pass wrote that "Stage 4 adds
+  mutations to a transport nobody has launched, which is the wrong order", and it was right.
+  Stage 0 is still unanswered and no code answers it: where this runs, on what https origin,
+  and how the database is backed up there is a decision about hosting. What Stage 4 cost is
+  bounded — no domain changes, so if the hosting question comes back "not this", the whole
+  of it deletes without touching anything that stores an item. What it bought is that the
+  questions only the transport can get wrong are answered before a session rather than
+  during one.
+
+- **A client chooses the idempotency key, and Discord used to.** `execute_fast` returns the
+  receipt stored under a key rather than running the mutation again, which is what makes a
+  retry safe. An interaction id was a number nobody could pick; a UUID from a browser is
+  not, so an unscoped key would let one player quote another's and be handed their receipt.
+  The key the receipts table sees is `activity:<actor>:<key>`, with the separator kept out
+  of the key's alphabet so no key can reach into another actor's namespace, and the key
+  itself bounded and checked because it becomes a primary key.
+
+- **A handle had to be minted somewhere, and the panel's answer does not exist here.** The
+  panel minted at render, because the server did the rendering. A browser renders itself, so
+  a `prepare` call mints when the player acts and the read set means "what was true when you
+  pressed". That keeps the check the take-all confirmation exists for — two players taking
+  all of one stack in the same tick still collides inside the round trip — while the stale
+  screen it also used to catch is now prevented upstream by the live feed. The rejected
+  alternative was minting against every read, which is the twenty-five-control budget again
+  in a place that has no controls: a forty-stack stash, re-minted on every change, for every
+  client at the table.
+
+- **A refusal has to say what to do, not just what happened.** The panels answer a refusal
+  with a sentence because a person reads it; here a program reads it first. Three of them
+  need different behaviour rather than different wording, so they carry a code beside the
+  sentence: `STALE` is a question for the player and is answered on a confirm route,
+  `HANDLE` means the control was spent and the action has to be prepared again, `REFUSED` is
+  the domain's answer and the end of it. They are mapped once, on the app, rather than
+  caught around each of thirteen calls.
+
+- **The plan's own table would have widened the trust boundary.** It left the DM column
+  blank on treasury → character, character registration, and lifecycle, and all three are
+  behind `_require_dm` on the panel. An API that grants authority the surface it replaces
+  does not grant is not a migration of it; the table is corrected and the routes are
+  DM-only. The same rule is why `party_authorized` is written by the `use` route rather than
+  read from its body: using an item and correcting the Party Stash are one service call
+  separated by that flag.
+
+- **CI was proving a bundle that contained no application.** `VITE_DISCORD_CLIENT_ID` is
+  read through `import.meta.env`, so Vite replaces it at build time — and when it is unset
+  the replacement makes `boot()`'s first branch statically true, and rollup removes every
+  module reachable only past it. The workflow does set a placeholder and is fine. A local
+  `npx vite build` without one is not, and reports success on 141 kB of dependency.
 
 ## Twelfth pass on 2026-08-16
 
@@ -769,6 +840,26 @@ answered. Everything here is a question the test suite cannot ask:
 28. Watch the log through an evening for live-feed lines. What is worth knowing is whether
     the wake-on-commit ever misses — the 30-second poll would cover it silently — and whether
     a reset is ever issued to a client that was merely slow rather than gone.
+29. Take something from the Activity and read the session log line it produces beside one a
+    panel produced. The ledger should not be able to tell which surface acted, and this is
+    Stage 4's exit criterion for the half a test can only approximate.
+30. Have two players press **Take all** on the same stack at the same moment. One of them
+    should get the question, and it should read as a genuine conflict rather than as an
+    error. This is the only path in the product with no live evidence behind it at all, and
+    it is now a race inside one round trip rather than one across a stale panel.
+31. **Use…** something and confirm the prompt reads as a decision rather than a dialog box —
+    it is the one action with no way back, and the reason it asks is that the panel's modal
+    asked. Then check the session log renders the reason.
+32. Give coin from the Treasury screen and confirm the amount fields are usable on a phone.
+    Four number inputs in a row is the layout most likely to be wrong in a cramped viewport,
+    and it is worth finding out at the same time as item 27.
+33. Type a quantity into a row, then have somebody else change something so the screen
+    redraws underneath you. What you typed should still be there and the caret should not
+    have moved. `state.inputs` and the focus restore in `draw()` are what make that true,
+    and a live screen is the only place the bug exists.
+34. As a DM, register a character for a player from the roster. This is the Activity's one
+    answer to Discord's user select, and whether picking a name out of who is present is
+    better or worse than a picker is a judgement only a real table makes.
 
 Runtime, unchanged by this pass and still unverified:
 
@@ -841,10 +932,12 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
 4. Choose evidence-based latency and freshness budgets from observed play if the current
    estimates prove wrong.
 5. Answer Stage 0 of the Activity migration — where it runs, on what https origin, and how
-   the database is backed up there. Stages 1 to 3 are built and none of them has been framed
-   by Discord once. Stage 4 adds mutations to a transport nobody has launched, which is the
-   wrong order: everything the proxy, the handshake, or the hosting has to say is knowable
-   now, and knowing it costs no domain changes to act on.
+   the database is backed up there. This is now the only thing standing between four built
+   stages and a table using them, and it is the one item on this list that no amount of code
+   moves: Stages 1 to 4 are built and none of them has been framed by Discord once. Stage 5,
+   the DM surface, should wait for it. Stage 4 did not, which was a judgement about what is
+   cheap to build blind and what is not — mutations are cheap because they add no domain
+   code, and the DM surface is where guessing starts to cost.
 
 The Avrae extension spike is no longer a priority: Gate 1 was answered "no, for now", so
 self-hosting, the Cog, provider gateway implementations, and combat reference projections

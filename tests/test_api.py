@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -161,6 +162,43 @@ class ApiTestCase(unittest.TestCase):
             interaction, actor_id=DM_ID, item_name=item, quantity=quantity
         )
 
+    def register(self, name: str, discord_user_id: str, *, interaction: str) -> str:
+        result = self.context.characters.create_interaction(
+            interaction, actor_id=DM_ID, name=name, discord_user_id=discord_user_id
+        )
+        return result.logical_response["character_id"]
+
+    def post(
+        self,
+        path: str,
+        body: dict | None = None,
+        *,
+        code: str = "player-code",
+        key: str | None = None,
+        headers: dict[str, str] | None = None,
+        client=None,
+    ):
+        """One request the way the client makes it: a token, and a key per action."""
+        request_headers = dict(headers if headers is not None else self.headers(code))
+        request_headers["Idempotency-Key"] = key if key is not None else uuid.uuid4().hex
+        return (client or self.client).post(path, json=body or {}, headers=request_headers)
+
+    def stash_stack(self, item_name: str) -> dict:
+        for item in self.client.get("/api/stash", headers=self.headers()).json()["items"]:
+            if item["item_name"] == item_name:
+                return item
+        raise AssertionError(f"the Party Stash has no {item_name}")
+
+    def take(self, item_name: str, amount: int | str = 1, *, code: str = "player-code") -> dict:
+        """Prepare and spend one take, which is what one press costs."""
+        prepared = self.post(
+            "/api/stash/take/prepare",
+            {"stack_id": self.stash_stack(item_name)["id"], "amount": amount},
+            code=code,
+        )
+        self.assertEqual(prepared.status_code, 200, prepared.text)
+        return self.post("/api/stash/take", {"handle_id": prepared.json()["handle_id"]}, code=code).json()
+
 
 class TokenExchangeTests(ApiTestCase):
     def test_a_valid_code_yields_a_token_naming_the_discord_user(self) -> None:
@@ -285,6 +323,322 @@ class ReadSurfaceTests(ApiTestCase):
         body = self.client.get("/api/health").json()
         self.assertEqual(body["status"], "ok")
         self.assertNotIn("stash_count", body)
+
+
+class TakeTests(ApiTestCase):
+    """Stage 4's first mutation, and the one that carries a read set.
+
+    The panel minted take handles when it rendered a message, so a handle could
+    be minutes older than the press it answered. Here it is minted when the
+    player acts, and the interesting question is whether the check that made
+    `Take all` honest still fires when it should.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.register("Vex", PLAYER_ID, interaction="register-vex")
+
+    def test_a_take_moves_the_stack_onto_the_players_own_character(self) -> None:
+        self.grant("Rope", 3, interaction="grant-rope")
+        body = self.take("Rope")
+        self.assertEqual(body["result"]["quantity"], 1)
+        self.assertEqual(body["result"]["remaining"], 2)
+        holdings = self.client.get("/api/me/items", headers=self.headers()).json()
+        self.assertEqual(holdings["character"]["name"], "Vex")
+        self.assertEqual([(item["item_name"], item["quantity"]) for item in holdings["items"]], [("Rope", 1)])
+
+    def test_take_all_means_the_quantity_the_player_acted_against(self) -> None:
+        self.grant("Rope", 3, interaction="grant-rope")
+        self.assertEqual(self.take("Rope", "all")["result"]["quantity"], 3)
+        self.assertEqual(self.client.get("/api/stash", headers=self.headers()).json()["total"], 0)
+
+    def test_a_quantity_that_moved_under_the_press_is_asked_about_rather_than_substituted(self) -> None:
+        """The race the plan names, now inside one round trip instead of one panel."""
+        self.grant("Rope", 3, interaction="grant-rope")
+        prepared = self.post(
+            "/api/stash/take/prepare", {"stack_id": self.stash_stack("Rope")["id"], "amount": "all"}
+        )
+        handle = prepared.json()["handle_id"]
+        self.grant("Rope", 2, interaction="grant-more-rope")
+
+        refused = self.post("/api/stash/take", {"handle_id": handle})
+        self.assertEqual(refused.status_code, 409)
+        self.assertEqual(refused.json()["code"], "STALE")
+        self.assertIn("3", refused.json()["detail"])
+
+        confirmed = self.post("/api/stash/take/confirm", {"handle_id": handle})
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        self.assertEqual(confirmed.json()["result"]["quantity"], 5)
+
+    def test_a_refused_take_leaves_the_handle_to_answer_with(self) -> None:
+        """The refusal rolls back, so the confirmation has something to spend."""
+        self.grant("Rope", 3, interaction="grant-rope")
+        prepared = self.post(
+            "/api/stash/take/prepare", {"stack_id": self.stash_stack("Rope")["id"], "amount": "all"}
+        )
+        self.grant("Rope", 1, interaction="grant-more-rope")
+        self.post("/api/stash/take", {"handle_id": prepared.json()["handle_id"]})
+        self.assertEqual(self.client.get("/api/stash", headers=self.headers()).json()["items"][0]["quantity"], 4)
+
+    def test_a_spent_handle_is_not_a_second_take(self) -> None:
+        self.grant("Rope", 3, interaction="grant-rope")
+        prepared = self.post(
+            "/api/stash/take/prepare", {"stack_id": self.stash_stack("Rope")["id"], "amount": 1}
+        )
+        handle = prepared.json()["handle_id"]
+        self.assertEqual(self.post("/api/stash/take", {"handle_id": handle}).status_code, 200)
+        replayed = self.post("/api/stash/take", {"handle_id": handle})
+        self.assertEqual(replayed.status_code, 409)
+        self.assertEqual(replayed.json()["code"], "HANDLE")
+
+    def test_one_players_handle_is_not_another_players_to_spend(self) -> None:
+        """The handle is bound to the actor it was minted for, not to whoever holds it."""
+        self.grant("Rope", 3, interaction="grant-rope")
+        prepared = self.post(
+            "/api/stash/take/prepare", {"stack_id": self.stash_stack("Rope")["id"], "amount": 1}
+        )
+        stolen = self.post(
+            "/api/stash/take", {"handle_id": prepared.json()["handle_id"]}, code="dm-code"
+        )
+        self.assertEqual(stolen.status_code, 409)
+        self.assertEqual(stolen.json()["code"], "HANDLE")
+
+    def test_a_take_without_a_character_is_refused_in_words_a_player_can_act_on(self) -> None:
+        self.grant("Rope", 1, interaction="grant-rope")
+        roster = self.client.get("/api/characters", headers=self.headers()).json()["characters"]
+        self.context.characters.transition_interaction(
+            "retire-vex", actor_id=DM_ID, character_id=roster[0]["id"], lifecycle="RETIRED"
+        )
+        prepared = self.post(
+            "/api/stash/take/prepare", {"stack_id": self.stash_stack("Rope")["id"], "amount": 1}
+        )
+        refused = self.post("/api/stash/take", {"handle_id": prepared.json()["handle_id"]})
+        self.assertEqual(refused.status_code, 422)
+        self.assertEqual(refused.json()["code"], "REFUSED")
+        self.assertIn("character", refused.json()["detail"])
+
+
+class GiveAndUseTests(ApiTestCase):
+    """Possession moving back out again, which is what makes a take repairable."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.register("Vex", PLAYER_ID, interaction="register-vex")
+        self.other = self.register("Brann", DM_ID, interaction="register-brann")
+        self.grant("Rope", 3, interaction="grant-rope")
+        self.take("Rope", "all")
+
+    def held(self, code: str = "player-code") -> list[dict]:
+        return self.client.get("/api/me/items", headers=self.headers(code)).json()["items"]
+
+    def test_a_give_returns_what_a_take_moved(self) -> None:
+        prepared = self.post("/api/items/give/prepare", {"stack_id": self.held()[0]["id"]})
+        self.assertEqual(prepared.status_code, 200, prepared.text)
+        given = self.post(
+            "/api/items/give", {"handle_id": prepared.json()["handles"]["all"], "destination": "party"}
+        )
+        self.assertEqual(given.json()["result"]["destination_name"], "the Party Stash")
+        self.assertEqual(self.stash_stack("Rope")["quantity"], 3)
+        self.assertEqual(self.held(), [])
+
+    def test_a_give_can_hand_it_to_another_active_character(self) -> None:
+        prepared = self.post("/api/items/give/prepare", {"stack_id": self.held()[0]["id"]})
+        given = self.post(
+            "/api/items/give",
+            {"handle_id": prepared.json()["handles"]["one"], "destination": self.other},
+        )
+        self.assertEqual(given.json()["result"]["destination_name"], "Brann")
+        self.assertEqual([(item["item_name"], item["quantity"]) for item in self.held("dm-code")], [("Rope", 1)])
+
+    def test_a_quantity_the_player_typed_needs_no_handle(self) -> None:
+        given = self.post(
+            "/api/items/give/some", {"item_name": "Rope", "quantity": 2, "destination": "party"}
+        )
+        self.assertEqual(given.status_code, 200, given.text)
+        self.assertEqual(given.json()["result"]["remaining"], 1)
+
+    def test_a_give_that_moved_under_the_press_is_asked_about(self) -> None:
+        prepared = self.post("/api/items/give/prepare", {"stack_id": self.held()[0]["id"]})
+        handle = prepared.json()["handles"]["all"]
+        self.grant("Rope", 1, interaction="grant-more-rope")
+        self.take("Rope")  # another character hands the giver one more
+
+        refused = self.post("/api/items/give", {"handle_id": handle, "destination": "party"})
+        self.assertEqual((refused.status_code, refused.json()["code"]), (409, "STALE"))
+        confirmed = self.post("/api/items/give/confirm", {"handle_id": handle, "destination": "party"})
+        self.assertEqual(confirmed.json()["result"]["quantity"], 4)
+
+    def test_using_something_spends_it_rather_than_moving_it(self) -> None:
+        used = self.post(
+            "/api/items/use", {"stack_id": self.held()[0]["id"], "quantity": 2, "reason": "Climbed a wall"}
+        )
+        self.assertEqual(used.json()["result"]["status"], "CONSUMED")
+        self.assertEqual(self.held()[0]["quantity"], 1)
+        self.assertEqual(self.client.get("/api/stash", headers=self.headers()).json()["total"], 0)
+
+    def test_a_player_cannot_correct_the_party_stash_by_calling_use(self) -> None:
+        """The one flag that separates using an item from emptying the stash.
+
+        `party_authorized` is set by the route and reaching for it in the body
+        changes nothing, which is the difference between a rule and a habit.
+        """
+        self.grant("Torch", 5, interaction="grant-torch")
+        refused = self.post(
+            "/api/items/use",
+            {
+                "stack_id": self.stash_stack("Torch")["id"],
+                "quantity": 5,
+                "party_authorized": True,
+                "actor_id": DM_ID,
+            },
+        )
+        self.assertEqual(refused.status_code, 422)
+        self.assertIn("DM", refused.json()["detail"])
+        self.assertEqual(self.stash_stack("Torch")["quantity"], 5)
+
+
+class ClaimAndCoinTests(ApiTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.register("Vex", PLAYER_ID, interaction="register-vex")
+
+    def drop_item(self) -> str:
+        self.context.loot.create_drop_interaction(
+            "open-drop", actor_id=DM_ID, items=[("Silver Dagger", 2, "Bandit camp")]
+        )
+        drops = self.client.get("/api/loot", headers=self.headers()).json()["drops"]
+        return drops[0]["items"][0]["id"]
+
+    def test_a_claim_moves_loot_onto_the_claimants_character(self) -> None:
+        claimed = self.post("/api/loot/claim", {"drop_item_id": self.drop_item(), "amount": 2})
+        self.assertEqual(claimed.status_code, 200, claimed.text)
+        self.assertEqual(claimed.json()["result"]["status"], "CLAIMED")
+        self.assertEqual(claimed.json()["result"]["quantity"], 2)
+        holdings = self.client.get("/api/me/items", headers=self.headers()).json()
+        self.assertEqual(holdings["items"][0]["item_name"], "Silver Dagger")
+
+    def test_a_claim_for_more_than_remains_is_refused_before_anything_moves(self) -> None:
+        refused = self.post("/api/loot/claim", {"drop_item_id": self.drop_item(), "amount": 3})
+        self.assertEqual((refused.status_code, refused.json()["code"]), (422, "REFUSED"))
+        self.assertEqual(self.client.get("/api/me/items", headers=self.headers()).json()["items"], [])
+
+    def test_coin_travels_back_to_the_treasury(self) -> None:
+        self.context.currency.adjust_treasury_interaction(
+            "fund-treasury", actor_id=DM_ID, deltas={"gp": 100}
+        )
+        self.post(
+            "/api/treasury/give",
+            {
+                "character_id": self.client.get("/api/characters", headers=self.headers()).json()["characters"][0]["id"],
+                "amounts": {"gp": 40},
+            },
+            code="dm-code",
+        )
+        returned = self.post("/api/treasury/return", {"amounts": {"gp": 15}, "destination": "party"})
+        self.assertEqual(returned.status_code, 200, returned.text)
+        body = self.client.get("/api/treasury", headers=self.headers()).json()
+        self.assertEqual(body["treasury"]["gp"], 75)
+        self.assertEqual(body["purse"]["balance"]["gp"], 25)
+
+    def test_coin_a_character_does_not_have_is_refused(self) -> None:
+        refused = self.post("/api/treasury/return", {"amounts": {"gp": 5}, "destination": "party"})
+        self.assertEqual((refused.status_code, refused.json()["code"]), (422, "REFUSED"))
+
+
+class IdempotencyTests(ApiTestCase):
+    """The key that replaced Discord's interaction id, and what it now has to defend.
+
+    Discord supplied an id nobody could choose. A browser chooses this one, so
+    the two things that were previously free — that a key belongs to the actor
+    who used it, and that it is a key at all — are checked here.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.register("Vex", PLAYER_ID, interaction="register-vex")
+        self.register("Brann", DM_ID, interaction="register-brann")
+        self.grant("Rope", 6, interaction="grant-rope")
+
+    def handle(self, code: str = "player-code") -> str:
+        return self.post(
+            "/api/stash/take/prepare", {"stack_id": self.stash_stack("Rope")["id"], "amount": 1}, code=code
+        ).json()["handle_id"]
+
+    def test_a_mutation_without_a_key_is_refused_rather_than_run(self) -> None:
+        response = self.client.post(
+            "/api/stash/take", json={"handle_id": self.handle()}, headers=self.headers()
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.stash_stack("Rope")["quantity"], 6)
+
+    def test_a_key_that_is_not_a_key_is_refused(self) -> None:
+        for key in ("x" * 200, "not a key", "../../etc/passwd"):
+            with self.subTest(key=key):
+                response = self.post("/api/stash/take", {"handle_id": self.handle()}, key=key)
+                self.assertEqual(response.status_code, 400)
+
+    def test_a_replayed_key_returns_the_stored_receipt_rather_than_taking_twice(self) -> None:
+        """Retry-safety for a flaky socket, which is what the receipt was always for."""
+        handle = self.handle()
+        first = self.post("/api/stash/take", {"handle_id": handle}, key="one-press")
+        second = self.post("/api/stash/take", {"handle_id": handle}, key="one-press")
+        self.assertEqual(first.json(), second.json())
+        self.assertEqual(self.stash_stack("Rope")["quantity"], 5)
+
+    def test_one_players_key_does_not_answer_for_anothers_action(self) -> None:
+        """Two clients generating the same string is a collision, not a replay."""
+        mine = self.post("/api/stash/take", {"handle_id": self.handle()}, key="same-key")
+        theirs = self.post(
+            "/api/stash/take", {"handle_id": self.handle("dm-code")}, key="same-key", code="dm-code"
+        )
+        self.assertEqual((mine.status_code, theirs.status_code), (200, 200))
+        self.assertNotEqual(mine.json()["operation_id"], theirs.json()["operation_id"])
+        self.assertEqual(self.stash_stack("Rope")["quantity"], 4)
+
+
+class MutationAuthorityTests(ApiTestCase):
+    """Who may do what, asked of the transport rather than of the panel."""
+
+    DM_ONLY = (
+        ("/api/treasury/give", {"character_id": "whoever", "amounts": {"gp": 1}}),
+        ("/api/characters", {"name": "Vex", "discord_user_id": PLAYER_ID}),
+        ("/api/characters/transition", {"character_id": "whoever", "lifecycle": "RETIRED"}),
+    )
+
+    def test_a_player_cannot_reach_a_dm_mutation(self) -> None:
+        for path, body in self.DM_ONLY:
+            with self.subTest(path=path):
+                self.assertEqual(self.post(path, body).status_code, 403)
+
+    def test_a_dm_can_register_a_character_for_a_player(self) -> None:
+        created = self.post("/api/characters", {"name": "Vex", "discord_user_id": PLAYER_ID}, code="dm-code")
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertEqual(created.json()["result"]["name"], "Vex")
+        # Registered for the player named in the body, not for the DM who is
+        # the actor on the call. This is the one identifier a body may carry.
+        mine = self.client.get("/api/me/items", headers=self.headers()).json()
+        theirs = self.client.get("/api/me/items", headers=self.headers("dm-code")).json()
+        self.assertEqual(mine["character"]["name"], "Vex")
+        self.assertIsNone(theirs["character"])
+
+    def test_a_dm_token_is_the_only_thing_that_confers_dm_authority(self) -> None:
+        """A player who says they are one is still a player."""
+        response = self.post(
+            "/api/characters", {"name": "Vex", "discord_user_id": PLAYER_ID, "is_dm": True}
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_the_actor_a_mutation_runs_as_is_the_one_the_token_proved(self) -> None:
+        self.register("Vex", PLAYER_ID, interaction="register-vex")
+        self.register("Brann", DM_ID, interaction="register-brann")
+        self.grant("Rope", 2, interaction="grant-rope")
+        prepared = self.post(
+            "/api/stash/take/prepare",
+            {"stack_id": self.stash_stack("Rope")["id"], "amount": 1, "actor_id": DM_ID},
+        )
+        self.post("/api/stash/take", {"handle_id": prepared.json()["handle_id"], "actor_id": DM_ID})
+        self.assertEqual(self.client.get("/api/me/items", headers=self.headers()).json()["items"][0]["quantity"], 1)
+        self.assertEqual(self.client.get("/api/me/items", headers=self.headers("dm-code")).json()["items"], [])
 
 
 class StaticSurfaceTests(ApiTestCase):
@@ -432,6 +786,21 @@ class LiveFeedTests(ApiTestCase):
         self.grant("Rope", 2, interaction="grant-rope")
         event = _next_message(socket)["events"][0]
         self.assertEqual(set(event), {"sequence", "event_type", "created_at"})
+
+    def test_a_take_made_through_the_activity_reaches_the_rest_of_the_table(self) -> None:
+        """Stage 4's half of the criterion Stage 3 set for a grant.
+
+        The bot changing the domain was the case that had to work first. This
+        is the one the migration is actually for: a player acts on the Activity
+        and every other screen at the table hears about it.
+        """
+        self.register("Vex", PLAYER_ID, interaction="register-vex")
+        self.grant("Rope", 2, interaction="grant-rope")
+        socket, _ = self.opened(code="dm-code")
+        self.take("Rope", "all")
+        notice = _next_message(socket)
+        self.assertEqual(notice["type"], EVENTS)
+        self.assertIn("ITEM_TAKEN", [event["event_type"] for event in notice["events"]])
 
     def test_a_change_reaches_every_socket_at_the_table(self) -> None:
         first, _ = self.opened()
