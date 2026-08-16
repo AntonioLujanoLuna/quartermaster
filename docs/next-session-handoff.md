@@ -1,6 +1,6 @@
 # Next-session handoff
 
-Updated: 2026-08-15 · Schema 12
+Updated: 2026-08-16 · Schema 12
 
 ## How to use this document
 
@@ -39,7 +39,12 @@ button carries a handle, so "Give all" cannot mean a number the giver never saw;
 names its own quantity does not need one. Coin moves both ways on the same terms —
 **Treasury → My coin…** sends a character's own currency back to the treasury or on to
 another active character — and every balance read and write goes through `read_balance` and
-`write_balance`.
+`write_balance`. Items can also leave the campaign: **My Items → Use…** spends what a
+character carries and **DM Tools → Correct stash…** removes from the Party Stash, both
+through `consume_interaction`, which follows possession — you may use up what you hold, only
+a DM may remove what the party shares — and writes an `ITEM_CONSUMED` ledger line. Neither
+is relative and neither carries a handle: the quantity is always named by the person
+removing it.
 
 **Projection.** State targets are scheduled by normalized lateness; events deliver FIFO
 per destination and bind to durable per-session threads. Undeliverable events dead-letter
@@ -80,8 +85,48 @@ durable but has no live caller, and its health check cannot fail on this build. 
 extension scaffold at `integrations/avrae/quartermaster_cog.py` is parked: Gate 1 was
 answered "no, for now" on 2026-08-14, and it has never been loaded in an Avrae deployment.
 
-**Checks.** 237 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Checks.** 244 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request.
+
+## Seventh pass on 2026-08-16
+
+One missing capability, the third with the same shape as the two before it, covered by tests
+that fail against the old behaviour.
+
+- **Items could enter the campaign and never leave.** Every item path was a mint or a
+  transfer: a grant mints into the Party Stash, a Loot Drop mints into the drop and returns
+  what nobody wanted, and take, claim, give and belongings resolution move what already
+  exists between owners. A stack row was only ever deleted because its quantity reached zero
+  on the way somewhere else, so the campaign's item total was monotonic.
+
+  Two ordinary things had nowhere to go. A potion drunk, a rope burned, twenty arrows fired:
+  the stash kept saying the party had them, and it drifted fastest for exactly the items that
+  get used most — on a permanent public surface that is also bounded, so dead entries push
+  live ones off the end and the table never gets the room back. And a mistyped grant, fifty
+  potions where the DM meant five, was permanent: granting again cannot subtract, and taking
+  only moves the mistake onto a character. The treasury has had signed **Adjust…** since the
+  beginning. Coin had this exit all along and items did not, which is the same asymmetry the
+  fifth and sixth passes closed for movement, one level down.
+
+  `consume_interaction` is the debit. **My Items → an item → Use…** spends what the caller's
+  active character is carrying; **DM Tools → Correct stash…** removes a quantity from the
+  Party Stash. Authorization follows possession, which is the rule the give paths already
+  hold: you may use up what you carry, and only a DM may remove what the party shares. It is
+  enforced in the transaction rather than only at the control, because a panel outlives the
+  render that built it and this is the one operation with no way back.
+
+  Nothing on this path is relative and nothing carries a handle. Every other quantity control
+  on the give panel is minted against a render because a give can be undone by giving it
+  back, and a stale one is worth a confirmation prompt; a removal cannot be undone by
+  anything, so the number is typed by the person removing it rather than fixed by a render
+  that has since gone stale. `ITEM_CONSUMED` is what pays for allowing it at all — the
+  session log says who removed what, how many, and why, reading as play at the character end
+  and as a correction at the party end.
+
+  Deliberately not done: a DM cannot remove from a *character's* holdings. An active
+  character's items are the player's to use up, and a non-active character's are what
+  belongings resolution is for. Adding a third path would be a second way to reach into
+  someone's pack.
 
 ## Sixth pass on 2026-08-15
 
@@ -388,6 +433,14 @@ Panel surface:
 7. Have a second player hand the first more of the same item while the first has the give
    panel open, then press `Give all`, and confirm the confirmation prompt appears and reads
    acceptably. This is the one path with no live evidence at all behind it.
+7a. **My Items → an item → Use…** for part of a stack, and confirm the reply and the session
+    log both read as a player using something rather than as a transfer, and that nothing
+    appeared in the Party Stash. Then use the rest and confirm the stack disappears from
+    My Items.
+7b. **DM Tools → Correct stash…** on a deliberately over-granted stack, and confirm the panel
+    lists the stash, that the removal reports what remains, and that the pinned Party Stash
+    converges to the corrected number. This is the repair for the most likely DM mistake at
+    the table, so it is worth making the mistake once on purpose.
 8. **Characters → Register…**, pick a player from the user select, and confirm the reply names
    them by mention. Repeat for a player who already has an active character and confirm the
    refusal names the existing one.

@@ -60,6 +60,7 @@ from .discord_views import (
     QuartermasterModal,
     QuartermasterView,
     SessionEndModal,
+    StashRemoveModal,
     TakeView,
     TreasuryAdjustModal,
     TreasuryGiveModal,
@@ -71,6 +72,7 @@ from .export import render_export
 from .inventory import InventoryError
 from .loot import LootDropError
 from .operations import create_scheduled_backup, health_report, render_health
+from .rendering import fit_discord_lines
 from .response import DeferredExecutionError
 from .sessions import SessionError
 
@@ -366,7 +368,7 @@ def _render_holdings(holdings: dict[str, Any]) -> str:
         lines.append("")
         lines.append(f"Showing {len(items)} of {total} stacks.")
     lines.append("")
-    lines.append("Choose one to give it back to the party or hand it to another character.")
+    lines.append("Choose one to hand it on, or to use it up.")
     return "\n".join(lines)
 
 
@@ -375,7 +377,7 @@ class MyItemsView(PanelView):
         super().__init__(context)
         if items:
             select = discord.ui.Select(
-                placeholder="Give one of these away…",
+                placeholder="Pick something you are carrying…",
                 options=[
                     discord.SelectOption(
                         label=str(item["item_name"])[:100],
@@ -1236,6 +1238,9 @@ class DMToolsView(PanelView):
         self.add_navigation(_open(open_loot_admin, context), label="Loot Drops", custom_id="qm:dm:loot", row=0)
         self.add_navigation(_open(open_session, context), label="Session", custom_id="qm:dm:session", row=0)
         self.add_navigation(
+            _open(open_stash_correction, context), label="Correct stash…", custom_id="qm:dm:correct", row=1
+        )
+        self.add_navigation(
             _open(open_maintenance, context), label="Maintenance", custom_id="qm:dm:maintenance", row=1
         )
         self.add_home(row=1)
@@ -1253,6 +1258,92 @@ async def open_dm_tools(interaction: discord.Interaction, context: Quartermaster
         "**DM TOOLS**\n\nGrant loot straight into the Party Stash, open a claimable drop, "
         "run the session, or take a backup.",
         DMToolsView(context),
+    )
+
+
+class StashCorrectionView(PanelView):
+    """Where the DM takes something out of the Party Stash for good.
+
+    It lives in DM Tools rather than on the Party Stash panel every player
+    opens, for the same reason granting does: the stash panel is what the
+    table looks at, and a destructive control on it is a control somebody
+    presses by accident.
+    """
+
+    def __init__(self, context: Quartermaster, items: list[dict]) -> None:
+        super().__init__(context)
+        if items:
+            select = discord.ui.Select(
+                placeholder="Remove some of…",
+                options=[
+                    discord.SelectOption(
+                        label=str(item["item_name"])[:100],
+                        value=str(item["id"]),
+                        description=f"The party holds {item['quantity']}",
+                    )
+                    for item in items[:SELECT_OPTION_LIMIT]
+                ],
+                custom_id="qm:correct:pick",
+                row=0,
+            )
+            select.callback = self._pick(select, items)
+            self.add_item(select)
+        self.add_navigation(
+            _open(open_stash_correction, context), label="Refresh", custom_id="qm:correct:refresh", row=1
+        )
+        self.add_navigation(
+            _open(open_dm_tools, context), label="◀ DM Tools", custom_id="qm:correct:back", row=1
+        )
+
+    def _pick(self, select: discord.ui.Select, items: list[dict]) -> Callable[[discord.Interaction], object]:
+        async def callback(interaction: discord.Interaction) -> None:
+            if not await _require_dm(interaction, self.settings):
+                return
+            stack_id = select.values[0]
+            item = next((row for row in items if str(row["id"]) == stack_id), None)
+            if item is None:
+                await _send_error(interaction, "That stack is no longer in the Party Stash.")
+                return
+            await interaction.response.send_modal(StashRemoveModal(self.context, item))
+
+        return callback
+
+
+async def open_stash_correction(interaction: discord.Interaction, context: Quartermaster) -> None:
+    if not await _require_dm(interaction, context.settings):
+        return
+    try:
+        execution = await _run_fast(interaction, context.settings, context.inventory.browse, ephemeral=True)
+    except InventoryError as error:
+        await _send_error(interaction, f"The Party Stash could not be read: {error}")
+        return
+    items = execution.value
+    lines = ["**CORRECT THE PARTY STASH**", ""]
+    if items:
+        lines.extend(
+            [
+                "Removing takes items out of the campaign — a mistyped grant, or something the "
+                "party used up.",
+                "It hands nothing back to anyone: to move an item, grant it or let a player give it.",
+                "",
+            ]
+        )
+        # The select shows the first twenty-five stacks, so the listing shows
+        # the same ones: a panel that names a stack with no option to choose it
+        # reads as an item that cannot be corrected at all.
+        lines.extend(
+            f"• {item['item_name']} x{item['quantity']}" for item in items[:SELECT_OPTION_LIMIT]
+        )
+        overflow = _select_overflow(len(items), noun="stacks")
+        if overflow:
+            lines.extend(["", overflow.strip()])
+    else:
+        lines.append("The Party Stash is empty, so there is nothing to correct.")
+    await _send_panel(
+        interaction,
+        fit_discord_lines(lines, label="Party Stash"),
+        StashCorrectionView(context, items),
+        execution=execution,
     )
 
 

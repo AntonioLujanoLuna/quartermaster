@@ -483,6 +483,142 @@ class QuartermasterCoreTests(unittest.TestCase):
         )
         self.assertEqual(self._item_total(), with_drop)
 
+    def test_items_leave_the_campaign_only_through_an_audited_removal(self) -> None:
+        """Something has to be able to go, and it has to leave a line saying so.
+
+        Every other item path is a mint or a transfer, so the campaign's item
+        total could only rise: a potion drunk stayed in the stash forever, and
+        a mistyped grant of fifty was permanent, because granting cannot
+        subtract and taking only moves the mistake onto a character. The
+        treasury has had signed **Adjust…** since the beginning; this is the
+        same exit for items, and the ledger entry is what pays for it.
+        """
+        self.inventory.grant_interaction(
+            "consume-grant", actor_id="dm", item_name="Trail Ration", quantity=5
+        )
+        self.assertEqual(self._item_total(), {"trail ration": 5})
+        stack_id = self.inventory.browse()[0]["id"]
+        # Retire the grant's own dirty mark, so what is asserted below is that
+        # the removal marked the pinned surface and not that the grant did.
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE projection_targets SET dirty_since = NULL WHERE target_id = 'party-stash'"
+            )
+
+        removed = self.inventory.consume_interaction(
+            "consume-correction",
+            actor_id="dm",
+            stack_id=stack_id,
+            quantity=2,
+            reason="Miscounted the grant",
+            party_authorized=True,
+        )
+        self.assertEqual(removed.logical_response["remaining"], 3)
+        self.assertEqual(self._item_total(), {"trail ration": 3})
+        recorded = self.store.connection.execute(
+            "SELECT payload FROM ledger_entries WHERE event_type = 'ITEM_CONSUMED'"
+        ).fetchall()
+        self.assertEqual(len(recorded), 1)
+        payload = json.loads(recorded[0]["payload"])
+        self.assertEqual(payload["quantity"], 2)
+        self.assertEqual(payload["owner_type"], "PARTY")
+        self.assertEqual(payload["reason"], "Miscounted the grant")
+        # The pinned surface renders party holdings, so a removal from the
+        # stash has to make it dirty exactly as a grant does.
+        self.assertIsNotNone(
+            self.store.connection.execute(
+                "SELECT dirty_since FROM projection_targets WHERE target_id = 'party-stash'"
+            ).fetchone()["dirty_since"]
+        )
+
+        prepared = self.inventory.prepare_take_view(actor_id="player")
+        self.inventory.take_interaction(
+            "consume-take", handle_id=prepared["take_all_handles"][stack_id], actor_id="player"
+        )
+        held_id = self.store.connection.execute(
+            "SELECT id FROM inventory_stacks WHERE owner_type = 'CHARACTER' AND owner_id = 'player-character'"
+        ).fetchone()["id"]
+        used = self.inventory.consume_interaction(
+            "consume-use", actor_id="player", stack_id=held_id, quantity=3
+        )
+        self.assertEqual(used.logical_response["owner_name"], "Player Character")
+        self.assertEqual(used.logical_response["remaining"], 0)
+        self.assertEqual(used.logical_response["reason"], None)
+        # An emptied stack is gone rather than left at zero, exactly as it is
+        # when the last of it is given away.
+        self.assertEqual(self._item_total(), {})
+
+    def test_removing_an_item_follows_possession_and_refuses_everything_else(self) -> None:
+        """You may use up what you carry; only a DM may remove what the party shares.
+
+        This is the same rule the give paths hold, and it is checked in the
+        transaction rather than only at the Discord control, because a panel
+        outlives the render that built it and this is the one operation with
+        no way back.
+        """
+        self._insert_character("consume-other", "Berrian")
+        self.inventory.grant_interaction(
+            "consume-refuse-grant", actor_id="dm", item_name="Brass Key", quantity=4
+        )
+        stack_id = self.inventory.browse()[0]["id"]
+        prepared = self.inventory.prepare_take_view(actor_id="player")
+        self.inventory.take_interaction(
+            "consume-refuse-take", handle_id=prepared["handles"][stack_id], actor_id="player"
+        )
+        self.inventory.give_interaction(
+            "consume-refuse-give",
+            actor_id="player",
+            item_name="Brass Key",
+            quantity=1,
+            destination="consume-other",
+        )
+        other_id = self.store.connection.execute(
+            "SELECT id FROM inventory_stacks WHERE owner_type = 'CHARACTER' AND owner_id = 'consume-other'"
+        ).fetchone()["id"]
+        before = self._item_total()
+        receipts_before = self.store.connection.execute(
+            "SELECT COUNT(*) FROM interaction_receipts"
+        ).fetchone()[0]
+
+        with self.assertRaisesRegex(InventoryError, "only a DM administrator"):
+            self.inventory.consume_interaction(
+                "consume-player-stash", actor_id="player", stack_id=stack_id, quantity=1
+            )
+        with self.assertRaisesRegex(InventoryError, "your own active character"):
+            self.inventory.consume_interaction(
+                "consume-someone-elses", actor_id="player", stack_id=other_id, quantity=1
+            )
+        with self.assertRaisesRegex(InventoryError, "your own active character"):
+            self.inventory.consume_interaction(
+                "consume-unregistered", actor_id="stranger", stack_id=other_id, quantity=1
+            )
+        with self.assertRaisesRegex(InventoryError, "holds only 3"):
+            self.inventory.consume_interaction(
+                "consume-too-many",
+                actor_id="dm",
+                stack_id=stack_id,
+                quantity=4,
+                party_authorized=True,
+            )
+        with self.assertRaisesRegex(InventoryError, "quantity must be positive"):
+            self.inventory.consume_interaction(
+                "consume-zero", actor_id="dm", stack_id=stack_id, quantity=0, party_authorized=True
+            )
+        with self.assertRaisesRegex(InventoryError, "no longer there"):
+            self.inventory.consume_interaction(
+                "consume-missing",
+                actor_id="dm",
+                stack_id="not-a-stack",
+                quantity=1,
+                party_authorized=True,
+            )
+        self.assertEqual(self._item_total(), before)
+        self.assertEqual(
+            self.store.connection.execute("SELECT COUNT(*) FROM interaction_receipts").fetchone()[0],
+            receipts_before,
+            "a refused removal must leave no receipt behind",
+        )
+
     def test_settings_require_guild_and_database(self) -> None:
         with self.assertRaises(ConfigurationError):
             Settings.from_env({})

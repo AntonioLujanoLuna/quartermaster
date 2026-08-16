@@ -707,6 +707,129 @@ class InventoryService:
             destination=destination,
         )
 
+    def consume_interaction(
+        self,
+        interaction_id: str,
+        *,
+        actor_id: str | None,
+        stack_id: str,
+        quantity: int,
+        reason: str | None = None,
+        party_authorized: bool = False,
+    ) -> ReceiptResult:
+        """Take a quantity out of the campaign, deliberately and on the record.
+
+        Every other item path is a mint or a transfer. A grant mints into the
+        Party Stash, a Loot Drop mints into the drop and returns what nobody
+        wanted, and take, claim, give and belongings resolution move what
+        already exists between owners. A stack row is only ever deleted because
+        its quantity reached zero on the way somewhere else, so the campaign's
+        item total could rise and never fall.
+
+        Two ordinary things at the table had nowhere to go. A potion drunk, a
+        rope burned, twenty arrows fired: the stash keeps saying the party has
+        them, and it drifts fastest for exactly the items that get used most.
+        And a mistyped grant — 50 potions where the DM meant 5 — was permanent,
+        because the repair everyone reaches for is the one that makes it worse.
+        Granting again cannot subtract, taking only moves the mistake onto a
+        character, and the treasury's own **Adjust…** has taken signed deltas
+        since the beginning: coin has had this exit all along and items did not.
+
+        Who may do it follows possession, which is the same rule the give paths
+        already hold. You may use up what you are carrying, because it is
+        yours and handing it back is already yours to do. Only a DM may remove
+        from the Party Stash, because it is shared. `party_authorized` is what
+        the Discord gate passes through, and it is checked here rather than
+        only at the control, because the control is ergonomics and this is the
+        boundary.
+
+        Nothing here is relative. The quantity is always named by the person
+        removing it, so there is no handle and no staleness prompt: the one
+        operation with no way back should never be a single press whose meaning
+        was fixed by a render that has since gone stale.
+        """
+        if quantity <= 0:
+            raise InventoryError("quantity must be positive")
+        normalized_reason = (reason or "").strip() or None
+        return self.receipts.execute_fast(
+            interaction_id,
+            actor_id=actor_id,
+            response_kind="stash",
+            mutation=lambda connection, operation_id: self._consume_in_transaction(
+                connection,
+                operation_id,
+                actor_id,
+                stack_id,
+                quantity,
+                normalized_reason,
+                party_authorized,
+            ),
+        )
+
+    def _consume_in_transaction(
+        self,
+        connection: Any,
+        operation_id: str,
+        actor_id: str | None,
+        stack_id: str,
+        quantity: int,
+        reason: str | None,
+        party_authorized: bool,
+    ) -> dict[str, Any]:
+        source = connection.execute("SELECT * FROM inventory_stacks WHERE id = ?", (stack_id,)).fetchone()
+        if source is None:
+            raise InventoryError("that item is no longer there")
+        if source["owner_type"] == "PARTY":
+            if not party_authorized:
+                raise InventoryError(
+                    "only a DM administrator can remove something from the Party Stash"
+                )
+            owner_name = "the Party Stash"
+        else:
+            holder = active_claimant(connection, actor_id)
+            if holder is None or str(holder["id"]) != str(source["owner_id"]):
+                raise InventoryError("you can only use up what your own active character is holding")
+            owner_name = str(holder["name"])
+        held = int(source["quantity"])
+        if held < quantity:
+            raise InventoryError(f"{owner_name} holds only {held}")
+        now = iso_now()
+        remaining = held - quantity
+        if remaining == 0:
+            connection.execute("DELETE FROM inventory_stacks WHERE id = ?", (stack_id,))
+        else:
+            connection.execute(
+                "UPDATE inventory_stacks SET quantity = ?, version = version + 1, updated_at = ? WHERE id = ?",
+                (remaining, now, stack_id),
+            )
+        result = {
+            "status": "CONSUMED",
+            "stack_id": stack_id,
+            "item_name": source["item_name"],
+            "quantity": quantity,
+            "remaining": remaining,
+            "owner_type": source["owner_type"],
+            "owner_id": str(source["owner_id"]),
+            "owner_name": owner_name,
+            "reason": reason,
+        }
+        # The ledger is the whole justification for allowing this at all: an
+        # item that leaves the campaign leaves a line saying who removed it,
+        # how many, and why.
+        append_event(
+            connection,
+            operation_id=operation_id,
+            actor_id=actor_id,
+            event_type="ITEM_CONSUMED",
+            payload=result,
+            destination=session_event_destination(connection),
+        )
+        if source["owner_type"] == "PARTY":
+            mark_projection_dirty(
+                connection, target_id="party-stash", target_type="STATE", destination="party-inventory"
+            )
+        return result
+
     def browse(self) -> list[dict[str, Any]]:
         with self.store.read() as connection:
             rows = connection.execute(

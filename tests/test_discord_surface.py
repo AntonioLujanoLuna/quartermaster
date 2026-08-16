@@ -53,13 +53,15 @@ from quartermaster.discord_views import (
     GrantLootModal,
     LootDropModal,
     SessionEndModal,
+    StashRemoveModal,
     TakeConfirmationView,
     TreasuryAdjustModal,
     TreasuryGiveModal,
     TreasurySplitModal,
+    UseItemModal,
 )
 from quartermaster.handles import HandleRepository
-from quartermaster.inventory import InventoryService
+from quartermaster.inventory import InventoryError, InventoryService
 from quartermaster.loot import LootDropService
 from quartermaster.receipts import ReceiptRepository
 from quartermaster.rendering import DISCORD_MESSAGE_LIMIT
@@ -465,6 +467,7 @@ class AuthorizationTests(SurfaceTestCase):
             "DM Tools → Grant loot…": (DMToolsView(self.context), "Grant loot…"),
             "DM Tools → Loot Drops": (DMToolsView(self.context), "Loot Drops"),
             "DM Tools → Session": (DMToolsView(self.context), "Session"),
+            "DM Tools → Correct stash…": (DMToolsView(self.context), "Correct stash…"),
             "DM Tools → Maintenance": (DMToolsView(self.context), "Maintenance"),
             "Loot admin → New drop…": (LootAdminView(self.context, []), "New drop…"),
             "Session → Start session": (SessionView(self.context, active=None), "Start session"),
@@ -500,6 +503,10 @@ class AuthorizationTests(SurfaceTestCase):
             "treasury split": (TreasurySplitModal(self.context), {"gp": 5}),
             "treasury give": (TreasuryGiveModal(self.context, "whoever", "Nobody"), {"gp": 5}),
             "combat end": (CombatEndModal(self.context), {"outcome": None}),
+            "stash removal": (
+                StashRemoveModal(self.context, {"id": "any-stack", "item_name": "Crown", "quantity": 4}),
+                {"quantity": 1, "reason": None},
+            ),
         }
         for name, (modal, fields) in modals.items():
             with self.subTest(modal=name):
@@ -789,7 +796,7 @@ class GivingTests(SurfaceTestCase):
         character_id = self.register()
         self.hold("Rope", 4)
         panel = self.give_panel()
-        self.assertIn("Rope · you hold 4", panel.text)
+        self.assertIn("You hold 4.", panel.text)
 
         given = self.press(panel.view, "Give all")
         self.assertEqual(given.text, "Tamsin gave 4 Rope to the Party Stash. 0 still held.")
@@ -831,7 +838,7 @@ class GivingTests(SurfaceTestCase):
         panel = self.give_panel()
 
         chosen = self.choose(panel.view, "qm:give:destination", [recipient_id])
-        self.assertIn("Going to Berrian.", chosen.text)
+        self.assertIn("Give → Berrian.", chosen.text)
 
         given = self.press(panel.view, "Give all")
         self.assertEqual(given.text, "Tamsin gave 2 Rope to Berrian. 0 still held.")
@@ -1528,12 +1535,106 @@ class MaintenanceTests(SurfaceTestCase):
         expected = {
             "Loot Drops": "**OPEN LOOT**",
             "Session": "**SESSION**",
+            "Correct stash…": "**CORRECT THE PARTY STASH**",
             "Maintenance": "**MAINTENANCE**",
         }
         tools = self.walk("DM Tools", who="dm")
         for label, marker in expected.items():
             with self.subTest(tool=label):
                 self.assertIn(marker, self.press(tools.view, label, "dm").text)
+
+
+class UsingUpTests(SurfaceTestCase):
+    """The way out of the campaign, from both ends of possession.
+
+    Until these controls existed every item path was a mint or a transfer, so
+    a drunk potion stayed in the stash for the length of the campaign and a
+    mistyped grant of fifty could not be taken back by anything.
+    """
+
+    def hold(self, item: str = "Potion of Healing", quantity: int = 3, who: str = "player") -> None:
+        self.grant(item, quantity)
+        panel = self.take_panel(who)
+        self.press(panel.view, f"Take all {item}" if quantity > 1 else f"Take 1 {item}", who)
+
+    def item_panel(self, who: str = "player") -> FakeInteraction:
+        items = self.walk("My Items", who=who)
+        stack_id = self.select(items.view, "qm:items:pick").options[0].value
+        return self.choose(items.view, "qm:items:pick", [stack_id], who)
+
+    def correction_panel(self) -> FakeInteraction:
+        return self.walk("DM Tools", "Correct stash…", who="dm")
+
+    def test_a_player_uses_up_what_they_are_carrying(self) -> None:
+        character_id = self.register()
+        self.hold("Potion of Healing", 3)
+        panel = self.item_panel()
+        self.assertIn("Use → gone from the campaign", panel.text)
+
+        opened = self.press(panel.view, "Use…")
+        modal = opened.response.modal
+        self.assertIsInstance(modal, UseItemModal)
+        used = self.submit(modal, "player", quantity=2, reason="Drunk in the tomb")
+        self.assertEqual(used.text, "You used 2 Potion of Healing. 1 still held.")
+        self.assertEqual(self.held(character_id), {"Potion of Healing": 1})
+        # It went nowhere: this is the one path that is not a transfer.
+        self.assertEqual(self.stash_quantities(), {})
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM ledger_entries WHERE event_type = 'ITEM_CONSUMED'"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_using_more_than_is_held_is_refused_with_the_real_number(self) -> None:
+        character_id = self.register()
+        self.hold("Rope", 2)
+        modal = self.press(self.item_panel().view, "Use…").response.modal
+        refusal = self.submit(modal, "player", quantity=5, reason=None)
+        self.assertIn("holds only 2", refusal.text)
+        self.assertEqual(self.held(character_id), {"Rope": 2})
+
+    def test_the_dm_removes_a_mistyped_grant_from_the_party_stash(self) -> None:
+        self.grant("Trail Ration", 50)
+        panel = self.correction_panel()
+        self.assertIn("• Trail Ration x50", panel.text)
+        self.assertIn("hands nothing back to anyone", panel.text)
+
+        stack_id = self.select(panel.view, "qm:correct:pick").options[0].value
+        chosen = self.choose(panel.view, "qm:correct:pick", [stack_id], "dm")
+        modal = chosen.response.modal
+        self.assertIsInstance(modal, StashRemoveModal)
+        removed = self.submit(modal, "dm", quantity=45, reason="Meant five")
+        self.assertIn("Removed 45 Trail Ration from the Party Stash. 5 remain.", removed.text)
+        self.assertEqual(self.stash_quantities(), {"Trail Ration": 5})
+
+    def test_a_player_cannot_remove_from_the_shared_stash(self) -> None:
+        """The gate is on the control, and the domain refuses without it.
+
+        A view outlives the render that built it, so the control checks again
+        when it is pressed — and the mutation refuses a party-owned stack
+        unless that check passed, because this is the one operation with no
+        way back.
+        """
+        self.grant("Rope", 4)
+        stack_id = str(self.inventory.browse()[0]["id"])
+        panel = self.correction_panel()
+        refusal = self.choose(panel.view, "qm:correct:pick", [stack_id], "bystander")
+        self.assertIn("Only configured DM administrators", refusal.text)
+
+        with self.assertRaisesRegex(InventoryError, "only a DM administrator"):
+            self.inventory.consume_interaction(
+                "surface-player-stash-removal",
+                actor_id=str(PLAYER_ID),
+                stack_id=stack_id,
+                quantity=1,
+            )
+        self.assertEqual(self.stash_quantities(), {"Rope": 4})
+
+    def test_the_correction_panel_says_so_when_there_is_nothing_to_correct(self) -> None:
+        panel = self.correction_panel()
+        self.assertIn("The Party Stash is empty", panel.text)
+        self.assertEqual([item.custom_id for item in panel.view.children if item.custom_id.endswith("pick")], [])
 
 
 if __name__ == "__main__":

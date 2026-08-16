@@ -87,6 +87,15 @@ character. Adjusting the treasury only touches the party's own balance, so using
 a mistyped `Give to…` would mint the difference rather than return it — the same reason
 granting is not how you undo a take.
 
+Items can also leave the campaign, which is the one thing giving cannot do. **My Items → an
+item → Use…** spends a quantity of what you are carrying — a potion drunk, twenty arrows
+fired — and **DM Tools → Correct stash…** removes a quantity from the Party Stash, which is
+the repair for a grant of fifty that was meant to be five. Both are debits and neither hands
+anything to anyone, so neither is a way to move an item; both are refused for anything the
+owner is not actually holding, and both write a ledger line naming who, how many, and why.
+You may use up what you carry; only a DM may remove what the party shares, and that is
+checked again in the transaction rather than only at the control.
+
 Every message Quartermaster sends is rendered within Discord's 2000-character limit. List
 surfaces — the Party Stash projection and the stash, loot and character panels — drop whole
 entries from the end and say how many they dropped rather than letting Discord reject the
