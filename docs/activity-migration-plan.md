@@ -1,8 +1,8 @@
 # Moving the table surface into a Discord Activity
 
-Status: Stages 1, 2, and 3 implemented, and none of them has been run against
-the guild. Stage 0 — hosting — is still open, and is what Stages 2 and 3 are
-waiting on. Stages 4 to 6 are proposed.
+Status: Stages 1, 2, 3, and 4 implemented, and none of them has been run against
+the guild. Stage 0 — hosting — is still open, and is what every stage past 1 is
+waiting on. Stages 5 and 6 are proposed.
 
 ## Why
 
@@ -127,11 +127,17 @@ The handshake:
 Discord supplies it. An Activity has no interaction ids.
 
 The client generates a UUIDv4 per user action and sends it as an `Idempotency-Key` header.
-The backend passes it straight through as `interaction_id`. The existing behaviour — a
-replayed key returns the stored receipt rather than re-running the mutation — becomes
-retry-safety for a flaky socket, which is a better fit than it ever was for buttons. The
-key must be generated when the user acts, not per request, or a retry mints a second
-operation.
+The existing behaviour — a replayed key returns the stored receipt rather than re-running
+the mutation — becomes retry-safety for a flaky socket, which is a better fit than it ever
+was for buttons. The key must be generated when the user acts, not per request, or a retry
+mints a second operation.
+
+Built, with one correction to "passes it straight through". Discord supplied an
+interaction id nobody could choose; a client chooses this one, so the key the receipts
+table sees is `activity:<actor>:<key>` — namespaced by the actor the token proved, with
+the separator kept out of the key's alphabet. Unscoped, one player could quote another's
+key and be handed their receipt. The key is also bounded and checked against that
+alphabet, because it becomes a primary key in `interaction_receipts`.
 
 ### Live state
 
@@ -183,6 +189,23 @@ prompt fires rarely, and when it does it is a genuine conflict rather than an ar
 panel rendered ninety seconds ago. `SemanticStaleness` and
 `CurrencySemanticStaleness` keep meaning exactly what they mean now.
 
+What also changes is when they are minted, and this is the one thing Stage 4 had to decide
+rather than port. The panel minted handles when it rendered a message, because the server
+was the thing doing the rendering. Here it is not: a `prepare` call mints when the player
+acts, so the read set means "what was true when you pressed" rather than "what was on the
+message". The stale *screen* is prevented upstream by the live feed instead of being caught
+downstream by a confirmation — and the race this section is actually about, two players
+taking all of one stack in the same tick, happens inside that round trip and is still
+caught there. The alternative, minting against every read so a handle exists for every
+listed stack before anyone presses anything, is the component budget again: it would mint
+handles for a forty-stack stash on every change, for every client at the table.
+
+A claim is the exception, and mints inside the request that spends it. Its handle carries
+`remaining_quantity` and nothing compares it to anything — the claim is absolute and
+re-checks the remainder in the transaction — so there is no relative meaning for a read set
+to preserve. What the handle does there is bind the claim to one actor and one use, and
+minting it in the request satisfies both.
+
 ## API surface
 
 All paths are relative to the mapped proxy root. Every endpoint requires the session token;
@@ -208,22 +231,35 @@ components. Over HTTP they become real pagination, or nothing at all.
 
 ### Mutations
 
-Each takes `Idempotency-Key`; each derives `actor_id` from the token.
+Each takes `Idempotency-Key`; each derives `actor_id` from the token. A `prepare` mints a
+handle and is not itself an action, so it takes no key: a retry costs an unspent handle
+rather than a receipt for something nobody completed.
 
 | Endpoint | Backed by | DM |
 | --- | --- | --- |
-| `POST /api/stash/take/prepare` | `InventoryService.prepare_take_view`, `create_take_handle` | |
+| `POST /api/stash/take/prepare` | `InventoryService.create_take_handle` | |
 | `POST /api/stash/take` | `InventoryService.take_interaction` | |
 | `POST /api/stash/take/confirm` | `InventoryService.confirm_take_interaction` | |
 | `POST /api/items/give/prepare` | `InventoryService.create_give_handles` | |
 | `POST /api/items/give` | `InventoryService.give_with_handle_interaction` | |
 | `POST /api/items/give/confirm` | `InventoryService.confirm_give_with_handle_interaction` | |
+| `POST /api/items/give/some` | `InventoryService.give_interaction` | |
 | `POST /api/items/use` | `InventoryService.consume_interaction` | |
 | `POST /api/loot/claim` | `LootDropService.create_claim_handle`, `claim_interaction` | |
-| `POST /api/treasury/give` | `CurrencyService.give_to_character_interaction` | |
 | `POST /api/treasury/return` | `CurrencyService.give_from_character_interaction` | |
-| `POST /api/characters` | `CharacterService.create_interaction` | |
-| `POST /api/characters/transition` | `CharacterService.transition_interaction` | |
+| `POST /api/treasury/give` | `CurrencyService.give_to_character_interaction` | ✓ |
+| `POST /api/characters` | `CharacterService.create_interaction` | ✓ |
+| `POST /api/characters/transition` | `CharacterService.transition_interaction` | ✓ |
+
+Three rows carry a check mark this table did not originally give them. Treasury → a
+character, registering a character, and moving one through its lifecycle are all behind
+`_require_dm` on the panel, and an API that grants authority the surface it replaces does
+not grant is not a migration of it. `prepare_take_view` left the table for the same kind of
+reason: it exists to mint against a component budget, and there is no budget here.
+
+`/api/items/give/some` is new to the table and was always on the panel — a give whose
+quantity the player types needs no handle, because the number came from the person giving
+rather than from a render.
 | `POST /api/stash/grant` | `InventoryService.grant_interaction` | ✓ |
 | `POST /api/stash/correct` | `InventoryService.consume_interaction`, `party_authorized=True` | ✓ |
 | `POST /api/loot/drops` | `LootDropService.create_drop_interaction` | ✓ |
@@ -284,10 +320,24 @@ when one is refused rather than going quiet — on the socket and on the reads b
 existed from Stage 1; a live screen is what made it visible, because a screen that stops
 reading still looks connected.
 
-**Stage 4 — Player mutations.** Take, give, use, claim, coin, character registration. The
-first stage where a handle round-trips through the new transport. *Exit: a full session's
-player actions run through the Activity; the ledger is indistinguishable from a bot-driven
-session.*
+**Stage 4 — Player mutations.** *Built, not yet launched.* Take, give, use, claim, coin,
+character registration — the mutation table above, `activity/src/actions.js` as the client
+half, and four screens to act on. The first stage where a handle round-trips through the
+new transport, and the stage that decided when a handle is minted at all.
+
+The refusals are the part worth stating. A domain refusal reaches the client as a status
+and a code rather than only as a sentence, because three of them mean different things to
+do: `STALE` is a question for the player and is answered on a confirm route, `HANDLE` means
+the control was spent or expired and the action has to be prepared again, and `REFUSED` is
+the domain's answer and the end of it. The sentence still travels in `detail`, where the
+reads already put theirs.
+
+*Exit still open: a full session's player actions running through the Activity with a
+ledger indistinguishable from a bot-driven session needs a session, which needs Stage 0.
+`tests/test_api.py` proves the ledger half — that a take through the API lands the same
+rows a take through a panel does, that a quantity moving under a press is asked about
+rather than substituted, that one player's handle and one player's idempotency key are not
+another's, and that a take made on the Activity reaches the other screens at the table.*
 
 **Stage 5 — DM surface.** Grant, drops, session start/end, combat, corrections,
 maintenance. *Exit: a DM runs a session end to end without opening a panel.*
@@ -299,6 +349,18 @@ the projection, and a deliberately small async surface (see below). *Exit:
 Stages 1–3 are the ones worth doing before committing to the rest. If the proxy, the
 handshake, or the hosting turns out to be intolerable, that is knowable by the end of
 Stage 2 and costs no domain changes to abandon.
+
+Stage 4 was nevertheless built before Stage 0 was answered, which is out of order and
+worth saying rather than leaving to be inferred. The previous pass recorded the objection
+in its own words — "Stage 4 adds mutations to a transport nobody has launched, which is the
+wrong order" — and it still stands: hosting is a decision about where this runs and how the
+database is backed up there, and no amount of code answers it. What Stage 4 did cost was
+bounded on purpose. It added no domain code, changed no service, and every route on it is
+the call a panel already makes; if the hosting question is answered "not this", the whole
+of it is deleted without touching anything that stores an item. What it buys is that the
+questions the transport can still get wrong — where a handle is minted, what a refusal
+looks like to a client, whose idempotency key is whose — are answered now, and are the kind
+of thing that is far more expensive to discover during a session than before one.
 
 ## What the bot keeps forever
 

@@ -141,12 +141,12 @@ main {
   font-size: 14px;
 }
 
-table.stash {
+table.listing {
   width: 100%;
   border-collapse: collapse;
 }
 
-table.stash th {
+table.listing th {
   text-align: left;
   font-size: 12px;
   text-transform: uppercase;
@@ -160,14 +160,238 @@ table.stash th {
   background: var(--ground);
 }
 
-table.stash td {
+table.listing td {
   padding: 8px 10px;
   border-bottom: 1px solid var(--line);
+  vertical-align: middle;
 }
 
-table.stash td.quantity {
+table.listing td.quantity {
   font-variant-numeric: tabular-nums;
   width: 4em;
+}
+
+table.listing td.field {
+  width: 6em;
+}
+
+table.listing td.controls {
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Controls ---------------------------------------------------------------- */
+
+.press {
+  font: inherit;
+  font-size: 13px;
+  padding: 5px 10px;
+  margin-left: 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--raised);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.press:hover:not(:disabled) {
+  border-color: var(--muted);
+}
+
+/* Disabled is the state of every control while an action is in flight, so it
+   has to read as "wait", not as "you may not". */
+.press:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.press.primary {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.press.danger {
+  border-color: #d83c3e;
+  color: #d83c3e;
+}
+
+.press.quiet {
+  border-color: transparent;
+  color: var(--muted);
+}
+
+.quantity-field,
+.text-field,
+.select {
+  font: inherit;
+  font-size: 13px;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--ground);
+  color: var(--ink);
+}
+
+.quantity-field {
+  width: 5em;
+  font-variant-numeric: tabular-nums;
+}
+
+.text-field {
+  flex: 1 1 12em;
+  min-width: 8em;
+}
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 10px;
+}
+
+.tab {
+  font: inherit;
+  font-size: 13px;
+  padding: 5px 10px;
+  border: 1px solid transparent;
+  border-radius: 4px 4px 0 0;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.tab-current {
+  color: var(--ink);
+  border-color: var(--line);
+  border-bottom-color: var(--ground);
+  background: var(--raised);
+}
+
+.badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--ground);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* What happened, and what is being asked ---------------------------------- */
+
+.notice,
+.prompt {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--raised);
+}
+
+.notice p,
+.prompt p {
+  margin: 0;
+}
+
+.notice-ok {
+  border-left: 3px solid #3ba55d;
+}
+
+.notice-bad {
+  border-left: 3px solid #d83c3e;
+}
+
+.prompt {
+  border-left: 3px solid var(--accent);
+}
+
+.prompt-text {
+  flex: 1 1 20em;
+}
+
+.prompt-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  justify-content: flex-end;
+}
+
+/* Forms ------------------------------------------------------------------- */
+
+.form,
+.destination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.destination {
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+
+.coin-fields {
+  display: flex;
+  gap: 8px;
+}
+
+.coin-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.coin-field .quantity-field {
+  width: 4.5em;
+}
+
+.coin.big {
+  font-size: 18px;
+  margin: 0 0 12px;
+}
+
+.screen h2 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 18px 0 6px;
+}
+
+.screen > h2:first-child {
+  margin-top: 0;
+}
+
+.dm-block {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.drop + .drop {
+  margin-top: 20px;
+}
+
+.roster li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.roster-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .muted {

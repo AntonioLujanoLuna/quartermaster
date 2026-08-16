@@ -1,26 +1,50 @@
 # The Quartermaster Activity
 
-The web surface Discord embeds in its own client. Stages 1 to 3 of
-[the migration plan](../docs/activity-migration-plan.md): the read API, the
-OAuth handshake, one read-only screen — the Party Stash, with the instance
-roster beside it — and the live feed that keeps it current.
+The web surface Discord embeds in its own client. Stages 1 to 4 of
+[the migration plan](../docs/activity-migration-plan.md): the API, the OAuth
+handshake, the live feed that keeps the screen current, and four screens a
+player can act on — Party Stash, My Items, Loot, and Treasury, with the instance
+roster beside them.
 
-This is a walking skeleton on purpose. It proves the handshake, the proxy, and
-the hosting, which are the parts that can only be discovered against real
-Discord. Nothing here mutates anything; the panels remain the way to act.
+None of it has been framed by Discord once. Stage 0 — an https origin — is what
+that is waiting on.
 
 ## What it is made of
 
 | File | What it does |
 | --- | --- |
-| `src/main.js` | The boot sequence: SDK ready, authorize, exchange, authenticate, connect, read, subscribe |
-| `src/api.js` | The session token, every call that carries it, and getting another one when it expires |
+| `src/main.js` | The boot sequence and the state the screens read: SDK ready, authorize, exchange, authenticate, connect, read, subscribe |
+| `src/api.js` | The session token, every call that carries it, the idempotency key on a mutation, and getting another token when this one expires |
+| `src/actions.js` | What a press means: prepare, one key per action, and what to do with a refusal |
 | `src/live.js` | The socket, its cursor, and the reconnect that resumes from it |
-| `src/render.js` | The screen, built with `createElement` rather than `innerHTML` |
+| `src/render.js` | The screens, built with `createElement` rather than `innerHTML` |
+| `src/format.js` | The few things the screens and the action results both have to say the same way |
 | `src/style.css` | A palette that follows the client's theme rather than choosing one |
 
 The API it talks to is `src/quartermaster/api_app.py`; the feed behind it is
 `src/quartermaster/api_live.py`.
+
+## What a press costs
+
+A mutation addressed by a handle is two calls: `prepare` mints the handle, and
+the action spends it. The handle carries the read set the action was decided
+against, which is what lets `Take all` mean a number rather than "whatever is
+there when this arrives" — and it is minted when the player presses rather than
+when the screen rendered, because a browser renders itself.
+
+Every mutation carries an `Idempotency-Key`, generated once per action and
+reused across every retry of it. The receipt behind the mutation answers a
+replayed key with what it already did, so a retry over a bad connection is a
+retry rather than a second take. A key per *request* would break exactly that.
+
+A refusal comes back as a code and a sentence. `STALE` means the number moved
+between deciding and pressing, and is put to the player as a question rather
+than resolved for them. `HANDLE` means the control was already spent; nothing
+happened, and the screen is read again. `REFUSED` is the domain's answer, and it
+is already a sentence.
+
+Nothing on this side sends an actor id. The server reads that from the token it
+signed, and a client that offered one would be ignored.
 
 ## How the screen stays current
 
@@ -121,7 +145,14 @@ Then set `QM_ACTIVITY_DIST=activity/dist` and run the bot. The API serves the
 built page at `/` and its own routes under `/api`, mounted so that `/api/...`
 is never shadowed by a file.
 
+`VITE_DISCORD_CLIENT_ID` has to be set for the build to mean anything. Vite
+replaces `import.meta.env` at build time, so without it the client id is
+statically undefined, the boot sequence returns on its first branch, and the
+bundler removes the entire application as unreachable — a successful build of
+nothing. CI sets a placeholder for this reason.
+
 ## What is not here yet
 
-Mutations (Stage 4) and the DM surface (Stage 5). The screen reads and refuses
-to pretend otherwise; acting is still the panels' job.
+The DM surface (Stage 5): grants, Loot Drops, sessions, combat, corrections, and
+maintenance are still panels. What a DM can do here is what Stage 4 named —
+register a character, and give coin from the treasury.

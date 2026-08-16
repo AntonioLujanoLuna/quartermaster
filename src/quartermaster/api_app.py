@@ -1,11 +1,12 @@
-"""The HTTP surface the Activity reads, and the socket that says when to read again.
+"""The HTTP surface the Activity reads and writes, and the socket that says when
+to read again.
 
-Stages 1 and 3 of `docs/activity-migration-plan.md`: every read a panel
+Stages 1, 3, and 4 of `docs/activity-migration-plan.md`: every read a panel
 performs, available over HTTP with the actor derived from a signed token rather
-than from anything the client sent, plus `/api/live` — a WebSocket carrying
-change notifications keyed on `domain_events.sequence`. No mutations yet —
-those are Stage 4, and landing them before the read surface and its
-authorization are proven is how the trust boundary gets crossed by accident.
+than from anything the client sent; `/api/live`, a WebSocket carrying change
+notifications keyed on `domain_events.sequence`; and the mutations a player
+performs at the table, each keyed by an idempotency key the client generates
+and scoped to the actor that proved who they are.
 
 Path operations that touch SQLite are declared `def`, not `async def`, so
 FastAPI runs them in a worker thread. The store guards both `read()` and
@@ -26,13 +27,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import string
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .api_auth import (
@@ -55,10 +58,16 @@ from .api_live import (
     latest_sequence,
     read_changes,
 )
+from .characters import CharacterError
 from .config import ConfigurationError, Settings
+from .currency import CurrencyError, CurrencySemanticStaleness
 from .db import SCHEMA_VERSION
 from .discord_common import Quartermaster
 from .export import render_export
+from .handles import HandleError
+from .inventory import InventoryError, SemanticStaleness
+from .loot import LootDropError
+from .receipts import ReceiptError, ReceiptResult
 from .snapshots import home_snapshot
 
 logger = logging.getLogger(__name__)
@@ -142,6 +151,44 @@ def current_dm(actor: CurrentActor) -> Actor:
 
 
 CurrentDM = Annotated[Actor, Depends(current_dm)]
+
+
+#: What a client-generated idempotency key may look like. A Discord interaction
+#: id was a number nobody could choose; this is a string a browser picks, and it
+#: becomes the primary key of a receipt row, so it is bounded here rather than
+#: wherever it lands.
+#:
+#: The separator this namespaces with is deliberately not in the alphabet, so
+#: no key can reach into another actor's namespace by containing one.
+IDEMPOTENCY_KEY_LIMIT = 100
+IDEMPOTENCY_KEY_CHARACTERS = frozenset(string.ascii_letters + string.digits + "-_.")
+
+
+def action_id(actor: CurrentActor, idempotency_key: Annotated[str, Header()] = "") -> str:
+    """The receipt key for one action at the table, scoped to who took it.
+
+    `ReceiptRepository` keys on an interaction id, and a replayed key returns
+    the receipt already stored under it rather than running the mutation again.
+    That is what makes a retry safe over a flaky socket, and it is why the key
+    cannot be taken at face value now that a client chooses it: an unscoped key
+    would let one player quote another's and be handed their result.
+
+    So the key the receipts table sees is this actor's key. Two players who
+    generate the same UUID — or one who copies another's on purpose — hold two
+    different receipts, and a retry still finds its own.
+
+    The client generates it when the player acts, not per request, which is the
+    difference between retrying an action and performing a second one.
+    """
+    key = idempotency_key.strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="an Idempotency-Key header is required")
+    if len(key) > IDEMPOTENCY_KEY_LIMIT or not set(key) <= IDEMPOTENCY_KEY_CHARACTERS:
+        raise HTTPException(status_code=400, detail="that Idempotency-Key is not a usable key")
+    return f"activity:{actor.id}:{key}"
+
+
+Idempotency = Annotated[str, Depends(action_id)]
 
 router = APIRouter(prefix="/api")
 
@@ -239,6 +286,304 @@ def continuity(state: State, _: CurrentActor, limit: int = 20) -> dict[str, Any]
 @router.get("/export")
 def export(state: State, _: CurrentDM) -> dict[str, Any]:
     return {"export": render_export(state.context.store)}
+
+
+# Mutations ------------------------------------------------------------------
+#
+# Stage 4. Three rules hold across every route below, and each of them is the
+# difference between a signed Discord interaction and a web page:
+#
+# `actor_id` is never read from a body. It comes from `current_actor`, which
+# reads it out of the token this process signed, so a request that names an
+# actor is not refused — it is ignored, which is the only outcome that cannot
+# be worked around.
+#
+# `party_authorized` is set here, never accepted. Using an item and correcting
+# the Party Stash are the same call separated only by that flag, so a body that
+# could set it would turn "use up what you carry" into "remove what the party
+# shares" for anyone who can edit a request.
+#
+# Each mutation is `def`, not `async def`, so FastAPI runs it in a worker
+# thread against the same serialized store the bot writes through.
+
+
+class TakePrepareRequest(BaseModel):
+    stack_id: str = Field(min_length=1, max_length=64)
+    amount: int | Literal["all"] = 1
+
+
+class HandleRequest(BaseModel):
+    handle_id: str = Field(min_length=1, max_length=64)
+
+
+class GivePrepareRequest(BaseModel):
+    stack_id: str = Field(min_length=1, max_length=64)
+
+
+class GiveRequest(BaseModel):
+    handle_id: str = Field(min_length=1, max_length=64)
+    #: `party`, or a character id. The service resolves it and refuses a
+    #: non-active recipient; nothing here decides who may receive what.
+    destination: str = Field(default="party", min_length=1, max_length=64)
+
+
+class GiveQuantityRequest(BaseModel):
+    item_name: str = Field(min_length=1, max_length=200)
+    quantity: int = Field(ge=1)
+    destination: str = Field(default="party", min_length=1, max_length=64)
+
+
+class UseRequest(BaseModel):
+    stack_id: str = Field(min_length=1, max_length=64)
+    quantity: int = Field(ge=1)
+    reason: str | None = Field(default=None, max_length=200)
+
+
+class ClaimRequest(BaseModel):
+    drop_item_id: str = Field(min_length=1, max_length=64)
+    amount: int = Field(default=1, ge=1)
+
+
+class CoinRequest(BaseModel):
+    amounts: dict[str, int]
+    destination: str = Field(default="party", min_length=1, max_length=64)
+
+
+class TreasuryGiveRequest(BaseModel):
+    character_id: str = Field(min_length=1, max_length=64)
+    amounts: dict[str, int]
+
+
+class CharacterRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    discord_user_id: str | None = Field(default=None, max_length=32)
+
+
+class TransitionRequest(BaseModel):
+    character_id: str = Field(min_length=1, max_length=64)
+    lifecycle: str = Field(min_length=1, max_length=32)
+
+
+def _committed(result: ReceiptResult) -> dict[str, Any]:
+    """A mutation's answer: what it did, and the receipt that says it did it."""
+    return {
+        "operation_id": result.operation_id,
+        "receipt_status": result.status,
+        "result": result.logical_response,
+    }
+
+
+# Taking from the Party Stash ------------------------------------------------
+
+
+@router.post("/stash/take/prepare")
+def prepare_take(state: State, actor: CurrentActor, request: TakePrepareRequest) -> dict[str, Any]:
+    """Mint the handle one take will spend.
+
+    The handle carries the read set the take was decided against, which is what
+    lets `all` mean a number rather than "whatever is there by the time this
+    arrives". In Discord that read set was the rendered message, minted minutes
+    before anyone pressed. Here it is minted when the player acts, so it means
+    "what was true when you pressed" — and the stale *screen* the panel had to
+    defend against is prevented upstream, by the live feed, rather than caught
+    downstream by a confirmation.
+
+    That does not make the check ornamental. The race the plan names — two
+    players taking all of one stack in the same tick — happens inside this
+    round trip, and this is still what catches it.
+
+    No idempotency key: minting is not an operation. A retry mints a second
+    handle, which expires unused in five minutes, and that is a better failure
+    than a receipt for an action nobody completed.
+    """
+    handle_id = state.context.inventory.create_take_handle(
+        stack_id=request.stack_id, actor_id=actor.id, amount=request.amount
+    )
+    return {"handle_id": handle_id}
+
+
+@router.post("/stash/take")
+def take(state: State, actor: CurrentActor, action: Idempotency, request: HandleRequest) -> dict[str, Any]:
+    return _committed(
+        state.context.inventory.take_interaction(action, handle_id=request.handle_id, actor_id=actor.id)
+    )
+
+
+@router.post("/stash/take/confirm")
+def confirm_take(
+    state: State, actor: CurrentActor, action: Idempotency, request: HandleRequest
+) -> dict[str, Any]:
+    """Take the current quantity, after being told it moved.
+
+    A separate route rather than a flag on the one above, because answering
+    "yes, the new number" is a second decision by the player and has to look
+    like one from the outside.
+    """
+    return _committed(
+        state.context.inventory.confirm_take_interaction(
+            action, handle_id=request.handle_id, actor_id=actor.id
+        )
+    )
+
+
+# Giving and using what a character holds ------------------------------------
+
+
+@router.post("/items/give/prepare")
+def prepare_give(state: State, actor: CurrentActor, request: GivePrepareRequest) -> dict[str, Any]:
+    """Mint the give controls for one held stack, for the same reason as above.
+
+    Both handles are minted and one is spent. The unused one expires, and the
+    alternative — asking the client which it wants before it knows — would put
+    the decision a round trip earlier without making it any more informed.
+    """
+    return state.context.inventory.create_give_handles(stack_id=request.stack_id, actor_id=actor.id)
+
+
+@router.post("/items/give")
+def give(state: State, actor: CurrentActor, action: Idempotency, request: GiveRequest) -> dict[str, Any]:
+    return _committed(
+        state.context.inventory.give_with_handle_interaction(
+            action, handle_id=request.handle_id, actor_id=actor.id, destination=request.destination
+        )
+    )
+
+
+@router.post("/items/give/confirm")
+def confirm_give(
+    state: State, actor: CurrentActor, action: Idempotency, request: GiveRequest
+) -> dict[str, Any]:
+    return _committed(
+        state.context.inventory.confirm_give_with_handle_interaction(
+            action, handle_id=request.handle_id, actor_id=actor.id, destination=request.destination
+        )
+    )
+
+
+@router.post("/items/give/some")
+def give_some(
+    state: State, actor: CurrentActor, action: Idempotency, request: GiveQuantityRequest
+) -> dict[str, Any]:
+    """A give whose quantity the player typed, which needs no handle.
+
+    Not in the plan's table, and it belongs there: the panel has had both since
+    the surface pass. A named quantity has nothing on screen to go stale,
+    because the number came from the person giving rather than from a render.
+    """
+    return _committed(
+        state.context.inventory.give_interaction(
+            action,
+            actor_id=actor.id,
+            item_name=request.item_name,
+            quantity=request.quantity,
+            destination=request.destination,
+        )
+    )
+
+
+@router.post("/items/use")
+def use(state: State, actor: CurrentActor, action: Idempotency, request: UseRequest) -> dict[str, Any]:
+    """Spend what the caller's own character is carrying.
+
+    `party_authorized=False`, written here and reachable from nowhere else on
+    this route. Correcting the Party Stash is the same service call with that
+    flag set, and it is a DM control on `/api/stash/correct` in Stage 5.
+    """
+    return _committed(
+        state.context.inventory.consume_interaction(
+            action,
+            actor_id=actor.id,
+            stack_id=request.stack_id,
+            quantity=request.quantity,
+            reason=request.reason,
+            party_authorized=False,
+        )
+    )
+
+
+# Loot Drops -----------------------------------------------------------------
+
+
+@router.post("/loot/claim")
+def claim(state: State, actor: CurrentActor, action: Idempotency, request: ClaimRequest) -> dict[str, Any]:
+    """Mint and spend in one request, deliberately unlike take and give.
+
+    A claim handle carries `remaining_quantity`, and nothing compares it to
+    anything: the claim is for an absolute amount and re-checks the remainder
+    inside the transaction, so there is no relative meaning for a read set to
+    preserve. What the handle is actually doing here is binding the claim to
+    one actor and to one use, and minting it inside the request satisfies both.
+
+    A retry under the same key mints a handle that is then never spent, because
+    the receipt answers first. It expires in five minutes.
+    """
+    handle_id = state.context.loot.create_claim_handle(
+        drop_item_id=request.drop_item_id, actor_id=actor.id, amount=request.amount
+    )
+    return _committed(state.context.loot.claim_interaction(action, handle_id=handle_id, actor_id=actor.id))
+
+
+# Coin -----------------------------------------------------------------------
+
+
+@router.post("/treasury/return")
+def return_coin(
+    state: State, actor: CurrentActor, action: Idempotency, request: CoinRequest
+) -> dict[str, Any]:
+    """The player's own coin, back to the treasury or on to another character."""
+    return _committed(
+        state.context.currency.give_from_character_interaction(
+            action, actor_id=actor.id, amounts=request.amounts, destination=request.destination
+        )
+    )
+
+
+@router.post("/treasury/give")
+def give_coin(state: State, dm: CurrentDM, action: Idempotency, request: TreasuryGiveRequest) -> dict[str, Any]:
+    """Treasury → a character, and a DM control.
+
+    The plan's table leaves the DM column blank on this row and on the two
+    character routes below. That is a mistake in the table rather than a
+    decision: all three are behind `_require_dm` on the panel, and an API that
+    grants authority the surface it replaces does not grant is not a migration.
+    """
+    return _committed(
+        state.context.currency.give_to_character_interaction(
+            action, actor_id=dm.id, character_id=request.character_id, amounts=request.amounts
+        )
+    )
+
+
+# Characters -----------------------------------------------------------------
+
+
+@router.post("/characters")
+def register_character(
+    state: State, dm: CurrentDM, action: Idempotency, request: CharacterRequest
+) -> dict[str, Any]:
+    """Register a character, for a player the DM names.
+
+    `discord_user_id` is whose character it is, not who is asking — the DM is
+    the actor on this call and the player is its subject, exactly as on the
+    panel, where the player comes from a user select. It is the one identifier
+    on this surface that is legitimately in a body.
+    """
+    return _committed(
+        state.context.characters.create_interaction(
+            action, actor_id=dm.id, name=request.name, discord_user_id=request.discord_user_id
+        )
+    )
+
+
+@router.post("/characters/transition")
+def transition_character(
+    state: State, dm: CurrentDM, action: Idempotency, request: TransitionRequest
+) -> dict[str, Any]:
+    return _committed(
+        state.context.characters.transition_interaction(
+            action, actor_id=dm.id, character_id=request.character_id, lifecycle=request.lifecycle
+        )
+    )
 
 
 # Live feed ------------------------------------------------------------------
@@ -395,6 +740,40 @@ def health() -> dict[str, Any]:
     return {"status": "ok", "schema_version": SCHEMA_VERSION}
 
 
+# Refusals -------------------------------------------------------------------
+
+#: How a refusal from the service layer reaches the client, and what the client
+#: is expected to do about it.
+#:
+#: The panels answer a refusal with a sentence, because a person is reading it.
+#: A client is reading this one, and three of these need different behaviour
+#: rather than different wording: `STALE` is a question to put to the player
+#: and answer on the confirm route, `HANDLE` means the handle is spent or
+#: expired and the action has to be prepared again, and `REFUSED` is the
+#: domain's answer and the end of it. The message stays in `detail`, where the
+#: reads already put theirs, so one client-side error type covers both.
+#:
+#: Order does not select the handler — Starlette walks the exception's MRO — so
+#: `SemanticStaleness` is found before the `InventoryError` it inherits from.
+DOMAIN_REFUSALS: tuple[tuple[type[Exception], int, str], ...] = (
+    (SemanticStaleness, 409, "STALE"),
+    (CurrencySemanticStaleness, 409, "STALE"),
+    (HandleError, 409, "HANDLE"),
+    (ReceiptError, 409, "RETRY"),
+    (InventoryError, 422, "REFUSED"),
+    (CurrencyError, 422, "REFUSED"),
+    (LootDropError, 422, "REFUSED"),
+    (CharacterError, 422, "REFUSED"),
+)
+
+
+def _refusal(status_code: int, code: str) -> Any:
+    async def handler(_: Request, error: Exception) -> JSONResponse:
+        return JSONResponse(status_code=status_code, content={"detail": str(error), "code": code})
+
+    return handler
+
+
 def _bounded(limit: int, *, ceiling: int = 500) -> int:
     """Clamp a client-supplied page size.
 
@@ -460,6 +839,12 @@ def create_app(
             allow_methods=["GET", "POST"],
             allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
         )
+
+    for error_type, status_code, code in DOMAIN_REFUSALS:
+        # Registered on the app rather than caught per route: every mutation
+        # raises the same eight types, and a try/except around each of thirteen
+        # calls is thirteen chances to map one of them differently.
+        app.add_exception_handler(error_type, _refusal(status_code, code))
 
     app.include_router(router)
 
