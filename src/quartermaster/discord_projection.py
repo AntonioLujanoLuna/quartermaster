@@ -5,17 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable
 from time import monotonic
 from typing import Any
 
 import discord
 
-from .combat import format_duration
 from .config import Settings
 from .currency import format_currency
 from .db import SQLiteStore
 from .loot import expire_due_drops
+from .narrative import render_event
 from .operations import create_scheduled_backup, record_discord_surface_health, run_maintenance
 from .projections import EventOutboxWorker, StateProjectionScheduler
 from .rendering import clamp_discord_content, fit_discord_lines
@@ -63,79 +62,6 @@ def _content_for_state(target_id: str, payload: dict[str, Any]) -> str:
     raise ProjectionConfigurationError(f"unknown state target {target_id}")
 
 
-def _item_consumed_line(payload: dict[str, Any]) -> str:
-    """The one event that says something left the campaign.
-
-    It reads differently at each end because it means differently: a player
-    using up what they carry is play, and a DM taking something out of the
-    shared stash is a correction the rest of the table should be able to see
-    and query. The reason is said whenever there is one, which is most of the
-    time for the second and almost never for the first.
-    """
-    if payload.get("owner_type") == "PARTY":
-        sentence = (
-            f"{payload['quantity']} {payload['item_name']} removed from the Party Stash. "
-            f"{payload['remaining']} remain."
-        )
-    else:
-        sentence = (
-            f"{payload['owner_name']} used {payload['quantity']} {payload['item_name']}. "
-            f"{payload['remaining']} left."
-        )
-    return sentence + (f" — {payload['reason']}" if payload.get("reason") else "")
-
-
-def _combat_closed_line(payload: dict[str, Any]) -> str:
-    ran = format_duration(payload.get("elapsed_seconds"))
-    sentence = "Combat closed" + (f" after {ran}" if ran else "")
-    if payload.get("reason") == "SESSION_CLOSED":
-        sentence += " with the session"
-    return sentence + (f": {payload['outcome']}." if payload.get("outcome") else ".")
-
-
-# Every event that reaches the session log renders through this table. An event
-# type that is missing from it still delivers, as its raw JSON payload — which
-# is how a Discord user ID or an internal UUID ends up read out at the table —
-# so `test_every_domain_event_type_has_a_renderer` fails the build rather than
-# letting a new event ship that way.
-_EVENT_RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
-    "ITEM_GRANTED": lambda payload: f"DM added {payload['quantity']} {payload['item_name']}.",
-    "ITEM_TAKEN": lambda payload: (
-        f"A player took {payload['quantity']} {payload['item_name']}. {payload['remaining']} remain."
-    ),
-    "ITEM_CONSUMED": _item_consumed_line,
-    "ITEM_GIVEN": lambda payload: (
-        f"{payload['character_name']} gave {payload['quantity']} {payload['item_name']} "
-        f"to {payload['destination_name']}."
-    ),
-    "SESSION_STARTED": lambda payload: f"Session {payload['session_number']} started.",
-    "SESSION_CLOSED": lambda payload: f"Session {payload['session_number']} closed.",
-    "LOOT_DROP_CREATED": lambda payload: f"New Loot Drop created ({len(payload['items'])} item entries).",
-    "LOOT_CLAIMED": lambda payload: (
-        f"A player claimed {payload['quantity']} {payload['item_name']} from a Loot Drop."
-    ),
-    "LOOT_DROP_CLOSED": lambda payload: f"Loot Drop closed ({payload['reason']}).",
-    "TREASURY_ADJUSTED": lambda payload: f"Treasury updated: {format_currency(payload['after'])}.",
-    "TREASURY_SPLIT": lambda payload: (
-        f"Treasury split among {len(payload['recipients'])} active characters."
-    ),
-    "CURRENCY_TRANSFERRED": lambda payload: f"Currency given to {payload['character_name']}.",
-    "CURRENCY_GIVEN": lambda payload: (
-        f"{payload['character_name']} gave {format_currency(payload['amount'])} "
-        f"to {payload['destination_name']}."
-    ),
-    "BELONGINGS_RESOLVED": lambda payload: (
-        f"Belongings resolved from {payload['source_character_name']} to {payload['destination_name']}."
-    ),
-    "CHARACTER_CREATED": lambda payload: f"{payload['name']} joined the roster.",
-    "CHARACTER_LIFECYCLE_CHANGED": lambda payload: (
-        f"{payload['name']} moved from {payload['from']} to {payload['to']}."
-    ),
-    "COMBAT_OPENED": lambda payload: f"Combat opened in <#{payload['channel_id']}>.",
-    "COMBAT_CLOSED": _combat_closed_line,
-}
-
-
 def _content_for_event(event_type: str, payload: dict[str, Any]) -> str:
     """Render one outbox event, never wider than Discord will accept.
 
@@ -146,12 +72,13 @@ def _content_for_event(event_type: str, payload: dict[str, Any]) -> str:
     letter, and the per-destination FIFO gate holds every later event in that
     thread behind it until an operator requeues.
     """
-    renderer = _EVENT_RENDERERS.get(event_type)
-    if renderer is None:
-        # An event with no renderer of its own falls back to its raw payload,
-        # which is unbounded and unreadable; the clamp keeps it deliverable.
+    sentence = render_event(event_type, payload)
+    if sentence is None:
+        # An event nothing can render falls back to its raw payload, which is
+        # unbounded and unreadable; the clamp keeps it deliverable. Delivering
+        # it badly beats blocking the thread it belongs to.
         return clamp_discord_content(f"{event_type}: {json.dumps(payload, sort_keys=True)}")
-    return clamp_discord_content(renderer(payload))
+    return clamp_discord_content(sentence)
 
 
 class DiscordProjectionTransport:

@@ -188,6 +188,8 @@ Every mutation should have tests at three levels:
 
 The release gate is the specification's core failure gate plus export/restore equivalence, projection recreation, startup recovery, privacy-path checks, and measured acknowledgement latency inside the configured budget.
 
+On that last item: the local metric histograms built for it were removed in August 2026, because at one table's interaction volume percentiles cannot carry meaning. The measurement is a log line per interaction carrying what its acknowledgement cost, and a warning whenever one crosses the configured internal hard deadline. That is enough to answer the gate from an evening of real play, which is the only place the answer exists; it is not enough to draw a distribution, and the plan no longer asks for one.
+
 ## First implementation slice
 
 The first coding slice should be deliberately narrow:

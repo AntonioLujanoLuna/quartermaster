@@ -12,11 +12,13 @@ import unittest
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import sleep
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from quartermaster.characters import CharacterError, CharacterService
+from quartermaster.clock import iso_now
 from quartermaster.combat import CombatService
 from quartermaster.config import ConfigurationError, Settings
 from quartermaster.currency import CurrencyError, CurrencySemanticStaleness, CurrencyService
@@ -26,6 +28,7 @@ from quartermaster.export import render_export
 from quartermaster.handles import HandleError, HandleRepository
 from quartermaster.inventory import InventoryError, InventoryService, SemanticStaleness
 from quartermaster.loot import LootDropError, LootDropService
+from quartermaster.narrative import EVENT_RENDERERS, render_event
 from quartermaster.operations import (
     create_backup,
     create_scheduled_backup,
@@ -406,10 +409,9 @@ class QuartermasterCoreTests(unittest.TestCase):
         without a line of its own: the session log simply starts printing
         internal UUIDs and Discord user IDs. Four event types had already
         arrived that way. This reads the event types the package actually
-        appends, so the next one cannot.
+        appends, so the next one cannot — for the session log and the export
+        alike, which now share one table.
         """
-        from quartermaster.discord_projection import _EVENT_RENDERERS
-
         source_root = Path(__file__).parents[1] / "src" / "quartermaster"
         appended = {
             match
@@ -418,10 +420,35 @@ class QuartermasterCoreTests(unittest.TestCase):
         }
         self.assertTrue(appended, "no domain events were found to check")
         self.assertEqual(
-            appended - set(_EVENT_RENDERERS),
+            appended - set(EVENT_RENDERERS),
             set(),
-            "these event types would be delivered to Discord as raw JSON",
+            "these event types would be read out as raw JSON",
         )
+
+    def test_a_renderer_that_cannot_read_its_payload_does_not_raise(self) -> None:
+        """A payload a renderer cannot read must degrade, not throw.
+
+        Renderers quote payload keys, and payloads are written by whatever
+        build appended them: the export renders every ledger row a campaign
+        has accumulated, and the outbox can hold events queued before a
+        restart that upgraded the code. A raising renderer is worse than an
+        ugly line at both ends — on the delivery side it fails identically
+        every attempt, so the event burns its eight retries, dead-letters, and
+        the per-destination FIFO gate holds every later event in that thread
+        behind it.
+        """
+        self.assertIsNone(render_event("ITEM_GRANTED", {"item_name": "Rope"}))
+        self.assertIsNone(render_event("NOT_AN_EVENT_TYPE", {}))
+        self.assertEqual(
+            render_event("ITEM_GRANTED", {"item_name": "Rope", "quantity": 2}),
+            "DM added 2 Rope.",
+        )
+
+        from quartermaster.discord_projection import _content_for_event
+
+        content = _content_for_event("ITEM_GRANTED", {"item_name": "Rope"})
+        self.assertIn("ITEM_GRANTED", content)
+        self.assertIn("Rope", content)
 
     def test_browse_handles_fit_the_control_budget_and_cover_a_leading_run(self) -> None:
         """Handles must describe controls that can actually exist, in reading order.
@@ -809,6 +836,48 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertEqual(result.value, {"ok": True})
         self.assertTrue(interaction.response.deferred)
 
+    def test_acknowledgement_latency_is_measured_and_says_when_it_missed_budget(self) -> None:
+        """The one number the release gate asks for was computed and dropped.
+
+        `execute_fast` recorded a latency only on the path that had already
+        deferred — never on the common path, which is the one that can still
+        lose Discord's window and strand a committed mutation with no reply.
+        Nothing read it either way, and `internal_hard_deadline_seconds` was
+        validated at startup by a process with no consumer for it.
+        """
+        from quartermaster.discord_common import _run_fast
+
+        class Response:
+            async def defer(self, *, ephemeral: bool = False) -> None:  # pragma: no cover
+                raise AssertionError("this operation should not need a deferral")
+
+        class Interaction:
+            def __init__(self) -> None:
+                self.response = Response()
+                self.data = {"custom_id": "qm:stash:take"}
+
+        within_budget = Settings(
+            guild_id="123", database_path=self.db_path, internal_hard_deadline_seconds=5.0
+        )
+        with self.assertLogs("quartermaster.discord_common", level="INFO") as captured:
+            quick = asyncio.run(_run_fast(Interaction(), within_budget, lambda: {"ok": True}))
+        self.assertIsNotNone(quick.ack_latency_ms)
+        self.assertFalse(quick.deferred)
+        self.assertIn("acknowledged qm:stash:take", captured.output[0])
+
+        tight_budget = Settings(
+            guild_id="123", database_path=self.db_path, internal_hard_deadline_seconds=0.02
+        )
+
+        def slow() -> dict[str, bool]:
+            sleep(0.05)
+            return {"ok": True}
+
+        with self.assertLogs("quartermaster.discord_common", level="WARNING") as warned:
+            asyncio.run(_run_fast(Interaction(), tight_budget, slow))
+        self.assertIn("past the 20ms internal hard deadline", warned.output[0])
+        self.assertIn("qm:stash:take", warned.output[0])
+
     def test_execute_deferred_commits_replays_and_records_failure(self) -> None:
         class Response:
             def __init__(self) -> None:
@@ -940,6 +1009,71 @@ class QuartermasterCoreTests(unittest.TestCase):
         after = render_export(self.store)
         self.assertIn("Owlbear routed", after)
         self.assertIn("in channel 9001", after)
+
+    def test_export_history_reads_as_sentences_about_the_played_session(self) -> None:
+        """The export was the one surface that printed events as stored JSON.
+
+        Every truncated surface tells the reader this document holds the full
+        record, and the session log has rendered events as sentences since the
+        fifth pass — but the export's history section printed the payload, so
+        the document a DM downloads during an outage was where internal UUIDs
+        and Discord user IDs actually got read out. It also meant "recent" —
+        the last ten rows in the campaign — which is a few minutes of a busy
+        evening and says nothing about which evening.
+        """
+        combat = CombatService(self.store, self.receipts)
+        sessions = SessionService(self.store, self.receipts, self.loot, combat)
+        # Written with an explicit timestamp rather than granted: the boundary
+        # is a millisecond, and a grant issued in the same millisecond as the
+        # session start genuinely belongs to the session.
+        with self.store.transaction() as connection:
+            connection.execute(
+                """INSERT INTO ledger_entries(id, operation_id, actor_id, event_type, payload, created_at)
+                   VALUES ('last-week', 'op-old', 'dm', 'ITEM_GRANTED',
+                           '{"item_name":"Pre-Session Lantern","quantity":1}', '2026-08-01T20:00:00.000Z')"""
+            )
+        started = sessions.start_interaction("history-start", actor_id="dm")
+        self.inventory.grant_interaction(
+            "history-grant", actor_id="dm", item_name="Moonlit Blade", quantity=2
+        )
+
+        output = render_export(self.store)
+        history = output.split("## Recent relevant history")[1]
+
+        self.assertIn(f"session {started.logical_response['session_number']}", history)
+        self.assertIn("DM added 2 Moonlit Blade.", history)
+        self.assertIn(
+            f"Session {started.logical_response['session_number']} started.", history
+        )
+        self.assertNotIn("Pre-Session Lantern", history)
+        self.assertNotIn('"item_name"', history)
+
+        sessions.end_interaction("history-end", actor_id="dm", where_ended="The ridge")
+        closed = render_export(self.store).split("## Recent relevant history")[1]
+        self.assertIn("DM added 2 Moonlit Blade.", closed)
+        self.assertIn(
+            f"Session {started.logical_response['session_number']} closed.",
+            closed,
+            "the line saying the session ended belongs to the session it ended",
+        )
+
+    def test_export_history_keeps_an_entry_no_renderer_can_read(self) -> None:
+        """An entry nothing renders is still an entry that happened.
+
+        Ledger rows outlive the build that wrote them, so a payload whose shape
+        moved is ordinary rather than exceptional. Dropping it — or raising out
+        of the export, which also validates every backup — would be worse than
+        printing it as it is stored.
+        """
+        with self.store.transaction() as connection:
+            connection.execute(
+                """INSERT INTO ledger_entries(id, operation_id, actor_id, event_type, payload, created_at)
+                   VALUES ('legacy-1', 'op-1', 'dm', 'ITEM_GRANTED', '{"item_name":"Older Shape"}', ?)""",
+                (iso_now(),),
+            )
+        history = render_export(self.store).split("## Recent relevant history")[1]
+        self.assertIn("ITEM_GRANTED", history)
+        self.assertIn("Older Shape", history)
 
     def test_export_says_so_when_there_is_no_open_loot_or_roster(self) -> None:
         with self.store.transaction() as connection:
@@ -2472,6 +2606,107 @@ class QuartermasterCoreTests(unittest.TestCase):
                 ).fetchone()["quantity"],
                 6,
             )
+
+
+class OperatorCommandLineTests(unittest.TestCase):
+    """The CLI is what an operator reaches for when something is already wrong.
+
+    Opening SQLite creates whatever path it is given, so every command answered
+    about a database it had just made if the real one was not where it looked —
+    which is the ordinary case, not an exotic one: the runbook passes
+    `--db $env:QM_DATABASE_PATH`, and the handoff records that a new PowerShell
+    process may not have imported that value yet.
+    """
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.database_path = self.root / "campaign.sqlite"
+        SQLiteStore(self.database_path).open().close()
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    @contextmanager
+    def _cli(self, argv: list[str], **environment: str):
+        """Run the CLI as an operator does: from some working directory.
+
+        Which directory that is matters — the old fallback resolved a relative
+        default against it — so the tests run somewhere they can watch.
+        """
+        from quartermaster import __main__ as cli
+
+        previous = Path.cwd()
+        os.chdir(self.root)
+        try:
+            with mock.patch.object(sys, "argv", ["quartermaster", *argv]), mock.patch.dict(
+                os.environ, environment, clear=True
+            ):
+                yield cli
+        finally:
+            os.chdir(previous)
+
+    def _grant_one_item(self) -> None:
+        store = SQLiteStore(self.database_path).open()
+        try:
+            InventoryService(
+                store, ReceiptRepository(store), HandleRepository(store)
+            ).grant_interaction(
+                "cli-grant", actor_id="dm", item_name="Configured Lantern", quantity=1
+            )
+        finally:
+            store.close()
+
+    def test_a_missing_database_is_refused_rather_than_created(self) -> None:
+        absent = self.root / "not-here.sqlite"
+        for command in ("health", "export", "backup", "requeue-events"):
+            with self.subTest(command=command):
+                with self._cli([command, "--db", str(absent)]) as cli:
+                    with self.assertRaises(SystemExit) as raised:
+                        cli.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertFalse(
+                    absent.exists(),
+                    f"{command} created a database instead of reporting the missing one",
+                )
+
+    def test_the_configured_database_is_used_when_no_path_is_given(self) -> None:
+        self._grant_one_item()
+        with self._cli(["export"], QM_DATABASE_PATH=str(self.database_path)) as cli:
+            with mock.patch("builtins.print") as printed:
+                self.assertEqual(cli.main(), 0)
+        self.assertIn("Configured Lantern", printed.call_args.args[0])
+        self.assertFalse(
+            (self.root / "quartermaster.sqlite").exists(),
+            "the CLI fell back to a database in the working directory",
+        )
+
+    def test_a_command_line_backup_lands_where_the_scheduled_one_does(self) -> None:
+        """Both rotate one set of files, and health reports the last one written.
+
+        A CLI backup that wrote to `./backups` while the runtime wrote to the
+        configured directory left two unrelated retention windows, and pointed
+        health's `primary_path` at whichever ran last.
+        """
+        backup_directory = self.root / "configured-backups"
+        with self._cli(
+            ["backup"],
+            QM_DATABASE_PATH=str(self.database_path),
+            QM_BACKUP_DIRECTORY=str(backup_directory),
+        ) as cli:
+            with mock.patch("builtins.print"):
+                self.assertEqual(cli.main(), 0)
+        self.assertEqual(len(list(backup_directory.glob("quartermaster-*.sqlite"))), 1)
+
+    def test_run_refuses_a_database_argument_the_adapter_would_ignore(self) -> None:
+        with self._cli(
+            ["run", "--db", str(self.root / "other.sqlite")],
+            QM_DATABASE_PATH=str(self.database_path),
+            QM_GUILD_ID="1",
+        ) as cli:
+            with self.assertRaises(SystemExit) as raised:
+                cli.main()
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

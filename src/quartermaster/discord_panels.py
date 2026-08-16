@@ -1454,6 +1454,7 @@ class MaintenanceView(PanelView):
                 interaction,
                 self.context.services,
                 lambda: {"export": render_export(self.context.store)},
+                settings=self.settings,
                 response_kind="export",
                 ephemeral=True,
             )
@@ -1474,6 +1475,7 @@ class MaintenanceView(PanelView):
                     off_device_directory=self.settings.backup_off_device_directory,
                     retention_count=self.settings.backup_retention_count,
                 ),
+                settings=self.settings,
                 response_kind="backup",
                 ephemeral=True,
             )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,8 @@ from .response import (
     execute_fast,
 )
 from .sessions import SessionService
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,54 @@ async def _send_error(interaction: discord.Interaction, message: str) -> None:
         await interaction.response.send_message(content, ephemeral=True)
 
 
+def _interaction_label(interaction: discord.Interaction) -> str:
+    """Name what was pressed, from identifiers Quartermaster itself authored.
+
+    Custom IDs are static strings from this package (`qm:stash:take`) and a
+    command name is the one command there is, so a latency line can say which
+    surface was slow without quoting anything a person typed or chose. A
+    select menu's `values` are canonical IDs the caller picked; they are not
+    read here.
+    """
+    data = getattr(interaction, "data", None) or {}
+    if not isinstance(data, dict):
+        return "interaction"
+    custom_id = data.get("custom_id")
+    if custom_id:
+        return str(custom_id)
+    name = data.get("name")
+    return f"/{name}" if name else "interaction"
+
+
+def _record_ack_latency(
+    settings: Settings, interaction: discord.Interaction, latency_ms: float | None
+) -> None:
+    """Log what the acknowledgement actually cost, once per interaction.
+
+    The release gate asks for measured acknowledgement latency inside the
+    configured budget, and until this the build could not answer it: the
+    numbers were computed and dropped on the floor, and
+    `internal_hard_deadline_seconds` was validated at startup by a process that
+    never read it. Local metric histograms were removed on purpose — at one
+    table's volume percentiles cannot carry meaning — but one line per
+    interaction can, and a warning the moment the budget is missed is what an
+    operator can act on. Nothing here names the actor: latency is a property of
+    the host, not of the person who pressed the button.
+    """
+    if latency_ms is None:
+        return
+    budget_ms = settings.internal_hard_deadline_seconds * 1000
+    if latency_ms >= budget_ms:
+        logger.warning(
+            "acknowledgement for %s took %.0fms, past the %.0fms internal hard deadline",
+            _interaction_label(interaction),
+            latency_ms,
+            budget_ms,
+        )
+    else:
+        logger.info("acknowledged %s in %.0fms", _interaction_label(interaction), latency_ms)
+
+
 async def _run_fast(
     interaction: discord.Interaction,
     settings: Settings,
@@ -123,12 +174,14 @@ async def _run_fast(
     *,
     ephemeral: bool = False,
 ) -> FastExecutionResult:
-    return await execute_fast(
+    execution = await execute_fast(
         interaction,
         operation,
         soft_deadline_seconds=settings.soft_deadline_seconds,
         ephemeral=ephemeral,
     )
+    _record_ack_latency(settings, interaction, execution.ack_latency_ms)
+    return execution
 
 
 async def _send_execution(
@@ -182,10 +235,11 @@ async def _run_deferred(
     services: BotServices,
     operation: Callable[[], object],
     *,
+    settings: Settings,
     response_kind: str,
     ephemeral: bool = False,
 ) -> DeferredExecutionResult:
-    return await execute_deferred(
+    execution = await execute_deferred(
         interaction,
         services.receipts,
         operation,
@@ -193,6 +247,8 @@ async def _run_deferred(
         response_kind=response_kind,
         ephemeral=ephemeral,
     )
+    _record_ack_latency(settings, interaction, execution.ack_latency_ms)
+    return execution
 
 
 async def _send_deferred_export(

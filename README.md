@@ -105,8 +105,10 @@ that runs out of buttons names the entries it has no control for instead of show
 nothing to press.
 
 The export is what those surfaces point at, so it holds what they cannot: every item with
-the character holding it named, every open Loot Drop with what is still unclaimed, and the
-full character roster.
+the character holding it named, every open Loot Drop with what is still unclaimed, the full
+character roster, and the played session's history read as sentences rather than as the
+payloads they are stored as — the same rendering the session log uses, from the same table,
+because two copies of it are two chances to disagree about what an event means.
 
 The Discord transport is intentionally an adapter boundary at this stage. No network calls occur in the core package or in a database transaction. The adapter is split into `discord_common` (services, authorization, response helpers), `discord_views` (the leaf controls that act, and the modals they open), `discord_panels` (the panels those controls sit on, and the navigation between them), `discord_commands` (the one entry point), and `discord_adapter` (bot assembly and the runtime loop).
 

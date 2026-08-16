@@ -72,9 +72,13 @@ committed mutation never depends on a re-render succeeding.
 
 **Operations.** `health`, `maintenance`, `backup`, `restore`, and `requeue-events` on the
 CLI; validated timestamped backups on a schedule with retention; **DM Tools → Maintenance**
-in Discord. The export is the full record every truncated surface points at: items with
-the character holding them named, open Loot Drops with what is still unclaimed, and the
-roster. See [the runbook](runbook.md).
+in Discord. Only `run` and `restore` may create a database file; every other command
+refuses a path with no database at it, and `--db` defaults to `QM_DATABASE_PATH`. The
+export is the full record every truncated surface points at: items with the character
+holding them named, open Loot Drops with what is still unclaimed, the roster, and the
+played session's history as sentences rather than payloads. Every interaction logs what
+its acknowledgement cost, and one past `internal_hard_deadline_seconds` logs a warning
+naming the control. See [the runbook](runbook.md).
 
 **Avrae.** The Combat panel has two halves. Start, End, and Status read and write
 Quartermaster's own `combat_encounters` record — session, channel, duration, outcome, and
@@ -85,8 +89,71 @@ durable but has no live caller, and its health check cannot fail on this build. 
 extension scaffold at `integrations/avrae/quartermaster_cog.py` is parked: Gate 1 was
 answered "no, for now" on 2026-08-14, and it has never been loaded in an Avrae deployment.
 
-**Checks.** 244 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Checks.** 252 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request.
+
+## Eighth pass on 2026-08-16
+
+Three defects, each silent, each ending with someone believing something the
+database does not say. All covered by tests that fail against the old behaviour.
+
+- **The export printed the ledger as JSON, and "recent" meant the last ten rows
+  in the campaign.** Every truncated surface tells the reader the export holds
+  the full record, and the session log has read events as sentences since the
+  fifth pass — but the history section printed the stored payload, so the
+  document a DM downloads during an outage was the one place internal UUIDs and
+  Discord user IDs actually got read out. Ten rows is also a few minutes of a
+  busy evening, and says nothing about which evening. `narrative.py` is now the
+  one renderer table both surfaces go through, for the same reason
+  `credit_stack` is one merge rule, and the window is the session the table is
+  playing — the active one, or the most recent closed one for as long as the
+  next has not started.
+
+  `render_event` is total. Renderers quote payload keys, payloads are written by
+  whatever build appended them, and the export renders every ledger row a
+  campaign has accumulated, so a key that moved between versions has to degrade
+  to the raw payload rather than raise. That matters more on the delivery side
+  than in the export: a renderer that raised would fail its event identically
+  every attempt, burning eight retries and a dead letter while the
+  per-destination FIFO gate held every later event in that thread behind it.
+  The JSON fallback existed for event types nobody had written a line for; it
+  did not cover a known type whose payload had moved.
+
+- **The CLI would invent a database and then report on it.** Opening SQLite
+  creates and migrates whatever path it is given. The runbook passes
+  `--db $env:QM_DATABASE_PATH`, and this document already records that a new
+  PowerShell process may not have imported that value yet — so the ordinary
+  failure was `health` answering `DEGRADED` about an empty database it had just
+  created in the working directory, `export` printing it, and `backup` writing a
+  *valid* empty snapshot into the same directory the real ones live in: one
+  genuine backup pruned to make room, and a restore candidate that passes
+  validation and holds nothing. `run` and `restore` may create a file because
+  that is what they are for; every other command now refuses a path with no
+  database at it and names the path. `--db` defaults to `QM_DATABASE_PATH`
+  rather than to a name in the working directory, `run` refuses a `--db` that
+  disagrees with the configured value instead of silently ignoring it, and a
+  command-line backup lands in `QM_BACKUP_DIRECTORY` with the configured
+  retention — the CLI and the scheduler rotate one set of files, and health
+  reports on whichever wrote last.
+
+- **The one number the release gate asks for was computed and thrown away.**
+  `execute_fast` recorded an acknowledgement latency only on the path that had
+  already deferred, never on the common path — which is the path that can still
+  lose Discord's three-second window and strand a committed mutation with no
+  reply — and nothing read it either way, while
+  `internal_hard_deadline_seconds` was validated at startup by a process that
+  had no consumer for it. Every interaction now logs what its acknowledgement
+  cost, and one past the hard deadline logs a warning naming the control that
+  was slow. The label comes from the custom ID this package authored, so a
+  latency line quotes nothing a person typed or chose, and no line names the
+  actor: latency is a property of the host, not of who pressed the button.
+
+  This does not reinstate the metric histograms removed on 2026-08-14. That
+  decision stands — at one table's volume percentiles cannot carry meaning — and
+  `local_metric_buckets` still has no reader and no writer. A log line per
+  interaction is what the observability section of the specification asks for
+  and what makes "measured acknowledgement latency inside the configured budget"
+  answerable from a real evening rather than an estimate.
 
 ## Seventh pass on 2026-08-16
 
@@ -405,9 +472,13 @@ the next session decides deliberately rather than rediscovering them.
   everyone's share. This is the same shape as the take-all gap, and as the give gap the
   surface pass closed, but the fix is a product decision — it puts a confirmation step in
   front of a DM control — so it is left for the table to choose.
-- **`local_metric_buckets` (migration 8) has no reader and no writer**, and
-  `internal_hard_deadline_seconds` and `ack_latency_ms` are likewise computed or validated
-  and never consumed. Latency budgets stay estimates until something records them.
+- **`local_metric_buckets` (migration 8) has no reader and no writer.** The
+  histograms it was built for were removed deliberately on 2026-08-14: at one
+  table's interaction volume percentiles cannot carry meaning. The table stays
+  because inert storage costs nothing and fails nothing, unlike a validated
+  configuration knob with no consumer — which is why
+  `internal_hard_deadline_seconds` and `ack_latency_ms` were wired up instead of
+  left sitting there. Latency now comes from the log, one line per interaction.
 ## Not yet verified live
 
 Nothing in any correction pass has been exercised against the guild, and the surface pass
@@ -482,6 +553,19 @@ Runtime, unchanged by this pass and still unverified:
     of the list and the closing line about entries with no control reads acceptably.
 21. Export mid-session with an open Loot Drop and an item a player has taken, and confirm the
     drop, the holder's name, and the roster all read correctly.
+21a. Export after a full evening and read the history section aloud. It should be the story of
+    that session in sentences, headed by the session number, with nothing before the session
+    in it and no JSON anywhere. This is the section a DM reads during an outage, so whether it
+    is the right length is a judgement only real play can make.
+21b. From a fresh PowerShell that has *not* imported the user-level variables, run
+    `uv run python -m quartermaster health`. It must refuse and name the path it looked at,
+    rather than reporting on a database it created in the working directory. Then run
+    `backup` with the variables imported and confirm the snapshot lands beside the scheduled
+    ones rather than in a second `backups` directory.
+21c. Watch the log through an ordinary evening for the acknowledgement lines, and see whether
+    anything crosses the 2.5 s internal hard deadline on the live host. This is the
+    measurement the release gate wants and the only way to find out whether the current
+    budgets are the right ones.
 22. Register a character and change a lifecycle with the session log in view, and confirm
     those lines read as sentences rather than JSON.
 

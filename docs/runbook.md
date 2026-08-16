@@ -12,7 +12,7 @@ The supported Windows process wrapper imports the required user-level environmen
 .\scripts\start-quartermaster.ps1
 ```
 
-Do not run a second ad-hoc bot process against the same database. The database path is read from `QM_DATABASE_PATH`; the explicit CLI `--db` value does not override that configured environment value when the Discord adapter starts.
+Do not run a second ad-hoc bot process against the same database. The database path is read from `QM_DATABASE_PATH`; `run` refuses a `--db` that disagrees with it rather than quietly starting against the configured value.
 
 Use the stop wrapper for intentional shutdown. It signals the supervisor, stops the full supervised process tree, and removes the PID/stop markers. If the bot exits unexpectedly, inspect `logs/quartermaster.supervisor.log` before restarting manually.
 
@@ -26,7 +26,18 @@ uv run python -m quartermaster --db $env:QM_DATABASE_PATH maintenance
 uv run python -m quartermaster --db $env:QM_DATABASE_PATH export > .\quartermaster-export.md
 ```
 
+`--db` may be left off entirely: it defaults to `QM_DATABASE_PATH`. Only `run` and `restore` create a database file. Every other command refuses a path with no database at it and names the path it looked for, so a shell that never imported the user-level variables — or a command run from the wrong directory — reports a missing database instead of answering about an empty one it just created.
+
 `health` checks SQLite integrity, schema version, the one-active-session invariant, receipt recovery state, outbox backlog, dead-lettered events, dirty and stuck projections, expired Loot Drops, the last transient-maintenance outcome, backup freshness, and the most recent Discord surface reachability check. A missing, failed, or stale Discord surface check is `DEGRADED`; pass `--discord-surface-max-age-seconds` to change the freshness window. The bot runs startup recovery, transient maintenance, scheduled backups, and surface checks while projection delivery is running; the `maintenance` command remains available for operator-triggered cleanup. It expires due drops and removes terminal receipts and consumed/expired handles after their configured retention periods.
+
+Every interaction logs what its acknowledgement cost, naming the control that was pressed:
+
+```
+INFO quartermaster.discord_common: acknowledged qm:stash:take in 84ms
+WARNING quartermaster.discord_common: acknowledgement for qm:stash:take took 2600ms, past the 2500ms internal hard deadline
+```
+
+Discord's own deadline is about three seconds, so the warning is the signal that the host is close to losing an acknowledgement — not that anything was lost. One in isolation is worth noting; a run of them means the budget in `QM_INTERNAL_HARD_DEADLINE_SECONDS` or the host itself needs attention.
 
 `/quartermaster` is the whole Discord surface. It opens an ephemeral home panel that states session, Party Stash, open loot, treasury, and who the caller is playing, and every action past that point is a button, a select menu, or a modal on a panel. The panel a caller sees is the panel they may use: DM Tools appears only for a configured DM administrator, and every DM control re-checks authorization when it is pressed, because a panel outlives the render that built it. Grant loot, Loot Drops, Session, and Maintenance — export, backup, health — all live under DM Tools.
 
@@ -121,6 +132,8 @@ The bot creates and validates a timestamped online backup immediately after its 
 ```powershell
 uv run python -m quartermaster --db $env:QM_DATABASE_PATH backup
 ```
+
+It writes into the same `QM_BACKUP_DIRECTORY` with the same `QM_BACKUP_RETENTION_COUNT` as the scheduled backup, because the two rotate one set of files and health reports on whichever snapshot was written last. `--destination`, `--off-device-directory`, and `--retention-count` override the configured values for one run.
 
 Configured DM administrators can also take one from **DM Tools → Maintenance → Backup** in the Discord guild. It uses the same validated timestamped path, records a durable `PROCESSING -> COMMITTED/FAILED` receipt, and reports the resulting snapshot filename ephemerally. The Discord control does not attach the SQLite file; use the CLI or the configured backup directory to retrieve it.
 
