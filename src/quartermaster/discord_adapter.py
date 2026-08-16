@@ -40,6 +40,7 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
     guild = discord.Object(id=int(settings.guild_id))
     handoff = services.avrae_handoff or AvraeHandoffService(services.store)
     projection_task: asyncio.Task | None = None
+    api_task: asyncio.Task | None = None
     stop_event = asyncio.Event()
     loot = services.loot or LootDropService(services.store, services.receipts, HandleRepository(services.store))
     characters = services.characters or CharacterService(services.store, services.receipts)
@@ -58,7 +59,7 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
     register_commands(bot, guild, context)
 
     async def setup_hook() -> None:
-        nonlocal projection_task
+        nonlocal projection_task, api_task
         await bot.tree.sync(guild=guild)
         logger.info("synced Quartermaster commands to guild %s", settings.guild_id)
         if settings.party_inventory_channel_id and settings.session_log_channel_id:
@@ -80,6 +81,13 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
             projection_task = asyncio.create_task(runner.run(stop_event))
         else:
             logger.warning("projection delivery disabled: configure QM_PARTY_INVENTORY_CHANNEL_ID and QM_SESSION_LOG_CHANNEL_ID")
+        if settings.activity_enabled:
+            # Imported here rather than at module scope: FastAPI and uvicorn
+            # are an optional extra, and the bot has to keep starting without
+            # them for a table that has not enabled the Activity.
+            from .api_server import serve_api
+
+            api_task = asyncio.create_task(serve_api(context, stop_event))
 
     bot.setup_hook = setup_hook  # type: ignore[method-assign]
 
@@ -92,6 +100,10 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
         stop_event.set()
         if projection_task is not None:
             await projection_task
+        if api_task is not None:
+            # Awaited before the store closes, so an in-flight read finishes
+            # against an open connection rather than a closed one.
+            await api_task
         services.store.close()
         await commands.Bot.close(bot)
 

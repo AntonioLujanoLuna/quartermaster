@@ -78,6 +78,7 @@ from .operations import create_scheduled_backup, health_report, render_health
 from .rendering import fit_discord_lines
 from .response import DeferredExecutionError
 from .sessions import SessionError
+from .snapshots import home_snapshot
 
 PANEL_TIMEOUT = 600
 
@@ -132,30 +133,20 @@ class PanelView(QuartermasterView):
 
 
 def _home_snapshot(context: Quartermaster, actor_id: str) -> dict[str, Any]:
-    """Everything the home panel states, read in one worker-thread pass."""
-    items = context.inventory.browse()
-    drops = context.loot.list_open()
-    roster = context.characters.list_characters()
-    holdings = context.inventory.holdings(actor_id=actor_id)
-    treasury = context.currency.view_treasury()
-    purse = context.currency.purse(actor_id=actor_id)
-    # One read of continuity rather than one of the active session: home has to
-    # say whether the table is mid-session either way, and the endpoint of the
-    # last one is the first thing anybody wants at the start of an evening. The
-    # recap belongs to the Last time panel, so nothing here asks for one.
-    continuity = context.sessions.continuity(limit=1)
-    return {
-        "stash_count": len(items),
-        "drop_count": len(drops),
-        "unclaimed": sum(int(item["remaining_quantity"]) for drop in drops for item in drop["items"]),
-        "active_session_number": continuity["active_session_number"],
-        "previous_session": continuity["previous"],
-        "unresolved_estates": sum(1 for row in roster if row["lifecycle"] != "ACTIVE"),
-        "treasury": treasury,
-        "character": holdings["character"],
-        "held_stacks": holdings["total_items"],
-        "purse": purse["balance"],
-    }
+    """The home composition, resolved out of the adapter's context.
+
+    The composition itself lives in `snapshots` so the Activity API reads the
+    same one; this is only the part that knows where a panel keeps its
+    services.
+    """
+    return home_snapshot(
+        inventory=context.inventory,
+        loot=context.loot,
+        characters=context.characters,
+        currency=context.currency,
+        sessions=context.sessions,
+        actor_id=actor_id,
+    )
 
 
 def _render_home(snapshot: dict[str, Any], *, is_dm: bool) -> str:
