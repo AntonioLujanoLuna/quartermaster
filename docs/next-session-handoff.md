@@ -69,7 +69,10 @@ its caller may press, and every DM control checks again when it is pressed, beca
 outlives the render that built it. Nothing is identified by hand: characters, players, held
 items, and open drops all come from select menus built out of canonical state. Navigation
 replaces the panel in place; a result is a separate ephemeral message, so reporting a
-committed mutation never depends on a re-render succeeding.
+committed mutation never depends on a re-render succeeding. A view that reaches its timeout —
+ten minutes for a panel, five for a control, matching the handles it carries — retires its own
+controls, says it has expired, and offers **Open again** where it knows the way back. Only the
+view currently on the message may do that; the panels it replaced expire silently.
 
 **Operations.** `health`, `maintenance`, `backup`, `restore`, and `requeue-events` on the
 CLI; validated timestamped backups on a schedule with retention; **DM Tools → Maintenance**
@@ -95,8 +98,98 @@ and the unique half of 31 — are deliberately not built and are no longer liste
 work in the implementation plan; the reasoning and the cost of reversing it are recorded in
 section 2 of that plan.
 
-**Checks.** 258 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Continuity.** While no session is running, home names the last session and where it ended;
+**Last time** opens the panel that reads that endpoint back with the tail of what happened,
+rendered by `narrative.render_entry` — the same table the session log and the export go
+through. The window is the played session, bounded above by the next session's start, and the
+panel says how many earlier lines it is not showing. It is open to the whole table and links
+to the session log where one is configured.
+
+**Checks.** 273 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request.
+
+## Eleventh pass on 2026-08-16
+
+The three observations from the tenth pass, answered. Two were documents; the third was the
+one feature gap the product's own name argues for.
+
+- **A continuity companion could not tell you where you stopped.** Specification 29 was
+  built as one line on the session state projection and a paragraph in the export — the
+  pinned surface nobody reads at the start of an evening, and the document only a DM
+  downloads. The home panel, which is where every session actually begins, said "No session
+  in progress" and nothing else. The endpoint was already there: End Session asks a DM for
+  exactly one sentence and stores it on the session row, and it was being read back nowhere
+  the table looks.
+
+  Home now names the last session and where it ended, for as long as that is still the last
+  thing that happened — once the next session starts the question changes and the line goes.
+  **Last time** is the panel behind it: the endpoint, then the end of that session's ledger
+  as sentences, then whether a session is running now. `sessions.continuity` is the read;
+  `narrative.render_entry` is the renderer, moved out of the export so history is rendered
+  by one rule wherever it is read, which is the same reason `credit_stack` is one merge
+  rule. The recap is the tail rather than the head, because "where did we stop" is a
+  question about the end of an evening, and it says how many earlier lines it is not showing
+  and points at the export, like every other bounded surface here.
+
+  Deliberately not derived: "2 healing potions remain" and the rest of specification 29's
+  state bullets. Current state is on the panels that own it, and a second rendering of it
+  here would be a second thing to keep true.
+
+- **The plan described a source tree that does not exist.** It specified a directory per
+  layer — `domain/`, `application/`, `discord/` — and the code is one flat package. A reader
+  checking the plan against the repository found the first thing they looked at wrong, which
+  is how the rest of the document stops being trusted. It now records the boundaries as
+  modules and states the rule that is actually enforced: `discord_*` may import the rest,
+  nothing else may import `discord_*`.
+
+- **The release gate could be passed without anyone playing.** Every item on it was
+  answerable from CI, and nothing in this build has been exercised against the guild. "One
+  session played against the live guild" is now a gate item, pointing at the checklist
+  below, with the reason stated: a test suite cannot tell you a control is in the wrong
+  place or that a refusal reads as an accusation.
+
+## Tenth pass on 2026-08-16
+
+One dead end, on the only surface the table uses, covered by tests that fail against the old
+behaviour.
+
+- **Every panel became a trap after ten minutes, and said nothing about it.** A component
+  view has a timeout — ten minutes for a panel, five for the control views whose handles
+  live that long — and past it discord.py stops listening. The press is never dispatched,
+  nothing acknowledges the interaction, and Discord shows "This interaction failed": the
+  same sentence a crash produces. That ambiguity is the one the fifth pass closed for
+  unexpected exceptions with `QuartermasterView.on_error`, and the timeout is the same hole
+  reached by a far more ordinary route — a panel left open while the table argues about
+  which door to open. A player pressing Take on it cannot tell a refusal from a mutation
+  that committed and lost its reply, which is exactly what "nothing was changed unless you
+  were told otherwise" exists to prevent.
+
+  `on_timeout` now retires the controls: the message becomes the reason they are gone, plus
+  an **Open again** control where the view knows a way back. Reopening renders the panel
+  from current state rather than restoring the old one — a take panel's controls are
+  single-use handles, so the only honest way back onto it is a fresh mint, which is why the
+  reopen for a take or a claim is its own Refresh.
+
+  Two things had to be true for this to be safe. A view can only edit the message it landed
+  on through the interaction that rendered it, so `bind` hands it that route at the moment
+  it is sent; `_send_panel`, `_send_execution`, `_rerender`, and the staleness prompt are
+  the four places that send one. And navigation replaces a panel in place, so several views
+  share a message over an evening and each times out on its own schedule long after the
+  player moved on: `_ON_SCREEN` records which view the message is showing, claimed at render
+  and again in `interaction_check`, and a view that no longer owns its message expires
+  silently. Writing a retirement notice over the panel someone is actually using would be a
+  worse failure than the dead control it replaces.
+
+  Deliberately not adopted: specification 22's 90-second confirmation TTL. A confirmation's
+  real deadline is the handle it carries, and expiring the view first takes away an answer
+  the table could still have given. A confirmation has no reopen either — it is not a place
+  — so its notice names `/quartermaster` instead.
+
+  Still a dead end, and knowingly: a panel that outlives the process. Views live in memory,
+  so a restart leaves an old ephemeral message holding controls that answer to nobody and no
+  interaction alive to edit it. The same is true of a view pressed often enough to refresh
+  its timer past the fifteen-minute life of the token that rendered it; that edit fails and
+  is logged. Both end where they began — reopen with `/quartermaster`.
 
 ## Ninth pass on 2026-08-16
 
@@ -532,6 +625,21 @@ Panel surface:
    **DM Tools** and the DM's does.
 2. Press through every panel and confirm each one replaces the message in place rather than
    leaving a column of ephemeral replies, and that the way back always works.
+2a. Open a panel, leave it for longer than its timeout — ten minutes for a panel, five for a
+    take or give view — then look at it. It should read as expired with a single **Open
+    again** control rather than still showing buttons. Press it and confirm the panel comes
+    back live. Then navigate two panels deep, wait out the timeout of the ones you left, and
+    confirm the panel on screen is untouched: this is the failure that would look like
+    Quartermaster wiping a panel out from under the table.
+2b. Restart the bot with a panel open, then press something on it. It will still fail the way
+    it always did — the view died with the process — and `/quartermaster` is the way back.
+    Worth seeing once so it is recognised at the table rather than debugged.
+2c. End a session with a real endpoint sentence, then open `/quartermaster` as a player the
+    way you would at the start of the next evening. Home should name where you stopped, and
+    **Last time** should read as the end of that session rather than as a log dump. Whether
+    eight lines is the right number of them is a judgement only a real evening can make —
+    it is `CONTINUITY_RECAP_LINES` in `sessions.py` if it is wrong. Start the next session
+    and confirm the home line gives way to the session in progress.
 3. **Party Stash → Take something…**, and confirm both `Take 1` and `Take all` appear, that
    Refresh renews the controls after a take, and that a take reports what it moved.
 4. `Take all` on a stack the DM grows in between, and confirm the confirmation prompt reads
@@ -628,7 +736,9 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
 
 ## Next priorities
 
-1. Work through "Not yet verified live" above.
+1. Work through "Not yet verified live" above. This is now a release-gate item in the
+   implementation plan rather than a wish: everything else on that gate is answerable from
+   CI, and none of it can tell you a control is in the wrong place.
 2. Play one session on the panel and watch where the DM hesitates. The surface pass replaced
    a command list with a shape, and a shape is only right if the thing you want next is
    already on screen — how many presses a real grant, a real take, and a real end-of-session

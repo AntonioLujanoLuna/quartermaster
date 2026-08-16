@@ -11,7 +11,13 @@ from .db import SQLiteStore
 from .events import append_event, mark_projection_dirty
 from .handles import HandleRepository
 from .loot import LootDropService
+from .narrative import render_entry
 from .receipts import ReceiptRepository, ReceiptResult
+
+#: How much of the last session a continuity surface reads back. This is a
+#: recap, not the record: the export holds every line, and a table that has to
+#: scroll to find where it stopped is being handed the ledger, not a reminder.
+CONTINUITY_RECAP_LINES = 8
 
 
 class SessionError(RuntimeError):
@@ -66,6 +72,62 @@ class SessionService:
         operation_id = operation_id or str(uuid.uuid4())
         with self.store.transaction() as connection:
             return self._end_in_transaction(connection, operation_id, session_id, where_ended)
+
+    def continuity(self, *, limit: int = CONTINUITY_RECAP_LINES) -> dict[str, Any]:
+        """What the table needs to pick up where it left off.
+
+        The product is a continuity companion and this is the question it was
+        built to answer: where did we stop, and what had happened by then. The
+        endpoint is the one narrative line End Session asks a DM for; the recap
+        is derived, because everything else the table could want was already
+        written down as it happened.
+
+        The window is the last session that was closed — the one they played —
+        and the lines are the end of it, because "where did we stop" is a
+        question about the end of an evening. `total` is how many lines that
+        session actually holds, so a surface can say what it is not showing.
+        """
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self.store.read() as connection:
+            active = connection.execute(
+                "SELECT session_number, started_at FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
+            ).fetchone()
+            previous = connection.execute(
+                """SELECT session_number, started_at, ended_at, where_ended
+                     FROM sessions WHERE status = 'CLOSED'
+                    ORDER BY session_number DESC LIMIT 1"""
+            ).fetchone()
+            recap: list[str] = []
+            total = 0
+            if previous is not None:
+                # The played session's span, read the way the export reads it:
+                # `ledger_entries` carries no session, but its timestamps and
+                # the session's come from the same clock in the same format,
+                # and a closed session is bounded at both ends by its own rows.
+                window: list[Any] = [previous["started_at"]]
+                clause = "created_at >= ?"
+                if active is not None:
+                    clause += " AND created_at < ?"
+                    window.append(active["started_at"])
+                total = int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM ledger_entries WHERE {clause}", tuple(window)
+                    ).fetchone()[0]
+                )
+                rows = connection.execute(
+                    f"""SELECT event_type, payload FROM ledger_entries
+                         WHERE {clause}
+                      ORDER BY created_at DESC, rowid DESC LIMIT ?""",
+                    (*window, limit),
+                ).fetchall()
+                recap = [render_entry(row["event_type"], row["payload"]) for row in reversed(rows)]
+        return {
+            "active_session_number": int(active["session_number"]) if active else None,
+            "previous": dict(previous) if previous else None,
+            "recap": recap,
+            "recap_total": total,
+        }
 
     def start_interaction(self, interaction_id: str, *, actor_id: str | None = None) -> ReceiptResult:
         if self.receipts is None:

@@ -64,6 +64,21 @@ Nothing is identified by hand. A character is chosen from a select menu, a playe
 Discord's own user picker, an item from what you are actually holding — the surface never asks
 anyone to paste a UUID.
 
+The table can pick up where it stopped. While no session is running, home names the last one
+and where it ended — the single sentence End Session asks a DM to type — and **Last time**
+opens the continuity panel: that endpoint, then the end of what happened, read as sentences
+through the same renderer the session log uses rather than as a second account of the evening.
+It is open to everyone at the table, links to the session log where one is configured, and
+says how many earlier lines it is not showing, because the export is the full record.
+
+A panel does not stay open forever, and it says so when it closes. A view that has timed out
+no longer answers its own controls, so instead of leaving buttons that produce Discord's bare
+"This interaction failed", it replaces them with the reason they are gone and an **Open
+again** control that renders the panel from current state — new handles included, because the
+old ones were single-use. A panel that has already been replaced on screen retires quietly:
+the notice belongs to the view the player is looking at, not the three they navigated through
+to reach it.
+
 **Party Stash → Take something…** offers `Take 1` per stack and `Take all` for stacks above
 one, using opaque single-use handles. A `Take all` whose quantity moved after the view was
 rendered asks for explicit confirmation of the current amount rather than silently taking a

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -20,7 +21,10 @@ from .currency import CurrencyError, CurrencySemanticStaleness, format_currency
 from .discord_common import (
     Quartermaster,
     _actor_id,
+    _bind_view,
+    _message_id,
     _require_dm,
+    _rerender,
     _run_fast,
     _send_error,
     _send_execution,
@@ -41,7 +45,20 @@ CONTROL_TIMEOUT = 300
 
 Opener = Callable[[discord.Interaction], Awaitable[None]]
 
+#: How a view reaches the message it was sent on after the fact. The two forms
+#: Discord offers — an interaction's original response and a followup webhook
+#: message — both edit an ephemeral message, and both take `content` and `view`.
+Editor = Callable[..., Awaitable[Any]]
+
 PARTY_DESTINATION = "party"
+
+#: The message a view has expired on, and who is showing on it now. Navigation
+#: replaces a panel in place, so several views can share one message over an
+#: evening and only the last of them is what the player is looking at.
+_ON_SCREEN: weakref.WeakValueDictionary[int, QuartermasterView] = weakref.WeakValueDictionary()
+
+EXPIRED_NOTICE = "This view has expired."
+EXPIRED_NOTICE_WITHOUT_CONTROL = "This view has expired. Run `/quartermaster` to open it again."
 
 
 class QuartermasterView(discord.ui.View):
@@ -54,12 +71,79 @@ class QuartermasterView(discord.ui.View):
     `View.on_error`, which logs and leaves the player looking at Discord's bare
     "This interaction failed" with no idea whether their take committed. Every
     view inherits this so the answer is the same wherever it is pressed.
+
+    A timeout is the same failure by a different route, and a more likely one:
+    once a view stops listening, discord.py never sees the press at all, so the
+    player reads the same bare failure with no way to tell it from a mutation
+    that was refused. `on_timeout` retires the controls and says so instead.
     """
 
-    def __init__(self, context: Quartermaster, *, timeout: float | None = CONTROL_TIMEOUT) -> None:
+    def __init__(
+        self,
+        context: Quartermaster,
+        *,
+        timeout: float | None = CONTROL_TIMEOUT,
+        reopen: Opener | None = None,
+    ) -> None:
         super().__init__(timeout=timeout)
         self.context = context
         self.settings = context.settings
+        self.reopen = reopen
+        self._editor: Editor | None = None
+        self._screen: int | None = None
+
+    def bind(self, editor: Editor, *, screen: int | None = None) -> None:
+        """Remember how to reach the message this view was sent on.
+
+        Ephemeral messages can only be edited through the interaction that
+        produced them, so a view that wants to retire its own controls has to
+        be handed that route at the moment it is sent. `screen` is the message
+        it landed on when there is one; a view sent as a fresh message learns
+        its message the first time something on it is pressed.
+        """
+        self._editor = editor
+        if screen is not None:
+            self._claim(screen)
+
+    def _claim(self, screen: int) -> None:
+        self._screen = screen
+        _ON_SCREEN[screen] = self
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Record which message this view is on, and that it is still on it."""
+        message = getattr(interaction, "message", None)
+        if message is not None:
+            self._claim(int(message.id))
+        return True
+
+    async def on_timeout(self) -> None:
+        """Take the dead controls off the screen rather than leave them to fail.
+
+        A view that has timed out is no longer listening: discord.py never
+        dispatches the press, nothing acknowledges the interaction, and Discord
+        tells the player "This interaction failed" — the one sentence that must
+        never be ambiguous, because it is also what a crash looks like. The
+        controls are replaced with the reason they are gone and, where the view
+        knows the way back, one control that renders it again.
+        """
+        if self._editor is None:
+            return
+        if self._screen is not None and _ON_SCREEN.get(self._screen) is not self:
+            # Another panel replaced this one on the same message. Editing now
+            # would wipe whatever the player is actually looking at, which is a
+            # worse failure than the one this is here to prevent.
+            return
+        expired = ExpiredView(self.context, self.reopen) if self.reopen is not None else None
+        notice = EXPIRED_NOTICE if expired is not None else EXPIRED_NOTICE_WITHOUT_CONTROL
+        try:
+            await self._editor(content=notice, view=expired)
+        except discord.HTTPException as error:
+            # A rendered view is bound to the interaction that rendered it and
+            # times out well inside that token's life, but pressing a control
+            # restarts the clock without re-rendering — so a long enough run of
+            # presses can outlive the token. That is the dead end this exists to
+            # prevent, reached anyway; there is nobody left to tell but the log.
+            logger.info("an expired view could not be retired: %s", error)
 
     def add_navigation(
         self,
@@ -97,6 +181,20 @@ class QuartermasterView(discord.ui.View):
             "Quartermaster could not complete that action. Nothing was changed unless you "
             "were told otherwise; open the surface again to see current state.",
         )
+
+
+class ExpiredView(QuartermasterView):
+    """What is left on the screen once a view has expired: the way back.
+
+    This one never expires. Everything it can do is render a panel out of
+    current state, so there is nothing on it to go stale — and a view whose
+    whole purpose is to answer an expiry cannot be the next thing that quietly
+    stops answering.
+    """
+
+    def __init__(self, context: Quartermaster, reopen: Opener) -> None:
+        super().__init__(context, timeout=None)
+        self.add_navigation(reopen, label="Open again", custom_id="qm:expired:open")
 
 
 class QuartermasterModal(discord.ui.Modal):
@@ -168,7 +266,9 @@ class TakeView(QuartermasterView):
         refresh: Opener,
         back: Opener,
     ) -> None:
-        super().__init__(context)
+        # Reopening mints fresh handles rather than restoring spent ones, which
+        # is the only honest way back onto a view whose controls were single-use.
+        super().__init__(context, reopen=refresh)
         take_all_handles = take_all_handles or {}
         for item in items:
             if len(self.children) >= MAX_VIEW_BUTTONS - 2:
@@ -231,9 +331,11 @@ async def _send_staleness_prompt(
 ) -> None:
     """Ask for the confirmation, whichever half of the response is still free."""
     if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True, view=view)
+        sent = await interaction.followup.send(message, ephemeral=True, view=view, wait=True)
+        _bind_view(view, sent.edit, screen=_message_id(sent))
     else:
         await interaction.response.send_message(message, ephemeral=True, view=view)
+        _bind_view(view, interaction.edit_original_response)
 
 
 class TakeConfirmationView(QuartermasterView):
@@ -276,7 +378,7 @@ class LootClaimView(QuartermasterView):
         refresh: Opener,
         back: Opener,
     ) -> None:
-        super().__init__(context)
+        super().__init__(context, reopen=refresh)
         for drop in drops:
             for item in drop["items"]:
                 if len(self.children) >= MAX_VIEW_BUTTONS - 2:
@@ -376,7 +478,7 @@ class GiveItemView(QuartermasterView):
         back: Opener,
         destination: str = PARTY_DESTINATION,
     ) -> None:
-        super().__init__(context)
+        super().__init__(context, reopen=back)
         self.item = item
         self.handles = handles
         self.recipients = recipients
@@ -423,10 +525,7 @@ class GiveItemView(QuartermasterView):
             self.destination = select.values[0]
             for option in select.options:
                 option.default = option.value == self.destination
-            await interaction.response.edit_message(
-                content=render_give_item(self.item, self._destination_name()),
-                view=self,
-            )
+            await _rerender(interaction, render_give_item(self.item, self._destination_name()), self)
 
         return callback
 
@@ -709,7 +808,7 @@ class GiveCurrencyView(QuartermasterView):
         back: Opener,
         destination: str = PARTY_DESTINATION,
     ) -> None:
-        super().__init__(context)
+        super().__init__(context, reopen=back)
         self.purse = purse
         self.recipients = recipients
         self.destination = destination
@@ -747,10 +846,7 @@ class GiveCurrencyView(QuartermasterView):
             self.destination = select.values[0]
             for option in select.options:
                 option.default = option.value == self.destination
-            await interaction.response.edit_message(
-                content=render_give_coin(self.purse, self._destination_name()),
-                view=self,
-            )
+            await _rerender(interaction, render_give_coin(self.purse, self._destination_name()), self)
 
         return callback
 

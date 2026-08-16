@@ -184,6 +184,31 @@ async def _run_fast(
     return execution
 
 
+def _bind_view(
+    view: discord.ui.View | None,
+    editor: Callable[..., object],
+    *,
+    screen: int | None = None,
+) -> None:
+    """Hand a view the route back to the message it was just sent on.
+
+    A Quartermaster view retires its own controls when it expires, and an
+    ephemeral message can only be edited through the interaction or webhook
+    that produced it — which only the code doing the sending knows. This is
+    duck-typed because the response helpers live below the views that use
+    them: `discord_views` imports this module, not the other way round.
+    """
+    bind = getattr(view, "bind", None)
+    if bind is None:
+        return
+    bind(editor, screen=screen)
+
+
+def _message_id(message: object) -> int | None:
+    identifier = getattr(message, "id", None)
+    return int(identifier) if identifier is not None else None
+
+
 async def _send_execution(
     interaction: discord.Interaction,
     execution: FastExecutionResult,
@@ -197,9 +222,13 @@ async def _send_execution(
         kwargs["view"] = view
     content = clamp_discord_content(message)
     if execution.deferred:
-        await interaction.followup.send(content, **kwargs)
+        sent = await interaction.followup.send(content, wait=view is not None, **kwargs)
+        if view is not None:
+            _bind_view(view, sent.edit, screen=_message_id(sent))
     else:
         await interaction.response.send_message(content, **kwargs)
+        if view is not None:
+            _bind_view(view, interaction.edit_original_response)
 
 
 async def _send_panel(
@@ -221,13 +250,37 @@ async def _send_panel(
     """
     body = clamp_discord_content(content)
     deferred = execution is not None and execution.deferred
-    if not deferred and getattr(interaction, "message", None) is not None and not interaction.response.is_done():
+    message = getattr(interaction, "message", None)
+    if not deferred and message is not None and not interaction.response.is_done():
         await interaction.response.edit_message(content=body, view=view)
+        _bind_view(view, interaction.edit_original_response, screen=_message_id(message))
         return
     if interaction.response.is_done():
-        await interaction.followup.send(body, view=view, ephemeral=True)
+        sent = await interaction.followup.send(body, view=view, ephemeral=True, wait=True)
+        _bind_view(view, sent.edit, screen=_message_id(sent))
     else:
         await interaction.response.send_message(body, view=view, ephemeral=True)
+        _bind_view(view, interaction.edit_original_response)
+
+
+async def _rerender(
+    interaction: discord.Interaction,
+    content: str,
+    view: discord.ui.View,
+) -> None:
+    """Redraw a view on the message it is already on, and renew its way back.
+
+    A select that changes what a panel says redraws the same view rather than
+    navigating, so the view outlives the interaction it was first sent on.
+    Rebinding here keeps the route it would use to retire itself pointed at the
+    most recent interaction, whose token is the one still alive.
+    """
+    await interaction.response.edit_message(content=clamp_discord_content(content), view=view)
+    _bind_view(
+        view,
+        interaction.edit_original_response,
+        screen=_message_id(getattr(interaction, "message", None)),
+    )
 
 
 async def _run_deferred(
@@ -498,6 +551,49 @@ def _render_characters(rows: list[dict]) -> str:
         [f"{row['name']} · `{row['id']}` · {row['lifecycle']}" for row in rows],
         label="character",
     )
+
+
+def _endpoint_summary(where_ended: str | None, *, limit: int = 90) -> str:
+    """The endpoint as one line, for a surface that has room for one line."""
+    if not where_ended:
+        return "no endpoint recorded"
+    text = " ".join(str(where_ended).split())
+    return text if len(text) <= limit else clamp_discord_content(text, limit=limit)
+
+
+def _render_last_time(continuity: dict) -> str:
+    """Where the table stopped, and what had happened by then.
+
+    This is the surface the product is named for. Everything on it is already
+    written down: the endpoint is the one narrative line End Session asks a DM
+    to type, and the recap is the end of that session's ledger read through the
+    same renderer the session log uses — so a recap cannot describe an evening
+    differently from the log the table watched it in.
+    """
+    previous = continuity["previous"]
+    lines = ["**LAST TIME**", ""]
+    if previous is None:
+        lines.append(
+            "No session has been closed yet, so there is nothing to pick up from. "
+            "Ending a session records where you stopped, and it shows up here."
+        )
+        return "\n".join(lines)
+    ended = str(previous["ended_at"] or "")[:10]
+    lines.append(f"Session {previous['session_number']}" + (f" · ended {ended}" if ended else ""))
+    lines.extend(["", "You ended:", previous["where_ended"] or "Nothing was recorded."])
+    recap = continuity["recap"]
+    if recap:
+        lines.extend(["", "What happened:"])
+        lines.extend(f"• {line}" for line in recap)
+        earlier = int(continuity["recap_total"]) - len(recap)
+        if earlier > 0:
+            entries = "line" if earlier == 1 else "lines"
+            lines.append(
+                f"({earlier} earlier {entries} not shown; the export holds the full record.)"
+            )
+    if continuity["active_session_number"] is not None:
+        lines.extend(["", f"Session {continuity['active_session_number']} is in progress now."])
+    return fit_discord_lines(lines, label="history")
 
 
 async def _require_dm(interaction: discord.Interaction, settings: Settings) -> bool:

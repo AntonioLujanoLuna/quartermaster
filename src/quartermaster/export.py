@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from typing import Any
 
 from .currency import currency_from_row, format_currency
 from .db import SCHEMA_VERSION, SQLiteStore
-from .narrative import render_event
+from .narrative import render_entry
 
 # What a reader wants from the history of a campaign with no session on record
 # is the last thing that happened, not all of it.
@@ -80,13 +79,7 @@ def _history_line(row: Any) -> str:
     their own evening should not have to decode them. An entry nothing can
     render still appears, as its payload — losing it would be worse.
     """
-    payload = row["payload"]
-    try:
-        decoded = json.loads(payload)
-    except (TypeError, json.JSONDecodeError):
-        decoded = None
-    sentence = render_event(row["event_type"], decoded) if isinstance(decoded, dict) else None
-    return sentence if sentence is not None else f"{row['event_type']}: {payload}"
+    return render_entry(row["event_type"], row["payload"])
 
 
 def _render_export(connection: Any) -> str:
