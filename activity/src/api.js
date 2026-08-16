@@ -8,6 +8,7 @@
 const BASE = "/.proxy/api";
 
 let sessionToken = null;
+let renew = null;
 
 export class ApiError extends Error {
   constructor(status, detail) {
@@ -20,12 +21,33 @@ export function setSessionToken(token) {
   sessionToken = token;
 }
 
-async function request(path, options = {}) {
+export function sessionTokenValue() {
+  return sessionToken;
+}
+
+/**
+ * How to get another session token when this one stops being accepted.
+ *
+ * A token lasts an hour and a session at the table does not, so without this
+ * every screen in the party goes dead partway through the evening — and with a
+ * live feed on it, it goes dead while still looking connected.
+ */
+export function onExpiry(handler) {
+  renew = handler;
+}
+
+async function request(path, options = {}, { retried = false } = {}) {
   const headers = { ...(options.headers || {}) };
   if (sessionToken) headers.Authorization = `Bearer ${sessionToken}`;
   if (options.body) headers["Content-Type"] = "application/json";
 
   const response = await fetch(`${BASE}${path}`, { ...options, headers });
+  if (response.status === 401 && renew && !retried) {
+    // Once. A second refusal after a fresh token is a real refusal, and
+    // retrying it again would be a loop rather than a repair.
+    await renew();
+    return request(path, options, { retried: true });
+  }
   if (!response.ok) {
     let detail = null;
     try {

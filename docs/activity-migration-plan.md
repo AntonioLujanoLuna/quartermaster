@@ -1,8 +1,8 @@
 # Moving the table surface into a Discord Activity
 
-Status: Stages 1 and 2 implemented, and neither has been run against the guild.
-Stage 0 — hosting — is still open, and is what Stage 2 is waiting on. Stages 3
-to 6 are proposed.
+Status: Stages 1, 2, and 3 implemented, and none of them has been run against
+the guild. Stage 0 — hosting — is still open, and is what Stages 2 and 3 are
+waiting on. Stages 4 to 6 are proposed.
 
 ## Why
 
@@ -148,6 +148,24 @@ This deliberately does not touch `event_outbox`, which belongs to the Discord pr
 transport and its FIFO delivery guarantees. The Activity feed is a second reader of
 `domain_events`, not a second writer to the outbox.
 
+Built, in `api_live.py`, with four decisions the sketch above did not settle:
+
+- **The feed is woken, not polled.** `SQLiteStore.add_commit_listener` reports that a write
+  transaction committed — that it did, and nothing about what was in it — so an idle table
+  costs no queries and a busy one costs one indexed read per commit. A timer instead would
+  contend with the gateway for the single connection all evening, which is the cost
+  `expire_due_drops` was changed to stop paying. A 30-second poll remains as a safety net,
+  and only ticks while somebody is listening.
+- **The token travels in the socket's first frame.** A browser cannot set an `Authorization`
+  header on a WebSocket, and the alternative — a query string — is a bearer credential in
+  every access log between here and the player.
+- **A client that falls behind is reset, not buffered.** Each subscriber has a bounded
+  queue; past it the backlog is dropped and the client is told to read everything again,
+  which is what it would do on reconnect anyway. A resume whose gap is wider than the replay
+  bound gets the same answer.
+- **One pump for the process.** Six players at one table would otherwise be six queries per
+  change against the connection the bot is also writing through.
+
 ### What happens to handles
 
 Opaque single-use handles stay, and stop being visible.
@@ -253,8 +271,18 @@ an origin and one URL mapping covers both. *Exit still open: it needs an https o
 a real launch in the guild — see Stage 0. The Entry Point command is not registered yet
 either; `/quartermaster` still opens the panel.*
 
-**Stage 3 — Live feed.** The `domain_events.sequence` WebSocket, with reconnect-from-cursor.
-*Exit: a grant issued from the bot appears on an open Activity screen without a refresh.*
+**Stage 3 — Live feed.** *Built, not yet launched.* `api_live` holds the pump and the
+subscriptions, `/api/live` is the socket, and `activity/src/live.js` is the client that
+reconnects from its cursor and answers a notification by refetching. The screen says whether
+it is live, because a surface that reads live has to say when it has stopped. *Exit still
+open: `tests/test_api.py` proves a grant made through the service layer reaches an open
+socket, which is the criterion as far as a test can carry it — the rest of it is a grant
+issued from the bot in the guild appearing on a screen in Discord, and that needs Stage 0.*
+
+Session tokens last an hour and an evening does not, so the client now re-runs the handshake
+when one is refused rather than going quiet — on the socket and on the reads both. That gap
+existed from Stage 1; a live screen is what made it visible, because a screen that stops
+reading still looks connected.
 
 **Stage 4 — Player mutations.** Take, give, use, claim, coin, character registration. The
 first stage where a handle round-trips through the new transport. *Exit: a full session's

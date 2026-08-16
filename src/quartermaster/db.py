@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -9,6 +10,8 @@ from pathlib import Path
 from threading import RLock
 
 from .naming import normalize_name
+
+logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 12
 
@@ -370,6 +373,39 @@ class SQLiteStore:
         self.uri = uri
         self.connection: sqlite3.Connection | None = None
         self.connection_lock = RLock()
+        self._commit_listeners: list[Callable[[], None]] = []
+
+    def add_commit_listener(self, listener: Callable[[], None]) -> None:
+        """Be told that a write transaction committed.
+
+        The Activity's live feed needs to know when `domain_events` grew, and
+        the alternative is polling the sequence on a timer — one read per tick
+        against the single connection the gateway shares, for the whole time
+        the table is idle, which is the contention `expire_due_drops` already
+        had to stop causing.
+
+        A listener is told *that* something committed and nothing about what:
+        the store stays a store. It runs on whichever thread committed, after
+        the connection lock is released, so it must not block and must not
+        write. A listener that raises is not allowed to fail the commit that
+        has already happened.
+        """
+        with self.connection_lock:
+            self._commit_listeners.append(listener)
+
+    def remove_commit_listener(self, listener: Callable[[], None]) -> None:
+        with self.connection_lock:
+            if listener in self._commit_listeners:
+                self._commit_listeners.remove(listener)
+
+    def _announce_commit(self) -> None:
+        with self.connection_lock:
+            listeners = tuple(self._commit_listeners)
+        for listener in listeners:
+            try:
+                listener()
+            except Exception:
+                logger.exception("a commit listener failed")
 
     def open(self) -> SQLiteStore:
         if self.connection is not None:
@@ -491,6 +527,7 @@ class SQLiteStore:
 
     @contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
+        committed = False
         with self.connection_lock:
             connection = self._require_connection()
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
@@ -501,6 +538,12 @@ class SQLiteStore:
                 raise
             else:
                 connection.commit()
+                committed = True
+        # Announced outside the lock, and only for a transaction that reached
+        # commit: a listener told about a rolled-back write would go looking
+        # for events that are not there.
+        if committed:
+            self._announce_commit()
 
     def snapshot(self, destination: str | Path) -> Path:
         """Create a consistent SQLite backup without copying a live file."""

@@ -1,9 +1,9 @@
 # The Quartermaster Activity
 
-The web surface Discord embeds in its own client. Stages 1 and 2 of
+The web surface Discord embeds in its own client. Stages 1 to 3 of
 [the migration plan](../docs/activity-migration-plan.md): the read API, the
-OAuth handshake, and one read-only screen — the Party Stash, with the instance
-roster beside it.
+OAuth handshake, one read-only screen — the Party Stash, with the instance
+roster beside it — and the live feed that keeps it current.
 
 This is a walking skeleton on purpose. It proves the handshake, the proxy, and
 the hosting, which are the parts that can only be discovered against real
@@ -13,12 +13,35 @@ Discord. Nothing here mutates anything; the panels remain the way to act.
 
 | File | What it does |
 | --- | --- |
-| `src/main.js` | The boot sequence: SDK ready, authorize, exchange, authenticate, read, subscribe |
-| `src/api.js` | The session token and every call that carries it |
+| `src/main.js` | The boot sequence: SDK ready, authorize, exchange, authenticate, connect, read, subscribe |
+| `src/api.js` | The session token, every call that carries it, and getting another one when it expires |
+| `src/live.js` | The socket, its cursor, and the reconnect that resumes from it |
 | `src/render.js` | The screen, built with `createElement` rather than `innerHTML` |
 | `src/style.css` | A palette that follows the client's theme rather than choosing one |
 
-The API it talks to is `src/quartermaster/api_app.py`.
+The API it talks to is `src/quartermaster/api_app.py`; the feed behind it is
+`src/quartermaster/api_live.py`.
+
+## How the screen stays current
+
+`/.proxy/api/live` is a WebSocket. It carries change notifications — a
+sequence, an event type, when it landed — and never state, so the answer to
+"something happened" is to ask for the reads on screen again rather than to
+render what arrived. That keeps one renderer per fact.
+
+The token goes in the socket's first frame, because a browser cannot set an
+`Authorization` header on a WebSocket and a query string would put a bearer
+credential in every log on the way.
+
+The socket opens *before* the first read. A change landing between a read and a
+connection would otherwise fall in the gap between them; connecting first can
+only cost a redundant refresh. Every notice carries the sequence it reached, and
+reconnecting asks to resume from the last one seen — so a dropped connection is
+a gap to fill, and only a gap too wide to replay costs a full reload.
+
+The header says `Live`, `Connecting…`, or `Reconnecting…`. A surface that reads
+live has to say when it has stopped, or the table trusts a number that stopped
+moving ten minutes ago.
 
 ## Configure the application in Discord's developer portal
 
@@ -79,7 +102,13 @@ the Activity from a voice channel in the configured guild.
 
 The dev server rewrites `/.proxy/api/*` to the API and strips the prefix, so the
 same paths work behind the real proxy and in development without the client
-knowing which it is in. Point it somewhere else with `QM_API_URL`.
+knowing which it is in. It carries the WebSocket upgrade on the same prefix, so
+the live feed works in development too. Point it somewhere else with
+`QM_API_URL`.
+
+The backend needs the `activity` extra installed for the socket: uvicorn speaks
+HTTP without a WebSocket implementation and answers an upgrade with a 404, which
+reads as a missing route rather than a missing dependency.
 
 ## Build and serve
 
@@ -94,6 +123,5 @@ is never shadowed by a file.
 
 ## What is not here yet
 
-Mutations (Stage 4), the DM surface (Stage 5), and the live feed over
-`domain_events.sequence` (Stage 3). Until Stage 3 lands, the screen reflects
-state as of the moment it loaded.
+Mutations (Stage 4) and the DM surface (Stage 5). The screen reads and refuses
+to pretend otherwise; acting is still the panels' job.
