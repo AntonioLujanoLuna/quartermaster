@@ -993,6 +993,36 @@ class ActivityConfigurationTests(unittest.TestCase):
         self.assertEqual(settings.require_activity(), ("1234", "shhh"))
         self.assertEqual(settings.api_bind, "127.0.0.1:8080")
 
+    def test_a_table_that_never_enabled_the_activity_is_not_warned_about_it(self) -> None:
+        settings = Settings.from_env(self._environment())
+        self.assertFalse(settings.activity_half_configured)
+
+    def test_a_served_activity_is_not_warned_about_either(self) -> None:
+        settings = Settings.from_env(
+            self._environment(
+                QM_DISCORD_CLIENT_ID="1234",
+                QM_DISCORD_CLIENT_SECRET="shhh",
+                QM_ACTIVITY_DIST="activity/dist",
+            )
+        )
+        self.assertFalse(settings.activity_half_configured)
+
+    def test_somewhere_to_serve_it_from_without_the_credentials_is_reported(self) -> None:
+        """The failure the start script used to cause, and the reason it warns.
+
+        The bot starts, the API does not, and the only symptom at the table is
+        a launcher that opens nothing.
+        """
+        for missing in (
+            {"QM_ACTIVITY_DIST": "activity/dist"},
+            {"QM_ACTIVITY_ORIGIN": "https://example.invalid"},
+            {"QM_ACTIVITY_DIST": "activity/dist", "QM_DISCORD_CLIENT_ID": "1234"},
+        ):
+            with self.subTest(**missing):
+                settings = Settings.from_env(self._environment(**missing))
+                self.assertFalse(settings.activity_enabled)
+                self.assertTrue(settings.activity_half_configured)
+
     def test_an_origin_discord_cannot_frame_is_refused_at_startup(self) -> None:
         with self.assertRaises(ConfigurationError):
             Settings.from_env(self._environment(QM_ACTIVITY_ORIGIN="http://localhost:5173"))

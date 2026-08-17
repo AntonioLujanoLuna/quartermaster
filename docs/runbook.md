@@ -66,6 +66,8 @@ $env:QM_API_BIND = "127.0.0.1:8080"
 $env:QM_ACTIVITY_DIST = ".\activity\dist"
 ```
 
+These can be set user-level like the backup values, and `start-quartermaster.ps1` imports every `QM_` value it finds there. It previously imported only the five required ones, which meant an Activity configured user-level reached the Developer Portal but never reached the process; if that has already been set up against an older copy of the script, take this one.
+
 Leave the bind on the loopback address. The tunnel connects from the same machine, so the API never needs to be reachable on the network, and the session token is a bearer credential that should not be answerable to anything else. The API starts only when both `QM_DISCORD_CLIENT_ID` and `QM_DISCORD_CLIENT_SECRET` are set; with either missing the bot starts exactly as it does today and logs that the Activity is disabled. The export CLI never needs them.
 
 Start the tunnel, then the bot, then configure the Developer Portal:
