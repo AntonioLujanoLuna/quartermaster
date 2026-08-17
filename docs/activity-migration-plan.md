@@ -1,8 +1,9 @@
 # Moving the table surface into a Discord Activity
 
 Status: Stages 1, 2, 3, and 4 implemented, and none of them has been run against
-the guild. Stage 0 — hosting — is still open, and is what every stage past 1 is
-waiting on. Stages 5 and 6 are proposed.
+the guild. Stage 0 — hosting — has a free answer written down in
+[the runbook](runbook.md) and has not been carried out yet; carrying it out is
+what every stage past 1 is waiting on. Stages 5 and 6 are proposed.
 
 ## Why
 
@@ -293,6 +294,25 @@ with a SQLite file and a Windows startup script (`docs/runbook.md`). An Activity
 publicly reachable HTTPS origin with a real certificate. Decide where it runs and how the
 database is backed up there before writing frontend code. *Exit: an origin exists and
 serves a static page through the Discord proxy.*
+
+*Answered, not yet carried out.* The decision this stage was waiting on was framed as
+"where does this move to," and the answer is that it does not move. One process, one SQLite
+writer, and a bot holding a gateway connection is the wrong shape for a free web tier —
+those sleep an idle service and hand it an ephemeral disk, so the choice was between paying
+for a host and losing the campaign on the next deploy. A tunnel makes it a third thing:
+the bot keeps running where it runs, and only the public origin is rented, which is the
+part that is free. Backups therefore stay exactly as
+[the backup section](runbook.md#backup-and-restore) already has them, which is the half of
+this stage that was genuinely unresolved.
+
+The tradeoff being accepted is availability: the Activity is reachable only while the
+machine running the bot is up, which is already true of the bot. The tradeoff being
+deferred is a stable hostname — a throwaway `trycloudflare.com` origin costs nothing and
+re-enters a URL mapping on each restart, a Tailscale Funnel hostname is stable and free but
+wants a policy file it can write to. Both are written up in
+[the runbook](runbook.md#serving-the-activity-without-paying-for-hosting). Neither is a
+commitment: the mapping is one field in the Developer Portal, so moving to a paid origin
+later changes a hostname and nothing else.
 
 **Stage 1 — API layer, no frontend.** *Done.* `api_auth` (session tokens, identity),
 `api_app` (routes), `api_server` (serving next to the bot), covered by `tests/test_api.py`.
