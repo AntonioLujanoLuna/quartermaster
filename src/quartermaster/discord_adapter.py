@@ -88,6 +88,15 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
             from .api_server import serve_api
 
             api_task = asyncio.create_task(serve_api(context, stop_event))
+        elif settings.activity_half_configured:
+            # A configuration that half arrived rather than a table that has not
+            # enabled the Activity — most often a value that never reached the
+            # process. Worth a warning, because the quiet version of this is a
+            # launcher in Discord that opens nothing.
+            logger.warning(
+                "Activity not served: QM_ACTIVITY_DIST or QM_ACTIVITY_ORIGIN is configured, "
+                "but QM_DISCORD_CLIENT_ID and QM_DISCORD_CLIENT_SECRET are not"
+            )
 
     bot.setup_hook = setup_hook  # type: ignore[method-assign]
 

@@ -8,11 +8,21 @@ $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $stopPath = Join-Path $repo 'quartermaster.stop'
 
-foreach ($name in @('QM_GUILD_ID', 'QM_PARTY_INVENTORY_CHANNEL_ID', 'QM_SESSION_LOG_CHANNEL_ID', 'QM_DATABASE_PATH', 'QM_DISCORD_TOKEN')) {
+# Every QM_ value in the user environment, rather than a list of the ones that
+# existed when this was written. The list this used to carry named only the five
+# required values, so an optional setting configured user-level never reached the
+# process — and an optional setting does not fail loudly. The Activity is the
+# case that made it matter: without QM_DISCORD_CLIENT_ID and
+# QM_DISCORD_CLIENT_SECRET the bot starts perfectly and simply does not serve it.
+# Process values still win, so an ad-hoc shell can override for one run.
+foreach ($entry in [Environment]::GetEnvironmentVariables('User').GetEnumerator()) {
+    $name = [string]$entry.Key
+    if ($name -notlike 'QM_*') {
+        continue
+    }
     if ([string]::IsNullOrWhiteSpace((Get-Item "Env:$name" -ErrorAction SilentlyContinue).Value)) {
-        $value = [Environment]::GetEnvironmentVariable($name, 'User')
-        if (-not [string]::IsNullOrWhiteSpace($value)) {
-            Set-Item "Env:$name" $value
+        if (-not [string]::IsNullOrWhiteSpace($entry.Value)) {
+            Set-Item "Env:$name" $entry.Value
         }
     }
 }

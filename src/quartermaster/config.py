@@ -101,6 +101,21 @@ class Settings:
     def activity_enabled(self) -> bool:
         return bool(self.discord_client_id and self.discord_client_secret)
 
+    @property
+    def activity_half_configured(self) -> bool:
+        """Where to serve the Activity from, without the credentials to serve it.
+
+        A table that has not enabled the Activity sets none of these, and the
+        bot starting without an API is the correct outcome. One that meant to
+        and lost a value on the way sets some of them, and gets the same
+        outcome — a launcher in Discord that opens nothing. Distinguishing the
+        two is what lets the adapter warn about the second without nagging the
+        first.
+        """
+        return not self.activity_enabled and (
+            self.activity_dist is not None or self.activity_origin is not None
+        )
+
     def require_discord_token(self) -> str:
         if not self.discord_token:
             raise ConfigurationError("QM_DISCORD_TOKEN is required to run the Discord bot")

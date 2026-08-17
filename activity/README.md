@@ -7,7 +7,11 @@ player can act on — Party Stash, My Items, Loot, and Treasury, with the instan
 roster beside them.
 
 None of it has been framed by Discord once. Stage 0 — an https origin — is what
-that is waiting on.
+that is waiting on, and it needs no paid hosting: the bot keeps running where it
+runs and a tunnel rents the origin.
+[Serving the Activity](../docs/runbook.md#serving-the-activity-without-paying-for-hosting)
+has the two free ways to get one, what to set, and what the first launch is
+really testing.
 
 ## What it is made of
 
