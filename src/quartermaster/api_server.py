@@ -15,10 +15,12 @@ installed to run the bot.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 
 from .api_app import create_app
 from .api_auth import DiscordIdentityProvider
+from .config import ConfigurationError
 from .discord_common import Quartermaster
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,34 @@ __all__ = ["serve_api"]
 def _split_bind(bind: str) -> tuple[str, int]:
     host, _, port = bind.rpartition(":")
     return host, int(port)
+
+
+#: The WebSocket implementations uvicorn can pick up. It selects one at startup
+#: and falls back to serving no WebSocket at all, which is the failure this
+#: refuses to start into.
+WEBSOCKET_IMPLEMENTATIONS = ("websockets", "wsproto")
+
+
+def _require_websockets() -> None:
+    """Refuse to serve a live feed that cannot be connected to.
+
+    With neither library installed uvicorn answers the upgrade on `/api/live`
+    with 404 and serves every other route normally. The screen then loads, says
+    it is connecting, retries on a backoff, and shows numbers that stopped
+    moving — which is the one failure mode this whole surface exists to avoid,
+    reached through a dependency that is easy to miss because the tests do not
+    need it: Starlette's test client runs a socket in-process.
+
+    So it is refused at startup, where it names itself, rather than at the first
+    upgrade, where it looks like a missing route.
+    """
+    if any(importlib.util.find_spec(module) is not None for module in WEBSOCKET_IMPLEMENTATIONS):
+        return
+    raise ConfigurationError(
+        "the Activity API needs a WebSocket implementation for the live feed, and neither "
+        "websockets nor wsproto is installed; install the activity extra "
+        "(uv sync --extra activity)"
+    )
 
 
 async def serve_api(context: Quartermaster, stop_event: asyncio.Event) -> None:
@@ -42,6 +72,15 @@ async def serve_api(context: Quartermaster, stop_event: asyncio.Event) -> None:
     settings = context.settings
     if not settings.activity_enabled:
         logger.info("Activity API disabled: configure QM_DISCORD_CLIENT_ID and QM_DISCORD_CLIENT_SECRET")
+        return
+
+    try:
+        _require_websockets()
+    except ConfigurationError as error:
+        # Not raised onward: the bot is the surface the table still has, and
+        # taking it down over an optional one would cost them both. The Activity
+        # does not come up, and the log says why in the words of the fix.
+        logger.error("Activity API not served: %s", error)
         return
 
     client_id, client_secret = settings.require_activity()

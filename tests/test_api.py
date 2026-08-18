@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from quartermaster.api_app import create_app
+from quartermaster.api_app import PROXY_PREFIX, create_app
 from quartermaster.api_auth import (
     Actor,
     Identity,
@@ -52,6 +52,7 @@ from quartermaster.api_live import (
     EventFeed,
     Subscription,
 )
+from quartermaster.api_server import _require_websockets, serve_api
 from quartermaster.characters import CharacterService
 from quartermaster.combat import CombatService
 from quartermaster.config import ConfigurationError, Settings
@@ -61,6 +62,7 @@ from quartermaster.discord_common import BotServices, Quartermaster
 from quartermaster.handles import HandleRepository
 from quartermaster.inventory import InventoryService
 from quartermaster.loot import LootDropService
+from quartermaster.preflight import _built_page, run_preflight
 from quartermaster.receipts import ReceiptRepository
 from quartermaster.sessions import SessionService
 
@@ -677,6 +679,103 @@ class StaticSurfaceTests(ApiTestCase):
         self.assertEqual(self.client.get("/api/health").status_code, 200)
         self.assertEqual(self.client.get("/").status_code, 404)
 
+    def test_the_page_is_served_behind_the_proxy_prefix_too(self) -> None:
+        """A page loaded at `/.proxy/` has to find itself there."""
+        response = self._app_serving(self.dist).get(f"{PROXY_PREFIX}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Quartermaster", response.text)
+
+
+class ProxyPrefixTests(ApiTestCase):
+    """Both path forms Discord's proxy may present, answered identically.
+
+    The client addresses `/.proxy/api/...` because that form has been carried
+    since Activities shipped; the proxy forwards it to `/api/...` here, and
+    since 2025-07-30 an unprefixed path is forwarded the same way. Answering
+    both is what keeps the first launch from depending on which behaviour is
+    live — and it is what lets the built page be opened straight from the bind
+    for a smoke test, with no proxy in front of it at all.
+    """
+
+    def test_a_read_answers_under_both_prefixes(self) -> None:
+        headers = self.headers()
+        plain = self.client.get("/api/stash", headers=headers)
+        proxied = self.client.get(f"{PROXY_PREFIX}/api/stash", headers=headers)
+        self.assertEqual(plain.status_code, 200)
+        self.assertEqual(proxied.status_code, 200)
+        self.assertEqual(plain.json(), proxied.json())
+
+    def test_the_trust_boundary_holds_under_the_prefix(self) -> None:
+        """A second mount is a second way in, so it gets the same door."""
+        self.assertEqual(self.client.get(f"{PROXY_PREFIX}/api/stash").status_code, 401)
+        self.assertEqual(
+            self.client.get(f"{PROXY_PREFIX}/api/export", headers=self.headers()).status_code, 403
+        )
+
+    def test_a_mutation_answers_under_the_prefix(self) -> None:
+        self.grant("Rope", 3, interaction="grant-1")
+        self.register("Sable", PLAYER_ID, interaction="register-1")
+        stack = self.stash_stack("Rope")
+        prepared = self.post(
+            f"{PROXY_PREFIX}/api/stash/take/prepare", {"stack_id": stack["id"], "amount": 1}
+        )
+        self.assertEqual(prepared.status_code, 200, prepared.text)
+        took = self.post(
+            f"{PROXY_PREFIX}/api/stash/take", {"handle_id": prepared.json()["handle_id"]}
+        )
+        self.assertEqual(took.status_code, 200, took.text)
+        self.assertEqual(took.json()["result"]["quantity"], 1)
+
+    def test_the_live_feed_upgrades_under_the_prefix(self) -> None:
+        token = self.authenticate("player-code")["token"]
+        # Entered as a context manager, which is what runs the lifespan and so
+        # starts the pump; a socket against an unstarted feed is refused rather
+        # than left to look live.
+        with TestClient(self.app) as served:
+            with served.websocket_connect(f"{PROXY_PREFIX}/api/live") as socket:
+                socket.send_json({"token": token})
+                self.assertEqual(_next_message(socket)["type"], "hello")
+
+
+class WebSocketDependencyTests(unittest.TestCase):
+    """The dependency whose absence looks like a working Activity.
+
+    With neither websockets nor wsproto installed, uvicorn serves every route
+    normally and answers the upgrade on `/api/live` with a 404. The screen then
+    loads, says it is connecting, backs off, and shows numbers that stopped
+    moving — the exact failure the live feed exists to prevent, produced by a
+    missing package rather than by anything in the code.
+    """
+
+    def test_a_missing_implementation_is_named_rather_than_served_into(self) -> None:
+        with mock.patch("quartermaster.api_server.importlib.util.find_spec", return_value=None):
+            with self.assertRaises(ConfigurationError) as raised:
+                _require_websockets()
+        self.assertIn("websockets", str(raised.exception))
+
+    def test_either_implementation_is_enough(self) -> None:
+        for present in ("websockets", "wsproto"):
+            with self.subTest(implementation=present):
+                with mock.patch(
+                    "quartermaster.api_server.importlib.util.find_spec",
+                    side_effect=lambda name, wanted=present: object() if name == wanted else None,
+                ):
+                    _require_websockets()
+
+    def test_the_bot_keeps_running_when_the_activity_cannot_be_served(self) -> None:
+        """The bot is the surface the table still has; it does not come down."""
+        settings = Settings(
+            guild_id=GUILD_ID,
+            database_path=Path("unused.sqlite"),
+            discord_client_id="1234",
+            discord_client_secret=CLIENT_SECRET,
+        )
+        context = mock.Mock(settings=settings)
+        with mock.patch("quartermaster.api_server.importlib.util.find_spec", return_value=None):
+            with self.assertLogs("quartermaster.api_server", level="ERROR") as logs:
+                asyncio.run(serve_api(context, asyncio.Event()))
+        self.assertIn("not served", logs.output[0])
+
 
 def _next_message(socket, *, timeout: float = 5.0) -> dict:
     """Read one frame, or fail rather than hanging the suite.
@@ -1039,6 +1138,69 @@ class ActivityConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(settings.activity_origin, "https://quartermaster.example")
         self.assertEqual(settings.api_bind, "0.0.0.0:9001")
+
+
+class PreflightTests(unittest.TestCase):
+    """Stage 0's checks, checked.
+
+    `preflight` exists to catch the things that would otherwise be discovered
+    from a blank frame inside a Discord client. The cases worth proving here
+    are the ones where a broken setup looks exactly like a working one — most
+    of all a bundle built without a client id, which compiles and serves and
+    contains no application.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.dist = Path(self.directory.name) / "dist"
+        (self.dist / "assets").mkdir(parents=True)
+
+    def _settings(self, **overrides) -> Settings:
+        return Settings(
+            guild_id=GUILD_ID,
+            database_path=Path(self.directory.name) / "quartermaster.sqlite",
+            discord_client_id="1234",
+            discord_client_secret=CLIENT_SECRET,
+            activity_dist=self.dist,
+            **overrides,
+        )
+
+    def _named(self, checks: list, name: str):
+        for check in checks:
+            if check.name == name:
+                return check
+        raise AssertionError(f"no {name!r} check among {[check.name for check in checks]}")
+
+    def _write_bundle(self, body: str) -> None:
+        (self.dist / "index.html").write_text("<!doctype html><title>Quartermaster</title>", encoding="utf-8")
+        (self.dist / "assets" / "index-abc.js").write_text(body, encoding="utf-8")
+
+    def test_a_bundle_built_without_a_client_id_is_caught(self) -> None:
+        """The failure that looks like success.
+
+        Vite replaces `import.meta.env` at build time, so with no
+        `VITE_DISCORD_CLIENT_ID` the boot sequence returns on its first branch
+        and the bundler removes the application as unreachable. The build
+        succeeds, the page serves, and nothing happens in the frame.
+        """
+        self._write_bundle("console.log('an application that was tree-shaken away')")
+        self.assertFalse(self._named(_built_page(self._settings()), "bundle").passed)
+
+    def test_a_bundle_that_still_carries_the_application_passes(self) -> None:
+        self._write_bundle('fetch("/.proxy/api/home")')
+        self.assertTrue(self._named(_built_page(self._settings()), "bundle").passed)
+
+    def test_a_build_that_never_ran_is_named_as_such(self) -> None:
+        self.assertFalse(self._named(_built_page(self._settings()), "built page").passed)
+
+    def test_an_unconfigured_activity_stops_before_serving(self) -> None:
+        """Nothing below the configuration check can be asked without a secret."""
+        settings = replace(self._settings(), discord_client_id=None, discord_client_secret=None)
+        checks, remaining = run_preflight(settings)
+        self.assertFalse(self._named(checks, "configuration").passed)
+        self.assertNotIn("origin", [check.name for check in checks])
+        self.assertIn("URL Mappings", remaining)
 
 
 def _unpad(value: str) -> bytes:

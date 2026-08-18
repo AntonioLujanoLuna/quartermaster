@@ -1,9 +1,14 @@
 # Moving the table surface into a Discord Activity
 
-Status: Stages 1, 2, 3, and 4 implemented, and none of them has been run against
-the guild. Stage 0 — hosting — has a free answer written down in
-[the runbook](runbook.md) and has not been carried out yet; carrying it out is
-what every stage past 1 is waiting on. Stages 5 and 6 are proposed.
+Status: Stages 1, 2, 3, and 4 implemented and driven end to end against a real
+server — a real socket, real SQLite, the real service layer — with Discord's
+code exchange as the only faked part. None of them has been run against the
+guild, because that is what Stage 0 is for. Stage 0's answer is written down in
+[the runbook](runbook.md), and its machine half is now carried out and
+repeatable: `python -m quartermaster preflight` serves the application and
+checks every Stage 0 property that does not require Discord. What remains of it
+is a tunnel, a URL mapping, and a launch, none of which any code can do.
+Stages 5 and 6 are proposed.
 
 ## Why
 
@@ -293,7 +298,9 @@ Each stage is independently shippable and leaves the bot working.
 with a SQLite file and a Windows startup script (`docs/runbook.md`). An Activity needs a
 publicly reachable HTTPS origin with a real certificate. Decide where it runs and how the
 database is backed up there before writing frontend code. *Exit: an origin exists and
-serves a static page through the Discord proxy.*
+serves a static page through the Discord proxy.* **Half met: the page, the API, and the
+socket are served and verified on this machine by `preflight`; the origin in front of them
+is a tunnel, a mapping, and a launch, and those are still to do.**
 
 *Answered, not yet carried out.* The decision this stage was waiting on was framed as
 "where does this move to," and the answer is that it does not move. One process, one SQLite
@@ -314,6 +321,31 @@ wants a policy file it can write to. Both are written up in
 commitment: the mapping is one field in the Developer Portal, so moving to a paid origin
 later changes a hostname and nothing else.
 
+*Carried out, as far as this side goes.* The stage splits cleanly in two, and the split is
+worth naming because only one half was ever about hosting. The half that is a fact about
+Discord — a tunnel is up, a mapping points at it, the app is installed in the guild — is
+still three manual steps and is written out in the runbook. The half that is a fact about
+this machine is now a command, `preflight`, and it found two things that would have
+surfaced as a blank frame:
+
+- **The live feed could not be served at all.** `websockets` is in the `activity` extra and
+  in nothing the tests need, because Starlette's test client runs a socket in-process. So a
+  suite that proves the feed passes on a machine that cannot serve it, and uvicorn answers
+  the upgrade with a 404 — which reads as a missing route. The screen would have loaded,
+  said it was connecting, and shown numbers that stopped moving, which is the one failure
+  this surface exists to prevent. The API now refuses to serve rather than start into it,
+  and the runbook installs the extra.
+- **Nothing checked that the bundle contained the application.** A build with no
+  `VITE_DISCORD_CLIENT_ID` compiles, serves, and holds nothing, because `boot()` returns on
+  its first branch and the bundler removes the rest as unreachable. It is indistinguishable
+  from a working build until Discord frames it. `preflight` reads the bundle for the path
+  every call in `api.js` is addressed to.
+
+The API also answers under `/.proxy` as well as `/api` now. The client addresses the
+prefixed form, the proxy forwards it unprefixed, and since 2025-07-30 both forms are
+carried identically — so this depends on none of that being remembered correctly, and it
+makes the built page openable straight from the bind with no proxy in front of it.
+
 **Stage 1 — API layer, no frontend.** *Done.* `api_auth` (session tokens, identity),
 `api_app` (routes), `api_server` (serving next to the bot), covered by `tests/test_api.py`.
 Every read in the table above is reachable, `actor_id` comes only from a signed token, and
@@ -324,8 +356,12 @@ the home composition moved to `snapshots` so both surfaces read one of it. *Exit
 handshake and one read-only Party Stash screen with the instance roster beside it. The
 build is served by the API itself under `QM_ACTIVITY_DIST`, so the page and its data share
 an origin and one URL mapping covers both. *Exit still open: it needs an https origin and
-a real launch in the guild — see Stage 0. The Entry Point command is not registered yet
-either; `/quartermaster` still opens the panel.*
+a real launch in the guild — see Stage 0.* Serving is now proved rather than assumed: the
+built page, its assets, and the API all answer on one origin under both path forms, which
+is what "one URL mapping covers both" was claiming. Nothing needs registering to launch it
+— Discord creates the Entry Point command when Activities is enabled, and it is global,
+while the bot syncs guild commands only, so `/quartermaster` and the panels are unaffected
+in both directions.
 
 **Stage 3 — Live feed.** *Built, not yet launched.* `api_live` holds the pump and the
 subscriptions, `/api/live` is the socket, and `activity/src/live.js` is the client that
@@ -358,6 +394,10 @@ ledger indistinguishable from a bot-driven session needs a session, which needs 
 rows a take through a panel does, that a quantity moving under a press is asked about
 rather than substituted, that one player's handle and one player's idempotency key are not
 another's, and that a take made on the Activity reaches the other screens at the table.*
+All of that has also been run over real HTTP against a served process: the handshake, every
+read, the handle round trip, a stale take answered on the confirm route, a spent handle
+refused, a replayed key returning its own receipt, another actor's key not returning it,
+and a body naming an actor being ignored rather than obeyed.
 
 **Stage 5 — DM surface.** Grant, drops, session start/end, combat, corrections,
 maintenance. *Exit: a DM runs a session end to end without opening a panel.*

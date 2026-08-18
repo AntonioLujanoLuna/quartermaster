@@ -31,31 +31,61 @@ from .sessions import SessionService
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["BotServices", "create_bot", "run_bot"]
+__all__ = ["BotServices", "assemble_services", "context_for", "create_bot", "run_bot"]
+
+
+def assemble_services(
+    store: SQLiteStore, receipts: ReceiptRepository, handles: HandleRepository
+) -> BotServices:
+    """Every service the surfaces share, built once over one store.
+
+    Extracted from `run_bot` so that something other than the bot can assemble
+    the same set — `preflight` serves the API without a gateway connection, and
+    a second, subtly different assembly is exactly the bug `Quartermaster`'s own
+    docstring warns about: two surfaces holding two `LootDropService` instances.
+    """
+    loot = LootDropService(store, receipts, handles)
+    combat = CombatService(store, receipts)
+    return BotServices(
+        store=store,
+        receipts=receipts,
+        inventory=InventoryService(store, receipts, handles),
+        sessions=SessionService(store, receipts, loot, combat),
+        characters=CharacterService(store, receipts),
+        currency=CurrencyService(store, receipts, handles=handles),
+        loot=loot,
+        combat=combat,
+    )
+
+
+def context_for(settings: Settings, services: BotServices) -> Quartermaster:
+    """The assembled context both surfaces read, without a bot around it.
+
+    `create_bot` fills the optional slots on `BotServices` as it builds its own
+    context; this is that same filling, for a caller that has no bot to build.
+    """
+    return Quartermaster(
+        services=services,
+        settings=settings,
+        characters=services.characters or CharacterService(services.store, services.receipts),
+        currency=services.currency
+        or CurrencyService(services.store, services.receipts, handles=HandleRepository(services.store)),
+        loot=services.loot
+        or LootDropService(services.store, services.receipts, HandleRepository(services.store)),
+        combat=services.combat or CombatService(services.store, services.receipts),
+        handoff=services.avrae_handoff or AvraeHandoffService(services.store),
+    )
 
 
 def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
     intents = discord.Intents.none()
     bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
     guild = discord.Object(id=int(settings.guild_id))
-    handoff = services.avrae_handoff or AvraeHandoffService(services.store)
     projection_task: asyncio.Task | None = None
     api_task: asyncio.Task | None = None
     stop_event = asyncio.Event()
-    loot = services.loot or LootDropService(services.store, services.receipts, HandleRepository(services.store))
-    characters = services.characters or CharacterService(services.store, services.receipts)
-    currency = services.currency or CurrencyService(services.store, services.receipts, handles=HandleRepository(services.store))
-    combat_service = services.combat or CombatService(services.store, services.receipts)
 
-    context = Quartermaster(
-        services=services,
-        settings=settings,
-        characters=characters,
-        currency=currency,
-        loot=loot,
-        combat=combat_service,
-        handoff=handoff,
-    )
+    context = context_for(settings, services)
     register_commands(bot, guild, context)
 
     async def setup_hook() -> None:
@@ -140,17 +170,6 @@ def run_bot(settings: Settings) -> None:
         handle_retention_seconds=settings.handle_retention_seconds,
     )
     logger.info("startup maintenance completed: %s", maintenance)
-    loot = LootDropService(store, receipts, handles)
-    combat = CombatService(store, receipts)
-    services = BotServices(
-        store=store,
-        receipts=receipts,
-        inventory=InventoryService(store, receipts, handles),
-        sessions=SessionService(store, receipts, loot, combat),
-        characters=CharacterService(store, receipts),
-        currency=CurrencyService(store, receipts, handles=handles),
-        loot=loot,
-        combat=combat,
-    )
+    services = assemble_services(store, receipts, handles)
     bot = create_bot(settings, services)
     bot.run(settings.require_discord_token())
