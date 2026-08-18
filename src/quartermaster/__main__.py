@@ -31,6 +31,12 @@ from .operations import (
 # validation and holds nothing.
 _COMMANDS_THAT_MAY_CREATE_THE_DATABASE = frozenset({"run", "restore"})
 
+# `preflight` asks about configuration, the built page, and the serving path,
+# and nothing about the campaign. It runs against a throwaway database of its
+# own so that it stays safe to run beside a live bot — the one thing the
+# architecture forbids is a second writer on the real one.
+_COMMANDS_THAT_NEED_NO_DATABASE = frozenset({"preflight"})
+
 
 def _resolve_database_path(argument: Path | None, environment: dict[str, str]) -> Path:
     if argument is not None:
@@ -75,7 +81,16 @@ def main() -> int:
     parser.add_argument("--db", default=None, type=Path)
     parser.add_argument(
         "command",
-        choices=["export", "run", "health", "maintenance", "backup", "restore", "requeue-events"],
+        choices=[
+            "export",
+            "run",
+            "health",
+            "maintenance",
+            "backup",
+            "restore",
+            "requeue-events",
+            "preflight",
+        ],
     )
     parser.add_argument("--destination-key", help="Limit requeue-events to one outbox destination")
     parser.add_argument("--destination", type=Path)
@@ -88,6 +103,11 @@ def main() -> int:
     parser.add_argument("--source", type=Path)
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--discord-surface-max-age-seconds", type=int, default=300)
+    parser.add_argument(
+        "--bind",
+        default=None,
+        help="Serve preflight on this host:port instead of QM_API_BIND",
+    )
     args = parser.parse_args()
 
     database_path = _resolve_database_path(args.db, environment)
@@ -103,7 +123,11 @@ def main() -> int:
                 f"--db {args.db} disagrees with QM_DATABASE_PATH {configured_path}; "
                 "the adapter reads the configured value, so pass one or make them match"
             )
-    if args.command not in _COMMANDS_THAT_MAY_CREATE_THE_DATABASE and not database_path.is_file():
+    if (
+        args.command not in _COMMANDS_THAT_MAY_CREATE_THE_DATABASE
+        and args.command not in _COMMANDS_THAT_NEED_NO_DATABASE
+        and not database_path.is_file()
+    ):
         parser.error(
             f"no Quartermaster database at {database_path}; "
             "pass --db, or set QM_DATABASE_PATH to the campaign database"
@@ -117,6 +141,16 @@ def main() -> int:
         from .discord_adapter import run_bot
 
         run_bot(Settings.from_env(environment))
+    elif args.command == "preflight":
+        # Imported here for the same reason the adapter imports the API layer
+        # lazily: FastAPI and uvicorn are an optional extra, and every other
+        # command has to keep working without them.
+        from .preflight import render_preflight, run_preflight
+
+        settings = Settings.from_env(environment)
+        checks, remaining = run_preflight(settings, bind=args.bind)
+        print(render_preflight(checks, remaining))
+        return 0 if all(check.passed for check in checks) else 1
     elif args.command == "export":
         with SQLiteStore(database_path).open() as store:
             print(render_export(store), end="")

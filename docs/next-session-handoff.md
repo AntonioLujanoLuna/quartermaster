@@ -1,6 +1,6 @@
 # Next-session handoff
 
-Updated: 2026-08-16 · Schema 12
+Updated: 2026-08-18 · Schema 12
 
 ## How to use this document
 
@@ -126,6 +126,21 @@ route and never read from a body. A refusal answers with a code as well as a sen
 `STALE` is a question to put to the player, `HANDLE` means prepare the action again,
 `REFUSED` is the domain's answer.
 
+The API answers under `/.proxy/api` as well as `/api`, and serves the built page at both
+`/.proxy/` and `/`. The client addresses the prefixed form and Discord's proxy forwards it
+unprefixed; both forms are carried, so neither end depends on the other's behaviour, and
+the built page can be opened straight from the bind with no proxy in front of it. Serving
+the Activity requires a WebSocket implementation and now refuses to start without one —
+`websockets` ships in the `activity` extra and in nothing the tests need, so a suite that
+proves the feed passes on a machine that answers the upgrade with a 404.
+
+`python -m quartermaster preflight` is Stage 0's machine half: it serves the real
+application on `QM_API_BIND` against a throwaway database and checks configuration, the
+WebSocket implementation, that the bundle contains an application rather than having been
+tree-shaken away, both path forms, the page and its assets, the refusal of an
+unauthenticated read, and that `/api/live` upgrades and refuses a token this process did
+not sign.
+
 `activity/` is the frontend: the SDK handshake, four screens — Party Stash, My Items, Loot,
 Treasury — the instance roster beside them, a reconnecting socket that resumes from its
 cursor, a header that says whether it is live, and a re-handshake when a session token is
@@ -133,7 +148,7 @@ refused. A player takes, gives, uses, claims, and moves coin from it; a DM regis
 character from the roster and gives coin from the treasury. Everything else a DM does is
 still a panel.
 
-**Checks.** 348 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Checks.** 363 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request, and CI builds the Activity bundle — with `VITE_DISCORD_CLIENT_ID`
 set, which matters: without it the client id is statically undefined, `boot()` returns on
 its first line, and Vite tree-shakes the entire application out of the bundle it just
@@ -819,9 +834,11 @@ Panel surface:
 12. **Combat**, and confirm the handoff cards are open to players while Start and End are not
     even rendered for them.
 
-Activity surface. None of it has run against Discord, and none of it can until Stage 0 of
-[the migration plan](activity-migration-plan.md) — an https origin Discord will frame — is
-answered. Everything here is a question the test suite cannot ask:
+Activity surface. None of it has run against Discord, and none of it can until the manual
+half of Stage 0 — a tunnel, a URL mapping, a launch — is carried out; the machine half is
+done and `python -m quartermaster preflight` re-checks it in a few seconds. Everything here
+is a question neither the test suite nor `preflight` can ask, because Discord is the other
+end of all of them:
 
 23. Launch the Activity from a voice channel in the guild and confirm the handshake
     completes, the Party Stash renders, and the roster names who is actually present.
@@ -931,11 +948,15 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
    observation is worth more than any further combat feature.
 4. Choose evidence-based latency and freshness budgets from observed play if the current
    estimates prove wrong.
-5. Answer Stage 0 of the Activity migration — where it runs, on what https origin, and how
-   the database is backed up there. This is now the only thing standing between four built
-   stages and a table using them, and it is the one item on this list that no amount of code
-   moves: Stages 1 to 4 are built and none of them has been framed by Discord once. Stage 5,
-   the DM surface, should wait for it. Stage 4 did not, which was a judgement about what is
+5. Carry out what is left of Stage 0 of the Activity migration: open a tunnel, map the
+   hostname in the Developer Portal, and launch the Activity in the guild once. The question
+   the stage was waiting on — where it runs, and how the database is backed up there — is
+   answered in [the runbook](runbook.md#serving-the-activity-without-paying-for-hosting):
+   nothing moves, the bot keeps running where it runs, and only the origin is rented. The
+   machine half is carried out and repeatable as `python -m quartermaster preflight`, which
+   serves the real application and checks every Stage 0 property that does not need Discord.
+   Three manual steps are left, and no code moves any of them. Stage 5, the DM surface,
+   should still wait for that launch. Stage 4 did not, which was a judgement about what is
    cheap to build blind and what is not — mutations are cheap because they add no domain
    code, and the DM surface is where guessing starts to cost.
 

@@ -47,3 +47,23 @@ jobs:
         env:
           VITE_DISCORD_CLIENT_ID: "0"
         run: npm run build
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Stage 0's machine half, on every pull request. This serves the real
+      # application and asks it what the first launch will ask, which is the
+      # only way the two failures it exists for get caught: a WebSocket
+      # implementation that is in the activity extra and in nothing the tests
+      # need, and a bundle built without a client id that compiles, serves, and
+      # contains no application.
+      - name: Check the Activity can actually be served
+        env:
+          QM_GUILD_ID: "1"
+          QM_DISCORD_CLIENT_ID: "1"
+          QM_DISCORD_CLIENT_SECRET: "a-placeholder-secret"
+          QM_ACTIVITY_DIST: activity/dist
+          QM_API_BIND: 127.0.0.1:8080
+        run: uv run --extra activity python -m quartermaster preflight

@@ -6,12 +6,23 @@ handshake, the live feed that keeps the screen current, and four screens a
 player can act on — Party Stash, My Items, Loot, and Treasury, with the instance
 roster beside them.
 
-None of it has been framed by Discord once. Stage 0 — an https origin — is what
-that is waiting on, and it needs no paid hosting: the bot keeps running where it
-runs and a tunnel rents the origin.
+None of it has been framed by Discord once. What is left of Stage 0 is a tunnel,
+a URL mapping, and a launch; it needs no paid hosting, because the bot keeps
+running where it runs and only the origin is rented.
 [Serving the Activity](../docs/runbook.md#serving-the-activity-without-paying-for-hosting)
 has the two free ways to get one, what to set, and what the first launch is
 really testing.
+
+Everything about Stage 0 that does not involve Discord is a command:
+
+```powershell
+uv run python -m quartermaster preflight
+```
+
+It serves the real application on `QM_API_BIND` for a few seconds and checks the
+things that otherwise surface as a blank frame inside a Discord client — most of
+all a bundle built without a client id, which compiles, serves, and contains
+nothing.
 
 ## What it is made of
 
@@ -79,7 +90,11 @@ moving ten minutes ago.
 3. **Activities → URL Mappings**: map the root prefix `/` to the host serving
    this app. Everything the client fetches goes through
    `<application_id>.discordsays.com`, which is why every request in `api.js`
-   is prefixed `/.proxy/`.
+   is prefixed `/.proxy/`. The proxy forwards that to `/api/...` on the mapped
+   target; since 2025-07-30 an unprefixed path is forwarded identically. The API
+   answers on both, so this does not depend on which behaviour is live — and it
+   is what lets the built page be opened straight from the bind for a smoke
+   test, with no proxy in front of it.
 4. **Entry Point Command**: the launcher. `/quartermaster` continues to open
    the panel until Stage 6 decides what the bot keeps.
 
@@ -134,9 +149,13 @@ knowing which it is in. It carries the WebSocket upgrade on the same prefix, so
 the live feed works in development too. Point it somewhere else with
 `QM_API_URL`.
 
-The backend needs the `activity` extra installed for the socket: uvicorn speaks
-HTTP without a WebSocket implementation and answers an upgrade with a 404, which
-reads as a missing route rather than a missing dependency.
+The backend needs the `activity` extra installed for the socket (`uv sync --extra
+activity`): uvicorn speaks HTTP without a WebSocket implementation and answers an
+upgrade with a 404, which reads as a missing route rather than a missing
+dependency. The test suite does not need it — Starlette's test client runs a
+socket in-process — so a green suite is not evidence that the feed can be served.
+The API refuses to start rather than serve a feed nothing can connect to, and
+`preflight` checks for it first.
 
 ## Build and serve
 

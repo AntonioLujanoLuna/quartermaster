@@ -48,6 +48,14 @@ Either way the machine running the bot has to be online for the Activity to load
 
 ### Bringing it up
 
+Install the Activity extra. The bot does not need it and the export CLI never does, so a machine that has only ever run the bot does not have it:
+
+```powershell
+uv sync --extra activity
+```
+
+This is not optional decoration. It carries `websockets`, and without a WebSocket implementation uvicorn serves every route normally and answers the upgrade on `/api/live` with a 404 — so the screen loads, says it is connecting, backs off, and shows numbers that stopped moving. The API now refuses to serve rather than start into that, and says so in the log.
+
 Build the frontend once, and again whenever `activity/src` changes:
 
 ```powershell
@@ -56,6 +64,8 @@ npm install
 npm run build
 cd ..
 ```
+
+`VITE_DISCORD_CLIENT_ID` has to be set for that build to mean anything — Vite replaces `import.meta.env` at build time, so without it the client id is statically undefined, the boot sequence returns on its first branch, and the bundler removes the whole application as unreachable. The build still succeeds. `preflight` below checks for exactly this, because a bundle of nothing is indistinguishable from a working one until Discord frames it.
 
 Set the Activity configuration alongside the existing values. The application ID is in the Developer Portal under General Information, the secret under OAuth2:
 
@@ -70,10 +80,22 @@ These can be set user-level like the backup values, and `start-quartermaster.ps1
 
 Leave the bind on the loopback address. The tunnel connects from the same machine, so the API never needs to be reachable on the network, and the session token is a bearer credential that should not be answerable to anything else. The API starts only when both `QM_DISCORD_CLIENT_ID` and `QM_DISCORD_CLIENT_SECRET` are set; with either missing the bot starts exactly as it does today and logs that the Activity is disabled. The export CLI never needs them.
 
+Then check this machine's half of it before involving Discord at all:
+
+```powershell
+uv run python -m quartermaster preflight
+```
+
+`preflight` serves the real application on `QM_API_BIND` for a few seconds and asks it the questions the first launch will ask: is the Activity configured, can the live feed be served, was the page built and built with a client id, does the origin answer on both path forms, does the page find its own assets, is an unauthenticated read refused, does `/api/live` upgrade and refuse a token this process did not sign. It runs against a throwaway database — nothing it asks is a question about the campaign — so it is safe beside a live bot, though it will report the bind as taken; pass `--bind 127.0.0.1:8099` to check a build on another port.
+
+Every check has to pass before a hostname is worth putting in a URL mapping. Each failure names its own remedy, and the point of all of them is that these are the failures that otherwise turn up as a blank frame inside a Discord client, which is the worst place to debug any of them.
+
 Start the tunnel, then the bot, then configure the Developer Portal:
 
 1. **Settings → enable Activities.**
 2. **URL Mappings → root mapping `/`** → the tunnel hostname, without the scheme. One mapping is enough: the built page and the API share an origin, because the API serves `QM_ACTIVITY_DIST` at `/` and its own routes under `/api`.
+
+   The client addresses every call as `/.proxy/api/...`, which the proxy forwards to `/api/...` here; since 2025-07-30 the prefix is optional and an unprefixed path is forwarded the same way. The API answers on both, so the mapping does not depend on which behaviour is live — and so the built page can be opened straight from the bind for a smoke test, with no proxy in front of it.
 3. **Entry Point command.** Discord creates a "Launch" command automatically when Activities is enabled, so there is nothing to register. It is a global command and the bot syncs guild commands only, so `/quartermaster` and the panels are unaffected in both directions.
 
 Confirm the origin before opening Discord at all:
@@ -88,10 +110,10 @@ Then launch it from the App Launcher in a voice channel.
 
 ### What the first launch is actually testing
 
-Stages 1 to 4 are built and tested, but four things are assumptions until Discord frames the page once, and all four are cheap to find out now and expensive to find out mid-session:
+Stages 1 to 4 are built and tested, and `preflight` proves everything about them that does not involve Discord: the handshake, the reads, the mutations, the handle round trip, and the live feed have all been driven against a real server on a real socket. What is left is the part where Discord is the other end, and all of it is cheap to find out now and expensive to find out mid-session:
 
 - The page loading inside the iframe at all — the URL mapping and the client's content security policy.
-- The OAuth handshake completing against `/api/token`.
+- The OAuth handshake completing against `/api/token`. Everything but the code exchange itself is covered; the exchange is the one call that has only ever been made against a fake.
 - **The WebSocket upgrading through Discord's proxy.** This is the one most likely to bite, and the one with the most built on top of it: `api_live.py` and `activity/src/live.js` were both written against an assumption about it. If it does not survive the proxy, the fallback is polling the reads on a timer, and the change stays inside those two files.
 - The layout on a phone, if anyone at the table plays from one.
 

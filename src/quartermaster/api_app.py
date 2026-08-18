@@ -72,7 +72,7 @@ from .snapshots import home_snapshot
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ApiState", "create_app", "router"]
+__all__ = ["PROXY_PREFIX", "ApiState", "create_app", "router"]
 
 
 @dataclass(frozen=True)
@@ -189,6 +189,14 @@ def action_id(actor: CurrentActor, idempotency_key: Annotated[str, Header()] = "
 
 
 Idempotency = Annotated[str, Depends(action_id)]
+
+#: The prefix Discord's proxy puts in front of everything the client asks for.
+#:
+#: The frontend addresses `/.proxy/api/...` because that form is carried by
+#: every version of the proxy; the proxy forwards it to `/api/...` here. The
+#: API answers on both so that neither end has to be right about the other —
+#: see the second `include_router` in `create_app`.
+PROXY_PREFIX = "/.proxy"
 
 router = APIRouter(prefix="/api")
 
@@ -847,17 +855,36 @@ def create_app(
         app.add_exception_handler(error_type, _refusal(status_code, code))
 
     app.include_router(router)
+    # The same routes again under the prefix the client actually asks for.
+    #
+    # Discord's proxy has carried `/.proxy/<path>` since Activities shipped and
+    # forwards it to `<path>` on the mapped target, so a backend serving only
+    # `/api` is the documented arrangement; since 2025-07-30 the prefix is
+    # optional and an unprefixed path is forwarded identically. Answering both
+    # costs one line and means the first launch does not depend on which of
+    # those two behaviours is live, which is not a thing worth discovering from
+    # a blank frame inside Discord.
+    #
+    # It also makes the built page openable straight from the bind for a smoke
+    # test: `api.js` asks for `/.proxy/api/...` with no proxy in front of it,
+    # and gets an answer rather than a 404.
+    app.include_router(router, prefix=PROXY_PREFIX)
 
     if settings.activity_dist is not None:
         # Serving the built page from the same origin as the API is what makes
         # one URL mapping enough, and it keeps the client's fetches
         # same-origin rather than relying on the CORS branch above. Mounted
-        # after the router, so `/api/...` never resolves to a file.
+        # after the routers, so `/api/...` never resolves to a file.
         from fastapi.staticfiles import StaticFiles
 
         distribution = settings.activity_dist.expanduser()
         if not distribution.is_dir():
             raise ConfigurationError(f"QM_ACTIVITY_DIST is not a directory: {distribution}")
+        # Mounted under the proxy prefix as well, for the same reason the router
+        # is: a page loaded at `/.proxy/` has to find its own assets.
+        app.mount(
+            PROXY_PREFIX, StaticFiles(directory=str(distribution), html=True), name="activity-proxy"
+        )
         app.mount("/", StaticFiles(directory=str(distribution), html=True), name="activity")
 
     return app
