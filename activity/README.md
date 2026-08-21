@@ -1,10 +1,10 @@
 # The Quartermaster Activity
 
-The web surface Discord embeds in its own client. Stages 1 to 4 of
+The web surface Discord embeds in its own client. Stages 1 to 5 of
 [the migration plan](../docs/activity-migration-plan.md): the API, the OAuth
-handshake, the live feed that keeps the screen current, and four screens a
-player can act on — Party Stash, My Items, Loot, and Treasury, with the instance
-roster beside them.
+handshake, the live feed that keeps the screen current, four screens a player
+can act on — Party Stash, My Items, Loot, and Treasury, with the instance roster
+beside them — and everything a DM does, so that an evening needs no panel.
 
 None of it has been framed by Discord once. What is left of Stage 0 is a tunnel,
 a URL mapping, and a launch; it needs no paid hosting, because the bot keeps
@@ -174,8 +174,30 @@ statically undefined, the boot sequence returns on its first branch, and the
 bundler removes the entire application as unreachable — a successful build of
 nothing. CI sets a placeholder for this reason.
 
+## Where a DM control lives
+
+On the screen showing what it changes, wherever there is one. Grant and Correct
+are on the Party Stash, the drop form is on Loot, and adjust and split are on
+Treasury; Register is on the instance roster, which is Discord's user select
+without a user select. The **DM** tab is the remainder — the session, the fight,
+the roster's lifecycle and estates, and health, backup, maintenance, and export
+— because none of those are about a list of things.
+
+Two of them are not straight ports of the panel:
+
+- **Split previews before it splits.** The share is the amount divided by how
+  many characters are alive, so a death between reading the shares and pressing
+  the button changes all of them. The preview mints a handle carrying that
+  roster, and a commit against a different one is refused and asked again with
+  the shares as they now stand.
+- **A Loot Drop takes a list.** The panel's holds one item because a Discord
+  modal holds five fields. A form has no such budget.
+
+A DM screen only a DM is shown is a courtesy. Every route behind it re-checks
+the token per request, so the check is the API's, not the tab's.
+
 ## What is not here yet
 
-The DM surface (Stage 5): grants, Loot Drops, sessions, combat, corrections, and
-maintenance are still panels. What a DM can do here is what Stage 4 named —
-register a character, and give coin from the treasury.
+Stage 6: the panels are all still there. What the bot keeps forever is a
+judgement about what people reach for *outside* a session, and that is worth
+making after one has been played on the Activity rather than before.

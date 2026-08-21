@@ -45,17 +45,22 @@ export function createActions({ notify, ask, reload }) {
       const said = await work();
       if (said) notify("ok", said);
       await reload();
+      // Answered rather than refused, which is what the forms need to know
+      // before they empty themselves: losing what was typed is only acceptable
+      // once the thing it described exists.
+      return true;
     } catch (error) {
       if (!(error instanceof ApiError)) throw error;
       if (error.code === "HANDLE") {
         notify("bad", "That control had already been used. Nothing happened — try again.");
         await reload();
-        return;
+        return false;
       }
       notify("bad", error.message);
       // A refusal is often a refusal *about* state that moved, so the screen is
       // read again rather than left showing what produced it.
       await reload();
+      return false;
     }
   }
 
@@ -67,7 +72,9 @@ export function createActions({ notify, ask, reload }) {
     } catch (error) {
       if (!(error instanceof ApiError) || error.code !== "STALE") throw error;
       ask({
-        text: question(error.message),
+        // Awaited, because one of these questions has to go and read the
+        // state that changed before it can ask about it.
+        text: await question(error.message),
         confirmLabel,
         // A second decision by the player, so it is a second action and gets
         // its own key.
@@ -75,6 +82,35 @@ export function createActions({ notify, ask, reload }) {
       });
       return null;
     }
+  }
+
+  /**
+   * Commit a previewed split, and ask again if the roster moved under it.
+   *
+   * The second preview exists only to be read. What commits is the original
+   * handle with `confirm_current`, because that is what says the DM saw the
+   * new numbers and meant them; the handle the second preview minted expires
+   * unspent, which is what asking the question costs.
+   */
+  function commitSplit(handleId, amounts) {
+    return perform(() =>
+      withConfirmation({
+        attempt: (key) => api.splitTreasury(handleId, false, key),
+        confirm: (key) => api.splitTreasury(handleId, true, key),
+        question: async (detail) => {
+          const now = await api.prepareSplit(amounts);
+          return `${detail}. ${describeSplit(now)} Split it that way?`;
+        },
+        confirmLabel: "Split it now",
+        report: (answer) => {
+          const it = answer.result;
+          const count = it.recipients.length;
+          return `Split ${formatCoin(it.per_recipient)} to each of ${count} ${
+            count === 1 ? "character" : "characters"
+          }.`;
+        },
+      }),
+    );
   }
 
   const tookIt = (answer) => {
@@ -159,5 +195,159 @@ export function createActions({ notify, ask, reload }) {
         return `Registered ${it.name}.`;
       });
     },
+
+    // Stage 5 -----------------------------------------------------------------
+    //
+    // What the DM does. Every one of these is refused by the API for anyone
+    // whose token does not say DM, so the screen not rendering them is a
+    // courtesy rather than the check.
+
+    async grant(itemName, quantity, provenance) {
+      return perform(async () => {
+        const it = (await api.grant(itemName, quantity, provenance || null, actionKey())).result;
+        return `Granted ${it.quantity} ${it.item_name}. The Party Stash holds ${it.new_quantity}.`;
+      });
+    },
+
+    async correct(item, quantity, reason) {
+      await perform(async () => {
+        const it = (await api.correct(item.id, quantity, reason || null, actionKey())).result;
+        return `Removed ${it.quantity} ${it.item_name} from the Party Stash. ${it.remaining} remain.`;
+      });
+    },
+
+    async createDrop(items, expiryHours) {
+      return perform(async () => {
+        const it = (await api.createDrop(items, expiryHours, actionKey())).result;
+        const count = it.items.length;
+        return `Loot Drop open with ${count} ${count === 1 ? "item" : "items"}, until ${it.expires_at}.`;
+      });
+    },
+
+    async closeDrop(dropId) {
+      await perform(async () => {
+        const it = (await api.closeDrop(dropId, actionKey())).result;
+        const returned = it.returned_item_count ?? 0;
+        return returned
+          ? `Drop closed. ${returned} unclaimed went back to the Party Stash.`
+          : "Drop closed. Nothing was left in it.";
+      });
+    },
+
+    async adjustTreasury(deltas, reason) {
+      await perform(async () => {
+        const it = (await api.adjustTreasury(deltas, reason || null, actionKey())).result;
+        return `Treasury is now ${formatCoin(it.after)}.`;
+      });
+    },
+
+    /**
+     * Split the treasury, which is two decisions and sometimes three.
+     *
+     * Pressing Split does not split anything. The share each character gets
+     * depends on how many are alive, and the DM cannot see the roster from
+     * inside a form — so this prepares the split, names who is being paid and
+     * what each of them gets, and waits. That is the panel's shape, and it is
+     * the shape because submitting used to be the split and a death in between
+     * silently changed everyone's share.
+     *
+     * The third decision is the unhappy path: if the roster moved between the
+     * preview and the press, the handle no longer matches what was shown and
+     * the commit refuses. The question is then asked again with the shares as
+     * they now stand.
+     */
+    async split(amounts) {
+      await perform(async () => {
+        const preview = await api.prepareSplit(amounts);
+        ask({
+          text: `Split ${formatCoin(amounts)}? ${describeSplit(preview)} Nothing has moved yet.`,
+          confirmLabel: "Split the treasury",
+          run: () => commitSplit(preview.handle_id, amounts),
+        });
+        return null;
+      });
+    },
+
+    async startSession() {
+      await perform(async () => {
+        const it = (await api.startSession(actionKey())).result;
+        if (it.status === "ACTIVE_EXISTS") {
+          // Never closed silently. Specification 28.2 makes this the DM's
+          // decision, and the surface has to say so rather than resolve it.
+          return `Session ${it.active_session_number} is still running. End it before starting another.`;
+        }
+        return `Session ${it.session_number} started.`;
+      });
+    },
+
+    async endSession(whereEnded) {
+      return perform(async () => {
+        const it = (await api.endSession(whereEnded, actionKey())).result;
+        if (it.status === "NO_ACTIVE_SESSION") return "There is no session running.";
+        const parts = [`Session ${it.session_number} ended.`];
+        if (it.closed_drops) parts.push(`${it.closed_drops} open drops closed.`);
+        if (it.closed_combats) parts.push(`${it.closed_combats} open fights closed.`);
+        return parts.join(" ");
+      });
+    },
+
+    async openCombat(channelId) {
+      await perform(async () => {
+        const it = (await api.openCombat(channelId, actionKey())).result;
+        if (it.status === "NO_ACTIVE_SESSION") return "Start a session before opening combat.";
+        if (it.status === "ALREADY_OPEN") return "A fight is already open.";
+        return "Combat open. Avrae still runs the fight.";
+      });
+    },
+
+    async closeCombat(outcome) {
+      return perform(async () => {
+        const it = (await api.closeCombat(outcome || null, actionKey())).result;
+        if (it.status === "NO_ACTIVE_SESSION") return "There is no session running.";
+        if (it.status === "NO_OPEN_COMBAT") return "No fight was open.";
+        const unclaimed = (it.open_drops || []).length;
+        return unclaimed
+          ? `Combat closed. ${unclaimed} Loot ${unclaimed === 1 ? "Drop is" : "Drops are"} still open.`
+          : "Combat closed.";
+      });
+    },
+
+    async transition(character, lifecycle) {
+      await perform(async () => {
+        const it = (await api.transitionCharacter(character.id, lifecycle, actionKey())).result;
+        return `${it.name} is now ${it.to.toLowerCase()}. Their belongings have not moved.`;
+      });
+    },
+
+    async resolveEstate(character, destination) {
+      await perform(async () => {
+        const it = (await api.resolveEstate(character.id, destination, actionKey())).result;
+        return `Moved ${it.items_moved} stacks and ${formatCoin(it.currency_moved)} from ${
+          it.source_character_name
+        } to ${it.destination_name}.`;
+      });
+    },
+
+    async runMaintenance() {
+      await perform(async () => {
+        const it = await api.runMaintenance();
+        return `Expired ${it.expired_drops} drops, and cleared ${it.removed_handles} handles and ${it.removed_receipts} receipts.`;
+      });
+    },
+
+    async backup() {
+      await perform(async () => {
+        const it = await api.backup();
+        return `Snapshot written and validated: ${it.primary_path}`;
+      });
+    },
   };
+}
+
+/** The shares a preview describes, as the sentence a question is asked in. */
+function describeSplit(preview) {
+  const names = preview.recipients.map((recipient) => recipient.name).join(", ");
+  const each = `${formatCoin(preview.per_recipient)} each to ${names}`;
+  if (!Object.values(preview.remainder).some((value) => value > 0)) return `${each}.`;
+  return `${each}, and the treasury keeps ${formatCoin(preview.remainder)} that will not divide evenly.`;
 }

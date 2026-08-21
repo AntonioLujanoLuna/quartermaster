@@ -1,14 +1,16 @@
 # Moving the table surface into a Discord Activity
 
-Status: Stages 1, 2, 3, and 4 implemented and driven end to end against a real
-server — a real socket, real SQLite, the real service layer — with Discord's
-code exchange as the only faked part. None of them has been run against the
-guild, because that is what Stage 0 is for. Stage 0's answer is written down in
-[the runbook](runbook.md), and its machine half is now carried out and
-repeatable: `python -m quartermaster preflight` serves the application and
-checks every Stage 0 property that does not require Discord. What remains of it
-is a tunnel, a URL mapping, and a launch, none of which any code can do.
-Stages 5 and 6 are proposed.
+Status: Stages 1, 2, 3, 4, and 5 implemented and driven end to end against a
+real server — a real socket, real SQLite, the real service layer — with
+Discord's code exchange as the only faked part. None of them has been run
+against the guild, because that is what Stage 0 is for. Stage 0's answer is
+written down in [the runbook](runbook.md), and its machine half is now carried
+out and repeatable: `python -m quartermaster preflight` serves the application
+and checks every Stage 0 property that does not require Discord. What remains
+of it is a tunnel, a URL mapping, and a launch, none of which any code can do.
+Stage 6 is proposed, and should stay proposed until a session has been played
+on the Activity: it deletes the panels, and what the bot keeps is a judgement
+only real use can make.
 
 ## Why
 
@@ -399,8 +401,43 @@ read, the handle round trip, a stale take answered on the confirm route, a spent
 refused, a replayed key returning its own receipt, another actor's key not returning it,
 and a body naming an actor being ignored rather than obeyed.
 
-**Stage 5 — DM surface.** Grant, drops, session start/end, combat, corrections,
-maintenance. *Exit: a DM runs a session end to end without opening a panel.*
+**Stage 5 — DM surface.** *Built, not yet launched.* Grant, corrections, drops,
+treasury adjustment and split, session start and end, combat, the roster's
+lifecycle and estates, and maintenance. Thirteen routes, the DM half of
+`activity/src/actions.js`, and a fifth screen.
+
+Three things the table above did not settle, decided here:
+
+- **Where a DM control goes is decided by what it changes.** Grant and Correct
+  are on the Party Stash screen, the drop form is on Loot, and adjust and split
+  are on Treasury, because that is what the DM is looking at when they reach
+  for them — and because it is the arrangement the Activity already made, when
+  Treasury → a character landed under the treasury and Register landed on the
+  roster. The DM tab is what is left over: the session, the fight, the
+  lifecycle, and the operator's controls, none of which are about a list of
+  things.
+
+- **The split still previews, and that is not a port of the panel — it is the
+  reason the panel changed.** Submitting used to be the split, and a death
+  between reading the roster and pressing it silently changed everyone's share.
+  So pressing Split here shows who is being paid what and waits; the handle it
+  mints carries that roster, and a commit against a different one is refused
+  and asked again with the shares as they now stand. The Activity's live feed
+  narrows that window, it does not close it.
+
+- **A Loot Drop takes a list.** The panel's drop holds one item because a modal
+  holds five fields and three were spoken for. A form has no such budget, and a
+  pile of loot from one fight is a list — so this is the first place the
+  Activity is allowed to be better than the surface it replaces rather than
+  merely equivalent.
+
+*Exit still open: a DM running a session end to end without opening a panel
+needs a session, which needs Stage 0. What is proved is everything up to that:
+`tests/test_api.py` drives each route and its refusals, and a whole evening —
+start, grant, correct, drop, claim, close, combat, adjust, split, a roster that
+moves under a prepared split, an estate, maintenance, backup, end — has been
+run over real HTTP against a served process, with every DM route refusing a
+player over the wire.*
 
 **Stage 6 — Retire the panels.** Delete what Stage 4 and 5 replaced. Keep the entry point,
 the projection, and a deliberately small async surface (see below). *Exit:

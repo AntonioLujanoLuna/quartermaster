@@ -111,6 +111,9 @@ export const api = {
   loot: () => request("/loot"),
   treasury: () => request("/treasury"),
   characters: () => request("/characters"),
+  combat: () => request("/combat"),
+  health: () => request("/maintenance/health"),
+  exportRecord: () => request("/export"),
 
   // Preparing an action mints the handle it will spend, and is not itself an
   // action: no key, and a retry costs an unspent handle rather than a receipt.
@@ -141,4 +144,41 @@ export const api = {
     mutate("/treasury/give", { character_id: characterId, amounts }, key),
   registerCharacter: (name, discordUserId, key) =>
     mutate("/characters", { name, discord_user_id: discordUserId }, key),
+
+  // DM mutations. The same shape as everything above — a body that names no
+  // actor, and a key per action — and refused with a 403 for anyone the token
+  // does not say is a DM. The client renders these only for a DM, which is
+  // presentation; the API is what makes it true.
+  grant: (itemName, quantity, provenance, key) =>
+    mutate("/stash/grant", { item_name: itemName, quantity, provenance }, key),
+  correct: (stackId, quantity, reason, key) =>
+    mutate("/stash/correct", { stack_id: stackId, quantity, reason }, key),
+  createDrop: (items, expiryHours, key) =>
+    mutate("/loot/drops", { items, expiry_hours: expiryHours }, key),
+  closeDrop: (dropId, key) => mutate("/loot/drops/close", { drop_id: dropId }, key),
+  adjustTreasury: (deltas, reason, key) =>
+    mutate("/treasury/adjust", { deltas, reason }, key),
+  splitTreasury: (handleId, confirmCurrent, key) =>
+    mutate("/treasury/split", { handle_id: handleId, confirm_current: confirmCurrent }, key),
+  startSession: (key) => mutate("/session/start", {}, key),
+  endSession: (whereEnded, key) => mutate("/session/end", { where_ended: whereEnded }, key),
+  openCombat: (channelId, key) => mutate("/combat/open", { channel_id: channelId }, key),
+  closeCombat: (outcome, key) => mutate("/combat/close", { outcome }, key),
+  transitionCharacter: (characterId, lifecycle, key) =>
+    mutate("/characters/transition", { character_id: characterId, lifecycle }, key),
+  resolveEstate: (characterId, destination, key) =>
+    mutate("/characters/estate", { character_id: characterId, destination }, key),
+
+  // Neither of these is a mutation of the campaign, so neither carries a key:
+  // there is no receipt to replay. Maintenance removes what is past its
+  // retention window, which is the same answer run twice, and a backup writes
+  // a timestamped snapshot that retention then reaps.
+  runMaintenance: () => request("/maintenance/run", { method: "POST", body: "{}" }),
+  backup: () => request("/maintenance/backup", { method: "POST", body: "{}" }),
+
+  // Previewing a split mints the handle that would commit it, so it is a
+  // preparation rather than an action and carries no key — the same rule the
+  // take and give preparations follow.
+  prepareSplit: (amounts) =>
+    request("/treasury/split/preview", { method: "POST", body: JSON.stringify({ amounts }) }),
 };

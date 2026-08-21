@@ -354,6 +354,18 @@ table.listing td.controls {
   width: 4.5em;
 }
 
+/* A word in front of a field, which is most of what a DM form is. */
+.field-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.field-label .text-field {
+  min-width: 12em;
+}
+
 .coin.big {
   font-size: 18px;
   margin: 0 0 12px;
@@ -379,6 +391,34 @@ table.listing td.controls {
 
 .drop + .drop {
   margin-top: 20px;
+}
+
+.drop-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.drop-heading h2 {
+  margin-top: 0;
+}
+
+/* The operator's own text — a health report or the export — laid out in the
+   columns it was written in. It scrolls rather than reflowing, because a
+   report wrapped at a phone's width stops being a report. */
+.report {
+  margin: 12px 0 8px;
+  padding: 12px;
+  max-height: 40vh;
+  overflow: auto;
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
 }
 
 .roster li {

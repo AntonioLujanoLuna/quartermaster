@@ -1,11 +1,12 @@
-// Stages 2, 3, and 4 of docs/activity-migration-plan.md: the walking skeleton,
-// live, and able to act.
+// Stages 2, 3, 4, and 5 of docs/activity-migration-plan.md: the walking
+// skeleton, live, able to act, and able to run an evening.
 //
 // Stage 2 proved the handshake, the proxy, and the hosting. Stage 3 made the
 // table look at one thing rather than six copies of one thing. Stage 4 is the
 // point of the exercise: a player takes, gives, uses, claims, and hands over
 // coin from here, and everyone else's screen says so without anyone pressing
-// anything.
+// anything. Stage 5 is the DM's half — the session, the loot, the treasury,
+// the roster, and the fight — so that an evening does not need a panel.
 //
 // This module holds the boot sequence and the state the screens read. What a
 // press means is in actions.js; what it looks like is in render.js.
@@ -14,7 +15,7 @@ import { DiscordSDK } from "@discord/embedded-app-sdk";
 import { api, ApiError, onExpiry, setSessionToken, sessionTokenValue } from "./api.js";
 import { createActions } from "./actions.js";
 import { openLiveFeed } from "./live.js";
-import { renderApp, renderError, renderStatus } from "./render.js";
+import { DROP_ROW_LIMIT, renderApp, renderError, renderStatus } from "./render.js";
 
 const CLIENT_ID = import.meta.env.VITE_DISCORD_CLIENT_ID;
 
@@ -33,6 +34,10 @@ const state = {
   holdings: null,
   loot: null,
   treasury: null,
+  combat: null,
+  // What `health` or `export` last printed. It is a document rather than a
+  // notice: nobody reads a health report in the corner of a screen.
+  report: null,
   roster: [],
   playing: new Set(),
   live: "connecting",
@@ -46,6 +51,9 @@ const state = {
 
 let refreshTimer = null;
 let refreshing = null;
+// Held past boot for one reason: opening combat records which channel the
+// fight is in, and Discord is the only thing that knows.
+let discordSdk = null;
 
 // Reads ----------------------------------------------------------------------
 
@@ -77,6 +85,9 @@ const READERS = {
   treasury: async () => {
     state.treasury = await api.treasury();
   },
+  combat: async () => {
+    state.combat = await api.combat();
+  },
 };
 
 // What each screen needs on top of the two every screen needs. Reading only
@@ -87,6 +98,9 @@ const SCREEN_READS = {
   items: ["holdings"],
   loot: ["loot"],
   treasury: ["treasury"],
+  // The roster is read for every screen already; the fight is not, and it is
+  // the only thing the DM screen needs that nothing else asks for.
+  dm: ["combat"],
 };
 
 async function refresh() {
@@ -180,12 +194,34 @@ async function run(work) {
   }
 }
 
+/** A number somebody typed, or the default if they typed nothing usable. */
+function typedNumber(key, fallback) {
+  const typed = Number.parseInt(state.inputs[key] ?? "", 10);
+  return Number.isFinite(typed) && typed > 0 ? typed : fallback;
+}
+
+/** How many item rows the Loot Drop form is showing. */
+function dropRows() {
+  return typedNumber("drop:rows", 1);
+}
+
+/** Empty one form, once what it described exists. */
+function clearInputs(prefix) {
+  for (const key of Object.keys(state.inputs)) {
+    if (key.startsWith(prefix)) delete state.inputs[key];
+  }
+}
+
 const actions = createActions({ notify, ask, reload: refresh });
 
 const handlers = {
   select(screen) {
     state.screen = screen;
     state.prompt = null;
+    // A health report or an export is a snapshot of the moment it was asked
+    // for, so leaving one lying around a screen the DM came back to later is
+    // the same mistake a stale panel was.
+    state.report = null;
     draw();
     scheduleRefresh();
   },
@@ -251,6 +287,163 @@ const handlers = {
     run(() => actions.giveCoin(character, amounts));
   },
 
+  // Stage 5 -------------------------------------------------------------------
+  //
+  // The DM's half. Two things recur. A form is validated here rather than at
+  // the API, so an empty field is answered without a round trip — the API
+  // refuses it too, and that refusal is the one that counts. And a form empties
+  // itself only once what it described exists, because losing what was typed
+  // to a refusal means typing it again.
+
+  grant(itemName, quantity, provenance) {
+    const name = (itemName || "").trim();
+    if (!name) {
+      notify("bad", "An item needs a name.");
+      return;
+    }
+    run(async () => {
+      if (await actions.grant(name, quantity, (provenance || "").trim())) clearInputs("grant:");
+    });
+  },
+
+  correct(item) {
+    // Removing from the Party Stash is the same call as a player using
+    // something up, and it has the same absence of a way back — so it asks the
+    // same two questions, and the reason is what the session log reads out.
+    ask({
+      text: `Remove how many ${item.item_name} from the Party Stash? ${item.quantity} are there, and what you remove leaves the campaign.`,
+      confirmLabel: "Remove it",
+      fields: [
+        { name: "quantity", placeholder: "How many" },
+        { name: "reason", placeholder: "Why? (optional)" },
+      ],
+      run: (values) => {
+        const quantity = Number.parseInt(values.quantity, 10);
+        if (!Number.isFinite(quantity) || quantity < 1) {
+          notify("bad", "Name how many to remove.");
+          return Promise.resolve();
+        }
+        return actions.correct(item, quantity, values.reason);
+      },
+    });
+  },
+
+  addDropRow() {
+    // Bounded to what the API accepts in one drop, so the form cannot offer a
+    // row that the request it builds would be refused for.
+    state.inputs["drop:rows"] = String(Math.min(dropRows() + 1, DROP_ROW_LIMIT));
+    draw();
+  },
+
+  createDrop(rows) {
+    const items = [];
+    for (let index = 0; index < rows; index += 1) {
+      const name = (state.inputs[`drop:${index}:item`] || "").trim();
+      // A blank row is a row the DM did not fill in, not an error. The form
+      // offers more of them than most drops need on purpose.
+      if (!name) continue;
+      items.push({
+        item_name: name,
+        quantity: typedNumber(`drop:${index}:quantity`, 1),
+        provenance: (state.inputs[`drop:${index}:provenance`] || "").trim() || null,
+      });
+    }
+    if (items.length === 0) {
+      notify("bad", "A Loot Drop needs at least one item.");
+      return;
+    }
+    run(async () => {
+      if (await actions.createDrop(items, typedNumber("drop:expiry", 72))) clearInputs("drop:");
+    });
+  },
+
+  closeDrop: (dropId) => run(() => actions.closeDrop(dropId)),
+
+  adjustTreasury(deltas, reason) {
+    if (Object.keys(deltas).length === 0) {
+      notify("bad", "Name an amount to add or take.");
+      return;
+    }
+    run(() => actions.adjustTreasury(deltas, reason));
+  },
+
+  split(amounts) {
+    if (Object.keys(amounts).length === 0) {
+      notify("bad", "Name an amount to split.");
+      return;
+    }
+    run(() => actions.split(amounts));
+  },
+
+  startSession: () => run(() => actions.startSession()),
+
+  endSession(whereEnded) {
+    const where = (whereEnded || "").trim();
+    if (!where) {
+      // Required, and this is where it is worth saying why: it is the sentence
+      // the next evening opens on.
+      notify("bad", "Say where it ended. That is what the table picks up from next time.");
+      return;
+    }
+    run(async () => {
+      if (await actions.endSession(where)) clearInputs("end:");
+    });
+  },
+
+  openCombat() {
+    // The one identifier this surface takes from Discord rather than from the
+    // domain. It labels Quartermaster's own record of the fight and authorizes
+    // nothing.
+    const channelId = discordSdk?.channelId;
+    if (!channelId) {
+      notify("bad", "Discord has not said which channel this is, so combat cannot be recorded.");
+      return;
+    }
+    run(() => actions.openCombat(String(channelId)));
+  },
+
+  closeCombat(outcome) {
+    run(async () => {
+      if (await actions.closeCombat((outcome || "").trim())) clearInputs("combat:");
+    });
+  },
+
+  transition: (character, lifecycle) => run(() => actions.transition(character, lifecycle)),
+
+  resolveEstate(character, destination) {
+    const where =
+      destination === "party"
+        ? "the Party Stash"
+        : state.roster.find((row) => row.id === destination)?.name || "them";
+    ask({
+      text: `Move everything ${character.name} was carrying to ${where}? Coin included.`,
+      confirmLabel: "Move it",
+      run: () => actions.resolveEstate(character, destination),
+    });
+  },
+
+  runMaintenance: () => run(() => actions.runMaintenance()),
+  backup: () => run(() => actions.backup()),
+
+  // Neither of these changes anything, so neither goes through the action
+  // layer: they are documents to read, and they are shown as documents.
+  health() {
+    run(async () => {
+      state.report = (await api.health()).rendered;
+    });
+  },
+
+  export() {
+    run(async () => {
+      state.report = (await api.exportRecord()).export;
+    });
+  },
+
+  dismissReport() {
+    state.report = null;
+    draw();
+  },
+
   register(discordUserId, personName) {
     ask({
       text: `Register a character for ${personName}.`,
@@ -313,6 +506,7 @@ async function boot() {
   }
 
   const sdk = new DiscordSDK(CLIENT_ID);
+  discordSdk = sdk;
   try {
     app.replaceChildren(renderStatus("Waiting for Discord…"));
     await sdk.ready();

@@ -1,6 +1,6 @@
 # Next-session handoff
 
-Updated: 2026-08-18 · Schema 12
+Updated: 2026-08-21 · Schema 12
 
 ## How to use this document
 
@@ -141,18 +141,86 @@ tree-shaken away, both path forms, the page and its assets, the refusal of an
 unauthenticated read, and that `/api/live` upgrades and refuses a token this process did
 not sign.
 
-`activity/` is the frontend: the SDK handshake, four screens — Party Stash, My Items, Loot,
-Treasury — the instance roster beside them, a reconnecting socket that resumes from its
-cursor, a header that says whether it is live, and a re-handshake when a session token is
-refused. A player takes, gives, uses, claims, and moves coin from it; a DM registers a
-character from the roster and gives coin from the treasury. Everything else a DM does is
-still a panel.
+`activity/` is the frontend: the SDK handshake, five screens — Party Stash, My Items, Loot,
+Treasury, and a DM screen only a DM is shown — the instance roster beside them, a
+reconnecting socket that resumes from its cursor, a header that says whether it is live,
+and a re-handshake when a session token is refused. A player takes, gives, uses, claims,
+and moves coin from it.
 
-**Checks.** 363 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+A DM runs the rest of it from the same place. Grant and Correct sit on the Party Stash, the
+drop form on Loot, adjust and split on Treasury — each control on the screen showing what it
+changes — and the DM screen holds what has no such screen: starting and ending the session,
+opening and closing combat, the roster's lifecycle and estates, and health, backup,
+maintenance, and export. Register is still on the instance roster, which is the user select
+without a user select. Pressing Split previews rather than splits, because the share depends
+on how many characters are alive; a Loot Drop takes a list of items rather than the panel's
+one, because a form has no component budget to spend. Every one of those routes is refused
+by the API for a token that does not say DM, so a screen that renders none of them is a
+courtesy rather than the check.
+
+**Checks.** 380 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
 on every pull request, and CI builds the Activity bundle — with `VITE_DISCORD_CLIENT_ID`
 set, which matters: without it the client id is statically undefined, `boot()` returns on
 its first line, and Vite tree-shakes the entire application out of the bundle it just
 proved compiles.
+
+## Fourteenth pass on 2026-08-21
+
+Stage 5 of the Activity migration: the DM's half. Thirteen routes, a fifth screen, and no
+domain code — every route is a call a panel already makes, which is the same bargain
+Stage 4 struck and the reason both were cheap to build before Stage 0 was carried out.
+
+- **A DM control belongs on the screen showing what it changes.** The alternative was one
+  DM tab holding all of it, which is how the panel is arranged — but the panel is arranged
+  that way because a message cannot show a list and a form at once. Grant is pressed while
+  looking at the Party Stash, so it is on the Party Stash; the drop form is on Loot; adjust
+  and split are on Treasury. That is also the arrangement this surface had already chosen,
+  before Stage 5 existed: Treasury → a character landed under the treasury, and Register
+  landed on the roster of who is actually here. The DM tab is the remainder, and the
+  remainder has a shape of its own — the session, the fight, the lifecycle, and the
+  operator's controls are none of them about a list of things.
+
+- **The split had to keep asking twice, and for a reason the live feed does not remove.**
+  A live screen makes the treasury current, so it is tempting to let Split just split. But
+  the share is `amount // len(active characters)`, and the roster is what moves: a character
+  dying between the DM reading the shares and pressing the button changes every one of them.
+  So the preview mints a handle carrying that roster, and a commit against a different one
+  is refused and asked again with the shares as they now stand. This is the gap the previous
+  handoff recorded as open in the Discord layer; it was closed there by the surface pass,
+  and the API now carries the same shape rather than a simpler one.
+
+- **The Loot Drop is the first place the Activity is allowed to be better.** Everything else
+  in Stages 4 and 5 is a migration: the same call, the same authority, the same refusal, on
+  a surface that scrolls. A drop is not. The panel's drop holds one item because a Discord
+  modal holds five fields and three of them were already spoken for, and a pile of loot from
+  one fight is a list. `POST /api/loot/drops` has always taken a list — the service did too —
+  so this is a budget being lifted rather than a feature being added.
+
+- **Three refusals were 500s waiting to happen.** `SessionError` and `CombatError` were not
+  in `DOMAIN_REFUSALS`, because until this pass nothing on the API could raise them. A
+  domain refusal that reaches a client as an unhandled exception is the one failure this
+  transport's error mapping exists to prevent, so both are mapped now, beside the six that
+  were already there.
+
+- **`where_ended` is stripped before it is measured.** The panel's modal cannot tell a space
+  from a sentence and this can. It is the whole of the continuity the next evening opens on,
+  and a required field that accepts a space is a required field somebody has already worked
+  around.
+
+- **Maintenance, backup, and the health report carry no idempotency key.** Not because a
+  retry is harmless, but because there is no receipt to replay: none of them mutate the
+  campaign. Maintenance removes what is past its retention window, which is the same answer
+  run twice; a backup writes a timestamped snapshot beside the scheduled ones, which
+  retention then reaps. `/api/maintenance/health` is DM-only and is not `/api/health`, which
+  stays unauthenticated and says only that the process is up.
+
+- **What is proved, and what is not.** `tests/test_api.py` drives every route and every
+  refusal, and a whole evening has been run over real HTTP against a served process: start,
+  grant, correct, drop, claim, close, combat open and close, adjust, split, a roster that
+  moves under a prepared split, an estate, maintenance, backup, and end — with every DM
+  route refusing a player over the wire. What that cannot reach is the stage's actual exit
+  criterion, which is a DM running an evening without reaching for a panel, and whether the
+  control they want next is already on screen. That needs Stage 0 and a table.
 
 ## Thirteenth pass on 2026-08-16
 
@@ -750,17 +818,9 @@ Also corrected:
 
 ## Observed but not acted on
 
-Neither of these is a defect; both are capability that exists without a caller, recorded so
-the next session decides deliberately rather than rediscovering them.
+Not a defect; capability that exists without a caller, recorded so the next session decides
+deliberately rather than rediscovering it.
 
-- **The relative treasury split has no producer in the Discord layer.**
-  `create_relative_split_handle` and `split_relative_interaction` implement a split that
-  notices the active recipient set changed since the DM looked and asks for confirmation.
-  The Split control calls `split_treasury_interaction` directly and skips that check, so a
-  character who died between the DM reading the roster and pressing Split silently changes
-  everyone's share. This is the same shape as the take-all gap, and as the give gap the
-  surface pass closed, but the fix is a product decision — it puts a confirmation step in
-  front of a DM control — so it is left for the table to choose.
 - **`local_metric_buckets` (migration 8) has no reader and no writer.** The
   histograms it was built for were removed deliberately on 2026-08-14: at one
   table's interaction volume percentiles cannot carry meaning. The table stays
@@ -768,6 +828,7 @@ the next session decides deliberately rather than rediscovering them.
   configuration knob with no consumer — which is why
   `internal_hard_deadline_seconds` and `ack_latency_ms` were wired up instead of
   left sitting there. Latency now comes from the log, one line per interaction.
+
 ## Not yet verified live
 
 Nothing in any correction pass has been exercised against the guild, and the surface pass
@@ -877,6 +938,29 @@ end of all of them:
 34. As a DM, register a character for a player from the roster. This is the Activity's one
     answer to Discord's user select, and whether picking a name out of who is present is
     better or worse than a picker is a judgement only a real table makes.
+35. Run a whole evening from the Activity as the DM and never open `/quartermaster`: start
+    the session, grant what the party finds, open and close a fight, make a drop and close
+    it, split the treasury, end the session with a real endpoint. This is Stage 5's exit
+    criterion, and the only thing that can answer it. Note every point at which you reach
+    for a panel anyway — that is the list of what the DM screen has in the wrong place.
+36. Confirm a player launching the Activity sees four tabs and no DM tab, and that the DM
+    sees five. Then have the player press something a DM control would reach — the browser
+    console is enough — and confirm the API refuses it rather than the screen having been
+    the only thing stopping them.
+37. Grant from the Activity while a second client has the Party Stash open, and read the
+    session log line beside one a panel's grant produced. As with item 29, the ledger should
+    not be able to tell which surface acted.
+38. Split the treasury from the Activity with the preview on screen, and have somebody's
+    character die between the preview and the press. The refusal should read as a genuine
+    question about who is being paid, and the second preview should name the new shares.
+    This is the same class of race as item 30 and the only DM control that has one.
+39. Open the drop form on a phone and fill in three rows. Four number inputs in a row was
+    item 32's worry; a table of text inputs is the same worry with more of it, and the
+    **Another item** control is the part most likely to be unreachable in a cramped viewport.
+40. Press **Health**, **Back up**, and **Export** from the DM screen during an evening. The
+    export is what a DM reads during an outage, and reading it inside the thing that is down
+    is not the case it exists for — what is worth knowing is whether having it here at all
+    is useful or merely available.
 
 Runtime, unchanged by this pass and still unverified:
 
@@ -955,10 +1039,18 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
    nothing moves, the bot keeps running where it runs, and only the origin is rented. The
    machine half is carried out and repeatable as `python -m quartermaster preflight`, which
    serves the real application and checks every Stage 0 property that does not need Discord.
-   Three manual steps are left, and no code moves any of them. Stage 5, the DM surface,
-   should still wait for that launch. Stage 4 did not, which was a judgement about what is
-   cheap to build blind and what is not — mutations are cheap because they add no domain
-   code, and the DM surface is where guessing starts to cost.
+   Three manual steps are left, and no code moves any of them. This is now the only thing
+   between the Activity and a real evening: Stages 1 through 5 are built, and every one of
+   their exit criteria that is still open is open because it needs a launch.
+
+   Stage 5 was built before that launch, as Stage 4 was, and on the same reasoning: it adds
+   no domain code and every route is a call a panel already makes, so if the hosting answer
+   comes back "not this" the whole of it deletes without touching anything that stores an
+   item. The previous pass said the DM surface was where guessing starts to cost, and that
+   is still true — but what it costs is layout, not correctness, and layout is answered by
+   item 35 of the checklist rather than by waiting. Stage 6, which deletes the panels, is
+   the one that should wait: what the bot keeps forever is a judgement about what people
+   reach for outside a session, and nobody has been outside one yet.
 
 The Avrae extension spike is no longer a priority: Gate 1 was answered "no, for now", so
 self-hosting, the Cog, provider gateway implementations, and combat reference projections
