@@ -57,7 +57,7 @@ from quartermaster.characters import CharacterService
 from quartermaster.combat import CombatService
 from quartermaster.config import ConfigurationError, Settings
 from quartermaster.currency import CurrencyService
-from quartermaster.db import SQLiteStore
+from quartermaster.db import SCHEMA_VERSION, SQLiteStore
 from quartermaster.discord_common import BotServices, Quartermaster
 from quartermaster.handles import HandleRepository
 from quartermaster.inventory import InventoryService
@@ -605,12 +605,35 @@ class MutationAuthorityTests(ApiTestCase):
         ("/api/treasury/give", {"character_id": "whoever", "amounts": {"gp": 1}}),
         ("/api/characters", {"name": "Vex", "discord_user_id": PLAYER_ID}),
         ("/api/characters/transition", {"character_id": "whoever", "lifecycle": "RETIRED"}),
+        # Stage 5. Every one of these is behind `_require_dm` on the panel, so
+        # every one of them is behind the DM check here: an API that grants
+        # authority the surface it replaces does not grant is not a migration
+        # of it.
+        ("/api/stash/grant", {"item_name": "Rope", "quantity": 1}),
+        ("/api/stash/correct", {"stack_id": "whatever", "quantity": 1}),
+        ("/api/loot/drops", {"items": [{"item_name": "Gem", "quantity": 1}]}),
+        ("/api/loot/drops/close", {"drop_id": "whatever"}),
+        ("/api/treasury/adjust", {"deltas": {"gp": 1}}),
+        ("/api/treasury/split/preview", {"amounts": {"gp": 2}}),
+        ("/api/treasury/split", {"handle_id": "whatever"}),
+        ("/api/session/start", {}),
+        ("/api/session/end", {"where_ended": "The Sunken Tomb"}),
+        ("/api/combat/open", {"channel_id": "9"}),
+        ("/api/combat/close", {}),
+        ("/api/characters/estate", {"character_id": "whoever", "destination": "party"}),
+        ("/api/maintenance/run", {}),
+        ("/api/maintenance/backup", {}),
     )
 
     def test_a_player_cannot_reach_a_dm_mutation(self) -> None:
         for path, body in self.DM_ONLY:
             with self.subTest(path=path):
                 self.assertEqual(self.post(path, body).status_code, 403)
+
+    def test_a_player_cannot_read_the_full_health_report(self) -> None:
+        """Unlike `/api/health`, which says only that the process is up."""
+        self.assertEqual(self.client.get("/api/maintenance/health", headers=self.headers()).status_code, 403)
+        self.assertEqual(self.client.get("/api/health").status_code, 200)
 
     def test_a_dm_can_register_a_character_for_a_player(self) -> None:
         created = self.post("/api/characters", {"name": "Vex", "discord_user_id": PLAYER_ID}, code="dm-code")
@@ -641,6 +664,266 @@ class MutationAuthorityTests(ApiTestCase):
         self.post("/api/stash/take", {"handle_id": prepared.json()["handle_id"], "actor_id": DM_ID})
         self.assertEqual(self.client.get("/api/me/items", headers=self.headers()).json()["items"][0]["quantity"], 1)
         self.assertEqual(self.client.get("/api/me/items", headers=self.headers("dm-code")).json()["items"], [])
+
+
+class DmSurfaceTests(ApiTestCase):
+    """Stage 5: the evening, run without opening a panel.
+
+    The authority on every route below is covered once, in
+    `MutationAuthorityTests`. What is here is the behaviour — that a grant
+    reaches the stash the same way the bot's does, that closing a drop returns
+    what nobody claimed, that ending a session closes what the session owned,
+    and that the two-step controls stay two steps.
+    """
+
+    def dm(self, path: str, body: dict | None = None, **kwargs):
+        return self.post(path, body, code="dm-code", **kwargs)
+
+    def stash_quantity(self, item_name: str) -> int:
+        for item in self.client.get("/api/stash", headers=self.headers()).json()["items"]:
+            if item["item_name"] == item_name:
+                return int(item["quantity"])
+        return 0
+
+    # The Party Stash ---------------------------------------------------------
+
+    def test_a_grant_lands_in_the_stash_with_its_provenance(self) -> None:
+        granted = self.dm(
+            "/api/stash/grant", {"item_name": "Rope", "quantity": 3, "provenance": "The ogre's cave"}
+        )
+        self.assertEqual(granted.status_code, 200, granted.text)
+        self.assertEqual(granted.json()["result"]["new_quantity"], 3)
+        self.assertEqual(self.stash_stack("Rope")["provenance"], "The ogre's cave")
+
+    def test_a_correction_removes_from_the_stash_rather_than_moving_it(self) -> None:
+        self.grant("Rope", 5, interaction="grant-rope")
+        corrected = self.dm(
+            "/api/stash/correct",
+            {"stack_id": self.stash_stack("Rope")["id"], "quantity": 2, "reason": "Miscounted"},
+        )
+        self.assertEqual(corrected.status_code, 200, corrected.text)
+        self.assertEqual(corrected.json()["result"]["remaining"], 3)
+        self.assertEqual(self.stash_quantity("Rope"), 3)
+        # Out of the campaign, not into anyone's hands: nothing was credited.
+        with self.store.read() as connection:
+            held = connection.execute(
+                "SELECT COUNT(*) FROM inventory_stacks WHERE owner_type = 'CHARACTER'"
+            ).fetchone()[0]
+        self.assertEqual(held, 0)
+
+    def test_a_player_cannot_reach_the_stash_through_the_use_route(self) -> None:
+        """The flag that separates the two is set by the route, never by a body.
+
+        `consume_interaction` is one call: using up what you carry and removing
+        what the party shares differ only by `party_authorized`. If a body could
+        carry it, every player would hold the DM's control.
+        """
+        self.register("Vex", PLAYER_ID, interaction="register-vex")
+        self.grant("Rope", 4, interaction="grant-rope")
+        refused = self.post(
+            "/api/items/use",
+            {"stack_id": self.stash_stack("Rope")["id"], "quantity": 1, "party_authorized": True},
+        )
+        self.assertEqual(refused.status_code, 422)
+        self.assertEqual(refused.json()["code"], "REFUSED")
+        self.assertEqual(self.stash_quantity("Rope"), 4)
+
+    # Loot Drops --------------------------------------------------------------
+
+    def test_a_drop_can_hold_more_than_one_item(self) -> None:
+        """The panel's drop holds one, because a modal holds five fields."""
+        created = self.dm(
+            "/api/loot/drops",
+            {
+                "items": [
+                    {"item_name": "Gem", "quantity": 2},
+                    {"item_name": "Idol", "quantity": 1, "provenance": "The shrine"},
+                ]
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        drops = self.client.get("/api/loot", headers=self.headers()).json()["drops"]
+        self.assertEqual(len(drops), 1)
+        self.assertEqual({item["item_name"] for item in drops[0]["items"]}, {"Gem", "Idol"})
+
+    def test_closing_a_drop_returns_what_nobody_claimed(self) -> None:
+        self.dm("/api/loot/drops", {"items": [{"item_name": "Gem", "quantity": 3}]})
+        drop_id = self.client.get("/api/loot", headers=self.headers()).json()["drops"][0]["drop_id"]
+
+        self.register("Vex", PLAYER_ID, interaction="register-vex")
+        item_id = self.client.get("/api/loot", headers=self.headers()).json()["drops"][0]["items"][0]["id"]
+        self.post("/api/loot/claim", {"drop_item_id": item_id, "amount": 1})
+
+        closed = self.dm("/api/loot/drops/close", {"drop_id": drop_id})
+        self.assertEqual(closed.status_code, 200, closed.text)
+        self.assertEqual(closed.json()["result"]["returned_item_count"], 2)
+        self.assertEqual(self.stash_quantity("Gem"), 2)
+        self.assertEqual(self.client.get("/api/loot", headers=self.headers()).json()["drops"], [])
+
+    # The treasury ------------------------------------------------------------
+
+    def test_the_treasury_is_adjusted_by_a_signed_amount(self) -> None:
+        self.dm("/api/treasury/adjust", {"deltas": {"gp": 10}, "reason": "Sold the idol"})
+        self.dm("/api/treasury/adjust", {"deltas": {"gp": -4}, "reason": "Paid the ferryman"})
+        treasury = self.client.get("/api/treasury", headers=self.headers()).json()["treasury"]
+        self.assertEqual(treasury["gp"], 6)
+
+    def test_a_split_previews_its_recipients_before_it_pays_them(self) -> None:
+        self.register("Vex", PLAYER_ID, interaction="register-vex")
+        self.register("Brann", DM_ID, interaction="register-brann")
+        self.dm("/api/treasury/adjust", {"deltas": {"gp": 7}})
+
+        preview = self.client.post(
+            "/api/treasury/split/preview",
+            json={"amounts": {"gp": 7}},
+            headers=self.headers("dm-code"),
+        )
+        self.assertEqual(preview.status_code, 200, preview.text)
+        prepared = preview.json()
+        self.assertEqual({row["name"] for row in prepared["recipients"]}, {"Vex", "Brann"})
+        self.assertEqual(prepared["per_recipient"]["gp"], 3)
+        # Specification 33.1: what will not divide stays where it is.
+        self.assertEqual(prepared["remainder"]["gp"], 1)
+        # Nothing has moved yet, which is the whole point of the preview.
+        self.assertEqual(self.client.get("/api/treasury", headers=self.headers()).json()["treasury"]["gp"], 7)
+
+        committed = self.dm("/api/treasury/split", {"handle_id": prepared["handle_id"]})
+        self.assertEqual(committed.status_code, 200, committed.text)
+        self.assertEqual(self.client.get("/api/treasury", headers=self.headers()).json()["treasury"]["gp"], 1)
+        self.assertEqual(self.client.get("/api/treasury", headers=self.headers()).json()["purse"]["balance"]["gp"], 3)
+
+    def test_a_roster_that_moves_under_a_split_is_asked_about(self) -> None:
+        """The share depends on how many are alive, so a death changes all of them."""
+        vex = self.register("Vex", PLAYER_ID, interaction="register-vex")
+        self.register("Brann", DM_ID, interaction="register-brann")
+        self.dm("/api/treasury/adjust", {"deltas": {"gp": 8}})
+        prepared = self.client.post(
+            "/api/treasury/split/preview",
+            json={"amounts": {"gp": 8}},
+            headers=self.headers("dm-code"),
+        ).json()
+
+        self.dm("/api/characters/transition", {"character_id": vex, "lifecycle": "DEAD"})
+
+        refused = self.dm("/api/treasury/split", {"handle_id": prepared["handle_id"]})
+        self.assertEqual(refused.status_code, 409)
+        self.assertEqual(refused.json()["code"], "STALE")
+        self.assertEqual(self.client.get("/api/treasury", headers=self.headers("dm-code")).json()["treasury"]["gp"], 8)
+
+        answered = self.dm(
+            "/api/treasury/split", {"handle_id": prepared["handle_id"], "confirm_current": True}
+        )
+        self.assertEqual(answered.status_code, 200, answered.text)
+        # One recipient now, so the whole eight rather than four each.
+        self.assertEqual(answered.json()["result"]["per_recipient"]["gp"], 8)
+
+    # The session -------------------------------------------------------------
+
+    def test_a_session_starts_and_a_second_start_names_the_first(self) -> None:
+        started = self.dm("/api/session/start")
+        self.assertEqual(started.json()["result"]["session_number"], 1)
+        again = self.dm("/api/session/start")
+        # Never closed silently — specification 28.2 makes it the DM's decision.
+        self.assertEqual(again.json()["result"]["status"], "ACTIVE_EXISTS")
+        self.assertEqual(again.json()["result"]["active_session_number"], 1)
+
+    def test_ending_a_session_needs_the_sentence_the_next_one_opens_on(self) -> None:
+        self.dm("/api/session/start")
+        self.assertEqual(self.dm("/api/session/end", {}).status_code, 422)
+        # A space is not an endpoint, and it is the shape a required field
+        # collects from somebody who does not want to answer it.
+        self.assertEqual(self.dm("/api/session/end", {"where_ended": "   "}).status_code, 422)
+        ended = self.dm("/api/session/end", {"where_ended": "  The Sunken Tomb  "})
+        self.assertEqual(ended.status_code, 200, ended.text)
+        continuity = self.client.get("/api/session/continuity", headers=self.headers()).json()
+        self.assertEqual(continuity["previous"]["where_ended"], "The Sunken Tomb")
+
+    def test_ending_a_session_closes_what_the_session_owned(self) -> None:
+        self.dm("/api/session/start")
+        self.dm("/api/loot/drops", {"items": [{"item_name": "Gem", "quantity": 2}]})
+        self.dm("/api/combat/open", {"channel_id": "9"})
+
+        ended = self.dm("/api/session/end", {"where_ended": "The Sunken Tomb"})
+        self.assertEqual(ended.status_code, 200, ended.text)
+        self.assertEqual(ended.json()["result"]["closed_drops"], 1)
+        self.assertEqual(ended.json()["result"]["closed_combats"], 1)
+        self.assertEqual(self.stash_quantity("Gem"), 2)
+
+        continuity = self.client.get("/api/session/continuity", headers=self.headers()).json()
+        self.assertIsNone(continuity["active_session_number"])
+        self.assertEqual(continuity["previous"]["where_ended"], "The Sunken Tomb")
+
+    # Combat ------------------------------------------------------------------
+
+    def test_combat_is_recorded_against_the_session_and_nothing_else(self) -> None:
+        self.assertEqual(self.dm("/api/combat/open", {"channel_id": "9"}).json()["result"]["status"], "NO_ACTIVE_SESSION")
+        self.dm("/api/session/start")
+        opened = self.dm("/api/combat/open", {"channel_id": "9"})
+        self.assertEqual(opened.json()["result"]["status"], "OPENED")
+        self.assertEqual(self.client.get("/api/combat", headers=self.headers()).json()["status"], "OPEN")
+
+        closed = self.dm("/api/combat/close", {"outcome": "The ogre fled"})
+        self.assertEqual(closed.json()["result"]["status"], "CLOSED")
+        status = self.client.get("/api/combat", headers=self.headers()).json()
+        self.assertEqual(status["status"], "NO_OPEN_COMBAT")
+        self.assertEqual(status["last_closed"]["outcome"], "The ogre fled")
+
+    # Characters --------------------------------------------------------------
+
+    def test_a_lifecycle_change_moves_nothing_and_an_estate_moves_it_explicitly(self) -> None:
+        vex = self.register("Vex", PLAYER_ID, interaction="register-vex")
+        self.grant("Rope", 2, interaction="grant-rope")
+        self.take("Rope", "all")
+
+        self.dm("/api/characters/transition", {"character_id": vex, "lifecycle": "DEAD"})
+        # The invariant: dying does not hand anything over.
+        self.assertEqual(self.stash_quantity("Rope"), 0)
+
+        resolved = self.dm("/api/characters/estate", {"character_id": vex, "destination": "party"})
+        self.assertEqual(resolved.status_code, 200, resolved.text)
+        self.assertEqual(resolved.json()["result"]["items_moved"], 1)
+        self.assertEqual(self.stash_quantity("Rope"), 2)
+
+    def test_an_active_character_has_no_estate_to_resolve(self) -> None:
+        vex = self.register("Vex", PLAYER_ID, interaction="register-vex")
+        refused = self.dm("/api/characters/estate", {"character_id": vex, "destination": "party"})
+        self.assertEqual(refused.status_code, 422)
+        self.assertEqual(refused.json()["code"], "REFUSED")
+
+    # Maintenance -------------------------------------------------------------
+
+    def test_maintenance_backup_and_health_answer_the_dm(self) -> None:
+        ran = self.dm("/api/maintenance/run")
+        self.assertEqual(ran.status_code, 200, ran.text)
+        self.assertEqual(ran.json()["expired_drops"], 0)
+
+        backups = Path(self.directory.name) / "backups"
+        client = self._client_with(replace(self.settings, backup_directory=backups))
+        taken = self.post("/api/maintenance/backup", code="dm-code", client=client)
+        self.assertEqual(taken.status_code, 200, taken.text)
+        self.assertTrue(Path(taken.json()["primary_path"]).is_file())
+
+        health = self.client.get("/api/maintenance/health", headers=self.headers("dm-code")).json()
+        self.assertEqual(health["report"]["schema_version"], SCHEMA_VERSION)
+        # Both renderings of one truth, so a DM reading it here and a DM
+        # reading it in Discord are reading the same sentences.
+        self.assertIn("Schema", health["rendered"])
+
+    def test_a_backup_that_cannot_be_written_says_why(self) -> None:
+        """The person pressing this is the person who can fix it."""
+        client = self._client_with(
+            replace(self.settings, backup_directory=Path(self.directory.name) / "nope")
+        )
+        with mock.patch(
+            "quartermaster.api_app.create_scheduled_backup",
+            side_effect=OSError("No space left on device"),
+        ):
+            failed = self.post("/api/maintenance/backup", code="dm-code", client=client)
+        self.assertEqual(failed.status_code, 500)
+        self.assertIn("No space left on device", failed.json()["detail"])
+
+    def _client_with(self, settings) -> TestClient:
+        return TestClient(create_app(replace(self.context, settings=settings), self.identity, tokens=self.tokens))
 
 
 class StaticSurfaceTests(ApiTestCase):

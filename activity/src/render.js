@@ -32,12 +32,12 @@ function button(label, { onPress, style, busy, title }) {
 }
 
 /** A number field whose value survives the redraw a live change causes. */
-function quantityField(state, key, { max, handlers }) {
+function quantityField(state, key, { max, handlers, initial = "1" }) {
   const node = element("input", "quantity-field");
   node.type = "number";
   node.min = "1";
   if (max !== undefined) node.max = String(max);
-  node.value = state.inputs[key] ?? "1";
+  node.value = state.inputs[key] ?? initial;
   node.dataset.inputKey = key;
   node.addEventListener("input", () => handlers.setInput(key, node.value));
   return node;
@@ -51,6 +51,27 @@ function textField(state, key, placeholder, handlers) {
   node.dataset.inputKey = key;
   node.addEventListener("input", () => handlers.setInput(key, node.value));
   return node;
+}
+
+/**
+ * How many item rows the drop form is showing.
+ *
+ * Held in `state.inputs` with everything else that has been typed but not
+ * sent, so a live change redrawing the screen does not take the DM's half-
+ * filled second row away with it.
+ */
+export const DROP_ROW_LIMIT = 50;
+
+function dropRowCount(state) {
+  const typed = Number.parseInt(state.inputs["drop:rows"] ?? "", 10);
+  return Number.isFinite(typed) && typed > 0 ? Math.min(typed, DROP_ROW_LIMIT) : 1;
+}
+
+/** A field with a word in front of it, which is most of the DM forms. */
+function labelled(text, field) {
+  const wrap = element("label", "field-label");
+  wrap.append(element("span", "muted", text), field);
+  return wrap;
 }
 
 function amountIn(state, key, fallback = 1) {
@@ -111,11 +132,17 @@ const SCREENS = [
   { id: "items", label: "My Items" },
   { id: "loot", label: "Loot" },
   { id: "treasury", label: "Treasury" },
+  // Stage 5. Grant, correct, drops, adjust, and split live on the screens that
+  // already show what they change, because that is where the DM is looking
+  // when they reach for them. This tab is what has no such screen: the
+  // session, the fight, the roster's lifecycle, and the operator's controls.
+  { id: "dm", label: "DM", dm: true },
 ];
 
 function renderTabs(state, handlers) {
   const nav = element("nav", "tabs");
   for (const screen of SCREENS) {
+    if (screen.dm && !state.actor?.isDm) continue;
     const tab = element("button", state.screen === screen.id ? "tab tab-current" : "tab", screen.label);
     tab.type = "button";
     if (screen.id === "loot" && state.home?.unclaimed) {
@@ -246,6 +273,18 @@ function renderStashScreen(state, handlers) {
         }),
       );
     }
+    if (state.actor?.isDm) {
+      // The repair for the most likely mistake at the table: a stack granted
+      // with the wrong number on it. It removes rather than moves, so it asks.
+      controls.append(
+        button("Correct…", {
+          style: "danger",
+          busy: state.busy,
+          title: "Removes it from the campaign. Not a transfer.",
+          onPress: () => handlers.correct(item),
+        }),
+      );
+    }
     row.append(controls);
     body.append(row);
   }
@@ -261,7 +300,36 @@ function renderStashScreen(state, handlers) {
       ),
     );
   }
+  if (state.actor?.isDm) screen.append(renderGrant(state, handlers));
   return screen;
+}
+
+/** Put something in. The one mutation that mints rather than moves. */
+function renderGrant(state, handlers) {
+  const block = element("div", "dm-block");
+  block.append(element("h2", null, "Grant to the Party Stash"));
+  const form = element("div", "form");
+  form.append(labelled("Item", textField(state, "grant:item", "Silvered dagger", handlers)));
+  form.append(labelled("How many", quantityField(state, "grant:quantity", { handlers })));
+  // The only field on this surface that can say where something came from:
+  // nothing upstream of a grant knows, so if it is not typed here it is lost.
+  form.append(
+    labelled("Where from", textField(state, "grant:provenance", "The dragon's hoard", handlers)),
+  );
+  form.append(
+    button("Grant", {
+      style: "primary",
+      busy: state.busy,
+      onPress: () =>
+        handlers.grant(
+          state.inputs["grant:item"] ?? "",
+          amountIn(state, "grant:quantity"),
+          state.inputs["grant:provenance"] ?? "",
+        ),
+    }),
+  );
+  block.append(form);
+  return block;
 }
 
 /**
@@ -358,11 +426,26 @@ function renderLootScreen(state, handlers) {
   const drops = state.loot?.drops || [];
   if (drops.length === 0) {
     screen.append(element("p", "muted", "No Loot Drop is open."));
+    if (state.actor?.isDm) screen.append(renderDropForm(state, handlers));
     return screen;
   }
   for (const drop of drops) {
     const block = element("div", "drop");
-    block.append(element("h2", null, `Loot Drop · closes ${drop.expires_at}`));
+    const heading = element("div", "drop-heading");
+    heading.append(element("h2", null, `Loot Drop · closes ${drop.expires_at}`));
+    if (state.actor?.isDm) {
+      // Closing early is not destructive: whatever nobody claimed goes back to
+      // the Party Stash, which is where it would have gone at expiry anyway.
+      heading.append(
+        button("Close it", {
+          style: "quiet",
+          busy: state.busy,
+          title: "What is left goes back to the Party Stash.",
+          onPress: () => handlers.closeDrop(drop.drop_id),
+        }),
+      );
+    }
+    block.append(heading);
     const [listing, body] = table(["Item", "Left", "How many", ""]);
     for (const item of drop.items) {
       const key = `claim:${item.id}`;
@@ -386,7 +469,54 @@ function renderLootScreen(state, handlers) {
     block.append(listing);
     screen.append(block);
   }
+  if (state.actor?.isDm) screen.append(renderDropForm(state, handlers));
   return screen;
+}
+
+/**
+ * Open a Loot Drop.
+ *
+ * The panel's drop holds one item, because a Discord modal holds five fields
+ * and three of them were already spoken for. A form is not a modal, so this
+ * one takes a list — which is what a pile of loot from one fight actually is.
+ */
+function renderDropForm(state, handlers) {
+  const block = element("div", "dm-block");
+  block.append(element("h2", null, "Open a Loot Drop"));
+  const rows = dropRowCount(state);
+  const [listing, body] = table(["Item", "How many", "Where from"]);
+  for (let index = 0; index < rows; index += 1) {
+    const row = element("tr");
+    for (const [suffix, placeholder] of [
+      ["item", "Loot gem"],
+      [null, null],
+      ["provenance", "Off the ogre"],
+    ]) {
+      const cell = element("td");
+      cell.append(
+        suffix === null
+          ? quantityField(state, `drop:${index}:quantity`, { handlers })
+          : textField(state, `drop:${index}:${suffix}`, placeholder, handlers),
+      );
+      row.append(cell);
+    }
+    body.append(row);
+  }
+  block.append(listing);
+  const form = element("div", "form");
+  form.append(button("Another item", { style: "quiet", onPress: () => handlers.addDropRow() }));
+  form.append(
+    labelled("Closes in (hours)", quantityField(state, "drop:expiry", { handlers, initial: "72" })),
+  );
+  form.append(
+    button("Open the drop", {
+      style: "primary",
+      busy: state.busy,
+      onPress: () => handlers.createDrop(rows),
+    }),
+  );
+  block.append(form);
+  return block;
 }
 
 /** The four fields a coin amount is typed into, and what they add up to. */
@@ -407,6 +537,34 @@ function coinFields(state, handlers, prefix) {
     row.append(label);
   }
   return row;
+}
+
+/** The same four fields, but a negative number is a legitimate answer. */
+function signedCoinFields(state, handlers, prefix) {
+  const row = element("div", "coin-fields");
+  for (const denomination of ["cp", "sp", "gp", "pp"]) {
+    const key = `${prefix}:${denomination}`;
+    const label = element("label", "coin-field");
+    label.append(element("span", "muted", denomination));
+    const node = element("input", "quantity-field");
+    node.type = "number";
+    node.value = state.inputs[key] ?? "";
+    node.placeholder = "0";
+    node.dataset.inputKey = key;
+    node.addEventListener("input", () => handlers.setInput(key, node.value));
+    label.append(node);
+    row.append(label);
+  }
+  return row;
+}
+
+function signedCoinAmounts(state, prefix) {
+  const deltas = {};
+  for (const denomination of ["cp", "sp", "gp", "pp"]) {
+    const typed = Number.parseInt(state.inputs[`${prefix}:${denomination}`] ?? "", 10);
+    if (Number.isFinite(typed) && typed !== 0) deltas[denomination] = typed;
+  }
+  return deltas;
 }
 
 function coinAmounts(state, prefix) {
@@ -446,8 +604,66 @@ function renderTreasuryScreen(state, handlers) {
 
   if (state.actor?.isDm) {
     screen.append(renderTreasuryGive(state, handlers));
+    screen.append(renderTreasuryAdjust(state, handlers));
+    screen.append(renderTreasurySplit(state, handlers));
   }
   return screen;
+}
+
+/** Correct the treasury, by a signed amount per denomination. */
+function renderTreasuryAdjust(state, handlers) {
+  const block = element("div", "dm-block");
+  block.append(element("h2", null, "Adjust the treasury"));
+  block.append(
+    element("p", "muted", "Negative takes it out. Nothing here moves coin to or from a character."),
+  );
+  const form = element("div", "form");
+  form.append(signedCoinFields(state, handlers, "adjust"));
+  form.append(labelled("Why", textField(state, "adjust:reason", "Paid the ferryman", handlers)));
+  form.append(
+    button("Adjust", {
+      style: "primary",
+      busy: state.busy,
+      onPress: () =>
+        handlers.adjustTreasury(signedCoinAmounts(state, "adjust"), state.inputs["adjust:reason"] ?? ""),
+    }),
+  );
+  block.append(form);
+  return block;
+}
+
+/**
+ * Split the treasury among everyone who is alive.
+ *
+ * Pressing this shows the shares and waits, rather than paying them: the
+ * share depends on how many characters are active, and the DM is entitled to
+ * see who is being paid what before any coin moves.
+ */
+function renderTreasurySplit(state, handlers) {
+  const block = element("div", "dm-block");
+  block.append(element("h2", null, "Split the treasury"));
+  const active = (state.roster || []).filter((character) => character.lifecycle === "ACTIVE").length;
+  block.append(
+    element(
+      "p",
+      "muted",
+      active === 0
+        ? "Nobody is active, so there is nobody to split it among."
+        : `Among ${active} active ${active === 1 ? "character" : "characters"}. Each denomination ` +
+          "divides on its own, and what will not divide stays in the treasury.",
+    ),
+  );
+  const form = element("div", "form");
+  form.append(coinFields(state, handlers, "split"));
+  form.append(
+    button("Preview the split", {
+      style: "primary",
+      busy: state.busy,
+      onPress: () => handlers.split(coinAmounts(state, "split")),
+    }),
+  );
+  block.append(form);
+  return block;
 }
 
 /** Treasury → a character. A DM control on the panel, and one here. */
@@ -488,11 +704,226 @@ function renderTreasuryGive(state, handlers) {
   return block;
 }
 
+// The DM screen ---------------------------------------------------------------
+//
+// What the other four screens have no room for, because it is not about a list
+// of things: the session, the fight, the roster's lifecycle, and the controls
+// that are about the runtime rather than the campaign.
+
+function renderDmScreen(state, handlers) {
+  const screen = element("section", "screen");
+  if (!state.actor?.isDm) {
+    // Reachable only by a token that stopped saying DM while the tab was open.
+    // The API refuses everything on this screen either way; this is so the
+    // screen says why rather than answering every press with a 403.
+    screen.append(element("p", "muted", "This is the DM's screen, and you are not the DM."));
+    return screen;
+  }
+  screen.append(renderSessionBlock(state, handlers));
+  screen.append(renderCombatBlock(state, handlers));
+  screen.append(renderRosterBlock(state, handlers));
+  screen.append(renderMaintenanceBlock(state, handlers));
+  return screen;
+}
+
+function renderSessionBlock(state, handlers) {
+  const block = element("div", "dm-block");
+  block.append(element("h2", null, "The session"));
+  const running = state.home?.active_session_number ?? null;
+  if (running === null) {
+    const previous = state.home?.previous_session;
+    block.append(
+      element(
+        "p",
+        "muted",
+        previous?.where_ended
+          ? `Last time ended: ${previous.where_ended}`
+          : "No session has been ended with an endpoint yet.",
+      ),
+    );
+    block.append(
+      button("Start a session", {
+        style: "primary",
+        busy: state.busy,
+        onPress: () => handlers.startSession(),
+      }),
+    );
+    return block;
+  }
+  block.append(element("p", null, `Session ${running} is running.`));
+  const form = element("div", "form");
+  // Required, here as on the panel. It is the whole of the continuity the next
+  // evening opens on, and a session ended without one leaves nothing to pick
+  // up — so it is a field on the screen rather than a prompt after the press.
+  form.append(labelled("Where did it end?", textField(state, "end:where", "The Sunken Tomb", handlers)));
+  form.append(
+    button("End the session", {
+      style: "danger",
+      busy: state.busy,
+      title: "Closes any open Loot Drops and any open fight.",
+      onPress: () => handlers.endSession(state.inputs["end:where"] ?? ""),
+    }),
+  );
+  block.append(form);
+  return block;
+}
+
+function renderCombatBlock(state, handlers) {
+  const block = element("div", "dm-block");
+  block.append(element("h2", null, "Combat"));
+  const combat = state.combat;
+  if (!combat) {
+    // The DM screen is drawn before its read lands, and "start a session
+    // first" is the wrong thing to say to somebody who has one running.
+    block.append(element("p", "muted", "Reading…"));
+    return block;
+  }
+  if (combat.status === "NO_ACTIVE_SESSION") {
+    block.append(element("p", "muted", "A fight belongs to a session. Start one first."));
+    return block;
+  }
+  // Quartermaster's own record and nothing Avrae owns: when it started, how
+  // long it has run, and how it ended. The mechanics stay where they are.
+  if (combat.status === "OPEN") {
+    block.append(
+      element("p", null, `A fight has been open for ${Math.round(combat.encounter.elapsed_seconds)}s.`),
+    );
+    const form = element("div", "form");
+    form.append(labelled("How did it end?", textField(state, "combat:outcome", "The ogre fled", handlers)));
+    form.append(
+      button("End combat", {
+        style: "primary",
+        busy: state.busy,
+        onPress: () => handlers.closeCombat(state.inputs["combat:outcome"] ?? ""),
+      }),
+    );
+    block.append(form);
+    return block;
+  }
+  if (combat.last_closed?.outcome) {
+    block.append(element("p", "muted", `Last fight: ${combat.last_closed.outcome}`));
+  }
+  block.append(
+    button("Start combat", { style: "primary", busy: state.busy, onPress: () => handlers.openCombat() }),
+  );
+  return block;
+}
+
+const LIFECYCLES = ["ACTIVE", "DEAD", "RETIRED", "DEPARTED"];
+
+/**
+ * The roster, and the two things a DM does to it that are not registration.
+ *
+ * A lifecycle change never moves anything — that is the invariant, and it is
+ * why resolving belongings is a second control rather than a consequence of
+ * the first.
+ */
+function renderRosterBlock(state, handlers) {
+  const block = element("div", "dm-block");
+  block.append(element("h2", null, "Characters"));
+  const roster = state.roster || [];
+  if (roster.length === 0) {
+    block.append(element("p", "muted", "Nobody is registered. Register from the roster beside this."));
+    return block;
+  }
+  const [listing, body] = table(["Character", "State", "Change to", "Belongings"]);
+  for (const character of roster) {
+    const row = element("tr");
+    row.append(element("td", "name", character.name));
+    row.append(element("td", null, character.lifecycle.toLowerCase()));
+
+    const change = element("td", "controls");
+    const select = element("select", "select");
+    const lifecycleKey = `lifecycle:${character.id}`;
+    select.dataset.inputKey = lifecycleKey;
+    for (const lifecycle of LIFECYCLES) {
+      const option = element("option", null, lifecycle.toLowerCase());
+      option.value = lifecycle;
+      option.selected = (state.inputs[lifecycleKey] ?? character.lifecycle) === lifecycle;
+      select.append(option);
+    }
+    select.addEventListener("change", () => handlers.setInput(lifecycleKey, select.value));
+    change.append(select);
+    change.append(
+      button("Apply", {
+        busy: state.busy,
+        onPress: () =>
+          handlers.transition(character, state.inputs[lifecycleKey] ?? character.lifecycle),
+      }),
+    );
+    row.append(change);
+
+    const estate = element("td", "controls");
+    if (character.lifecycle === "ACTIVE") {
+      // Only a character who has stopped playing has an estate to resolve, and
+      // the domain refuses the rest. Not offering it is the same answer,
+      // earlier.
+      estate.append(element("span", "muted", "—"));
+    } else {
+      const destinationKey = `estate:${character.id}`;
+      const destination = element("select", "select");
+      destination.dataset.inputKey = destinationKey;
+      const options = [{ value: "party", label: "The Party Stash" }];
+      for (const other of roster) {
+        if (other.lifecycle !== "ACTIVE") continue;
+        options.push({ value: other.id, label: other.name });
+      }
+      for (const option of options) {
+        const node = element("option", null, option.label);
+        node.value = option.value;
+        node.selected = (state.inputs[destinationKey] ?? "party") === option.value;
+        destination.append(node);
+      }
+      destination.addEventListener("change", () =>
+        handlers.setInput(destinationKey, destination.value),
+      );
+      estate.append(destination);
+      estate.append(
+        button("Resolve", {
+          busy: state.busy,
+          onPress: () =>
+            handlers.resolveEstate(character, state.inputs[destinationKey] ?? "party"),
+        }),
+      );
+    }
+    row.append(estate);
+    body.append(row);
+  }
+  block.append(listing);
+  return block;
+}
+
+function renderMaintenanceBlock(state, handlers) {
+  const block = element("div", "dm-block");
+  block.append(element("h2", null, "Maintenance"));
+  block.append(
+    element(
+      "p",
+      "muted",
+      "The export is the full record every surface points at, and the one to read during an outage.",
+    ),
+  );
+  const form = element("div", "form");
+  form.append(button("Health", { busy: state.busy, onPress: () => handlers.health() }));
+  form.append(button("Back up", { busy: state.busy, onPress: () => handlers.backup() }));
+  form.append(button("Run maintenance", { busy: state.busy, onPress: () => handlers.runMaintenance() }));
+  form.append(button("Export", { style: "quiet", busy: state.busy, onPress: () => handlers.export() }));
+  block.append(form);
+  if (state.report) {
+    // A pre rather than a paragraph: this is the operator's text, and it is
+    // laid out in columns that a reflow would take apart.
+    block.append(element("pre", "report", state.report));
+    block.append(button("Close", { style: "quiet", onPress: handlers.dismissReport }));
+  }
+  return block;
+}
+
 const SCREEN_BODIES = {
   stash: renderStashScreen,
   items: renderItemsScreen,
   loot: renderLootScreen,
   treasury: renderTreasuryScreen,
+  dm: renderDmScreen,
 };
 
 export function renderApp(state, handlers) {

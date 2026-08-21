@@ -1,12 +1,13 @@
 """The HTTP surface the Activity reads and writes, and the socket that says when
 to read again.
 
-Stages 1, 3, and 4 of `docs/activity-migration-plan.md`: every read a panel
+Stages 1, 3, 4, and 5 of `docs/activity-migration-plan.md`: every read a panel
 performs, available over HTTP with the actor derived from a signed token rather
 than from anything the client sent; `/api/live`, a WebSocket carrying change
-notifications keyed on `domain_events.sequence`; and the mutations a player
+notifications keyed on `domain_events.sequence`; the mutations a player
 performs at the table, each keyed by an idempotency key the client generates
-and scoped to the actor that proved who they are.
+and scoped to the actor that proved who they are; and the ones a DM performs,
+which are the same shape with the authority checked twice.
 
 Path operations that touch SQLite are declared `def`, not `async def`, so
 FastAPI runs them in a worker thread. The store guards both `read()` and
@@ -36,7 +37,7 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 from .api_auth import (
     Actor,
@@ -59,6 +60,7 @@ from .api_live import (
     read_changes,
 )
 from .characters import CharacterError
+from .combat import CombatError
 from .config import ConfigurationError, Settings
 from .currency import CurrencyError, CurrencySemanticStaleness
 from .db import SCHEMA_VERSION
@@ -67,7 +69,14 @@ from .export import render_export
 from .handles import HandleError
 from .inventory import InventoryError, SemanticStaleness
 from .loot import LootDropError
+from .operations import (
+    create_scheduled_backup,
+    health_report,
+    render_health,
+    run_maintenance,
+)
 from .receipts import ReceiptError, ReceiptResult
+from .sessions import SessionError
 from .snapshots import home_snapshot
 
 logger = logging.getLogger(__name__)
@@ -495,7 +504,7 @@ def use(state: State, actor: CurrentActor, action: Idempotency, request: UseRequ
 
     `party_authorized=False`, written here and reachable from nowhere else on
     this route. Correcting the Party Stash is the same service call with that
-    flag set, and it is a DM control on `/api/stash/correct` in Stage 5.
+    flag set, and it is a DM control on `/api/stash/correct`.
     """
     return _committed(
         state.context.inventory.consume_interaction(
@@ -592,6 +601,361 @@ def transition_character(
             action, actor_id=dm.id, character_id=request.character_id, lifecycle=request.lifecycle
         )
     )
+
+
+# DM controls ----------------------------------------------------------------
+#
+# Stage 5 of `docs/activity-migration-plan.md`: what the DM does, so that an
+# evening can be run without opening a panel.
+#
+# Everything below is `CurrentDM` rather than `CurrentActor`, and that is the
+# whole difference between this section and the one above it. The authority is
+# re-checked per request, in `current_dm`, and again by the service inside the
+# transaction — the same two checks the panel makes when it renders a control
+# and when somebody presses it.
+#
+# Three of these are not receipt-backed and say so where they are declared:
+# maintenance, backup, and the full health report are operator actions against
+# the runtime rather than mutations of the campaign, and there is nothing for a
+# receipt to replay.
+
+
+class GrantRequest(BaseModel):
+    item_name: str = Field(min_length=1, max_length=200)
+    quantity: int = Field(ge=1)
+    provenance: str | None = Field(default=None, max_length=200)
+
+
+class CorrectRequest(BaseModel):
+    stack_id: str = Field(min_length=1, max_length=64)
+    quantity: int = Field(ge=1)
+    reason: str | None = Field(default=None, max_length=200)
+
+
+class DropItemRequest(BaseModel):
+    item_name: str = Field(min_length=1, max_length=200)
+    quantity: int = Field(ge=1)
+    provenance: str | None = Field(default=None, max_length=200)
+
+
+class DropRequest(BaseModel):
+    #: The panel makes a drop of one item because a modal holds five fields.
+    #: This one takes a list because a form does not, which is the first place
+    #: on this surface where the Activity is allowed to be better rather than
+    #: merely equivalent.
+    items: list[DropItemRequest] = Field(min_length=1, max_length=50)
+    #: Bounded here as well as in the service, and to the same 720 hours the
+    #: panel's modal accepts: an absolute expiry is what closes a drop nobody
+    #: came back to, and a year-long one is not one.
+    expiry_hours: int = Field(default=72, ge=1, le=720)
+
+
+class CloseDropRequest(BaseModel):
+    drop_id: str = Field(min_length=1, max_length=64)
+
+
+class TreasuryAdjustRequest(BaseModel):
+    deltas: dict[str, int]
+    reason: str | None = Field(default=None, max_length=200)
+
+
+class SplitPreviewRequest(BaseModel):
+    amounts: dict[str, int]
+
+
+class SplitRequest(BaseModel):
+    handle_id: str = Field(min_length=1, max_length=64)
+    #: Set only by a client answering the question a `STALE` refusal asked.
+    confirm_current: bool = False
+
+
+class SessionEndRequest(BaseModel):
+    #: Stripped before it is measured, so a space is not an endpoint. The
+    #: panel's modal cannot make that distinction and this can, and the
+    #: sentence is the whole of what the next evening opens on.
+    where_ended: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+
+
+class CombatOpenRequest(BaseModel):
+    channel_id: str = Field(min_length=1, max_length=32)
+
+
+class CombatCloseRequest(BaseModel):
+    outcome: str | None = Field(default=None, max_length=200)
+
+
+class EstateRequest(BaseModel):
+    character_id: str = Field(min_length=1, max_length=64)
+    destination: str = Field(default="party", min_length=1, max_length=64)
+
+
+# The Party Stash, from the other side --------------------------------------
+
+
+@router.post("/stash/grant")
+def grant(state: State, dm: CurrentDM, action: Idempotency, request: GrantRequest) -> dict[str, Any]:
+    """Put something into the Party Stash.
+
+    The one mutation that mints rather than moves, which is why provenance is
+    on it: nothing upstream of a grant can say where the item came from.
+    """
+    return _committed(
+        state.context.inventory.grant_interaction(
+            action,
+            actor_id=dm.id,
+            item_name=request.item_name,
+            quantity=request.quantity,
+            provenance=request.provenance,
+        )
+    )
+
+
+@router.post("/stash/correct")
+def correct(state: State, dm: CurrentDM, action: Idempotency, request: CorrectRequest) -> dict[str, Any]:
+    """Take something out of the Party Stash and out of the campaign.
+
+    The same call as `/api/items/use`, separated from it only by
+    `party_authorized`, which is set here and is not in `CorrectRequest` —
+    there is no field for a body to fill. That is the flag the plan names: a
+    request that could carry it would turn "use up what you carry" into
+    "remove what the party shares" for anyone who can edit one.
+
+    The DM check is therefore doing two jobs. `consume_interaction` follows
+    possession — a player may spend what they hold — and this is the only route
+    that reaches the other half of it.
+    """
+    return _committed(
+        state.context.inventory.consume_interaction(
+            action,
+            actor_id=dm.id,
+            stack_id=request.stack_id,
+            quantity=request.quantity,
+            reason=request.reason,
+            party_authorized=True,
+        )
+    )
+
+
+# Loot Drops -----------------------------------------------------------------
+
+
+@router.post("/loot/drops")
+def create_drop(state: State, dm: CurrentDM, action: Idempotency, request: DropRequest) -> dict[str, Any]:
+    return _committed(
+        state.context.loot.create_drop_interaction(
+            action,
+            actor_id=dm.id,
+            items=[(item.item_name, item.quantity, item.provenance) for item in request.items],
+            expiry_hours=request.expiry_hours,
+        )
+    )
+
+
+@router.post("/loot/drops/close")
+def close_drop(state: State, dm: CurrentDM, action: Idempotency, request: CloseDropRequest) -> dict[str, Any]:
+    """Close a drop early. What nobody claimed goes back to the Party Stash."""
+    return _committed(
+        state.context.loot.close_drop_interaction(action, drop_id=request.drop_id, actor_id=dm.id)
+    )
+
+
+# The treasury ---------------------------------------------------------------
+
+
+@router.post("/treasury/adjust")
+def adjust_treasury(
+    state: State, dm: CurrentDM, action: Idempotency, request: TreasuryAdjustRequest
+) -> dict[str, Any]:
+    """Add to or take from the treasury, by a signed amount per denomination."""
+    return _committed(
+        state.context.currency.adjust_treasury_interaction(
+            action, actor_id=dm.id, deltas=request.deltas, reason=request.reason
+        )
+    )
+
+
+@router.post("/treasury/split/preview")
+def preview_split(state: State, dm: CurrentDM, request: SplitPreviewRequest) -> dict[str, Any]:
+    """Say who would be paid what, and mint the handle that would pay them.
+
+    A split reads the roster twice — once to show the DM the shares, once to
+    move the coin — and a character dying in between changes every share. The
+    handle carries the roster and treasury the preview was computed against, so
+    the commit can tell that it is about to pay out numbers nobody was shown.
+
+    No idempotency key, for the same reason the take and give preparations have
+    none: minting is not an operation. A retry costs an unspent handle.
+
+    Answering a `STALE` refusal means calling this again — to see the shares as
+    they now stand — and then committing the *original* handle with
+    `confirm_current`. The second preview's handle is the cost of asking the
+    question, and it expires unspent.
+    """
+    return state.context.currency.prepare_split(actor_id=dm.id, amounts=request.amounts)
+
+
+@router.post("/treasury/split")
+def split_treasury(state: State, dm: CurrentDM, action: Idempotency, request: SplitRequest) -> dict[str, Any]:
+    """Commit a previewed split.
+
+    `confirm_current` is the DM answering "yes, against the party as it stands
+    now" to a refusal they were shown. It is a field rather than a second route
+    because the domain takes it as an argument, and because — unlike take and
+    give — the confirmation does not change which handle is spent.
+    """
+    return _committed(
+        state.context.currency.split_relative_interaction(
+            action, handle_id=request.handle_id, actor_id=dm.id, confirm_current=request.confirm_current
+        )
+    )
+
+
+# The session ----------------------------------------------------------------
+
+
+@router.post("/session/start")
+def start_session(state: State, dm: CurrentDM, action: Idempotency) -> dict[str, Any]:
+    """Start a session, or report the one already running.
+
+    A stale active session is never closed silently — the domain answers
+    `ACTIVE_EXISTS` and names it, and ending it is a separate decision.
+    """
+    return _committed(state.context.sessions.start_interaction(action, actor_id=dm.id))
+
+
+@router.post("/session/end")
+def end_session(
+    state: State, dm: CurrentDM, action: Idempotency, request: SessionEndRequest
+) -> dict[str, Any]:
+    """End the session, with the one sentence the next evening opens on.
+
+    `where_ended` is required rather than optional, here as on the panel: it is
+    the whole of specification 29's continuity, and a session ended without one
+    leaves the table with nothing to pick up.
+    """
+    return _committed(
+        state.context.sessions.end_interaction(action, actor_id=dm.id, where_ended=request.where_ended)
+    )
+
+
+# Combat ---------------------------------------------------------------------
+
+
+@router.post("/combat/open")
+def open_combat(
+    state: State, dm: CurrentDM, action: Idempotency, request: CombatOpenRequest
+) -> dict[str, Any]:
+    """Open Quartermaster's own record of a fight. Nothing Avrae owns is in it.
+
+    `channel_id` is in the body, and it is not an exception to the rule above
+    it. The panel reads it off the interaction because Discord put it there;
+    a browser has it from the SDK and there is nowhere else to get it. It
+    names where the fight is happening on a record this process writes, and
+    authorizes nothing — the authority on this route is the DM check, and a
+    channel a client made up buys whoever sent it a mislabelled row.
+    """
+    return _committed(
+        state.context.combat.open_interaction(action, actor_id=dm.id, channel_id=request.channel_id)
+    )
+
+
+@router.post("/combat/close")
+def close_combat(
+    state: State, dm: CurrentDM, action: Idempotency, request: CombatCloseRequest
+) -> dict[str, Any]:
+    """Close the fight, and report what is still unclaimed while everyone is here."""
+    return _committed(
+        state.context.combat.close_interaction(action, actor_id=dm.id, outcome=request.outcome)
+    )
+
+
+# Characters -----------------------------------------------------------------
+
+
+@router.post("/characters/estate")
+def resolve_estate(
+    state: State, dm: CurrentDM, action: Idempotency, request: EstateRequest
+) -> dict[str, Any]:
+    """Move a non-active character's belongings, explicitly.
+
+    Kept apart from the lifecycle transition above it on purpose: a character
+    dying must never silently move what they were carrying, so the transition
+    and the resolution are two decisions and two records.
+    """
+    return _committed(
+        state.context.characters.resolve_belongings_interaction(
+            action, actor_id=dm.id, character_id=request.character_id, destination=request.destination
+        )
+    )
+
+
+# Maintenance ----------------------------------------------------------------
+#
+# The one group on this surface that is not a domain mutation. Nothing here
+# takes an idempotency key, and the reason is not that a retry is harmless: it
+# is that there is no receipt to replay. `run_maintenance` deletes what is past
+# its retention window, which is the same answer run twice; a backup writes a
+# timestamped snapshot, so a repeat writes a second file that retention then
+# reaps. Both record their own outcome in `maintenance_runs`, which is where
+# `health` reads them back from.
+#
+# They are `def`, so they run in a worker thread. A backup snapshots the
+# database through the same online-backup path the CLI uses, and holds the
+# store while it does — which is a second reason the event loop must not be
+# the thread that waits for it.
+
+
+@router.post("/maintenance/run")
+def maintenance(state: State, _: CurrentDM) -> dict[str, Any]:
+    settings = state.settings
+    return run_maintenance(
+        state.context.store,
+        receipt_retention_seconds=settings.receipt_retention_seconds,
+        handle_retention_seconds=settings.handle_retention_seconds,
+    )
+
+
+@router.post("/maintenance/backup")
+def backup(state: State, _: CurrentDM) -> dict[str, Any]:
+    """A validated snapshot, beside the scheduled ones rather than somewhere new.
+
+    The directory, the off-device copy, and the retention count all come from
+    configuration, so a backup taken from here rotates the same set of files
+    the scheduled ones do and `health` reports on whichever was written last.
+    """
+    settings = state.settings
+    try:
+        return create_scheduled_backup(
+            state.context.store,
+            settings.backup_directory,
+            off_device_directory=settings.backup_off_device_directory,
+            retention_count=settings.backup_retention_count,
+        )
+    except OSError as error:
+        # The one route here that fails for reasons outside the campaign — a
+        # full disk, a directory nothing may write to. It answers 500 because
+        # the server is what failed, and it carries the reason because the
+        # person pressing this is the person who can fix it. The failure is
+        # already recorded in `maintenance_runs`, so `health` says so too.
+        raise HTTPException(
+            status_code=500, detail=f"the backup could not be written: {error}"
+        ) from error
+
+
+@router.get("/maintenance/health")
+def full_health(state: State, _: CurrentDM) -> dict[str, Any]:
+    """What the runtime can see, both ways it is read.
+
+    `report` is the machine-readable snapshot; `rendered` is what the panel
+    prints, carried so that a DM reading it here and a DM reading it in Discord
+    are reading the same sentences rather than two renderings of one truth.
+
+    Not `/api/health`, which is unauthenticated and says only that the process
+    is up: this one names sessions, receipts, outbox depth, and backups, and
+    that is campaign state.
+    """
+    report = health_report(state.context.store)
+    return {"report": report, "rendered": render_health(report)}
 
 
 # Live feed ------------------------------------------------------------------
@@ -772,6 +1136,8 @@ DOMAIN_REFUSALS: tuple[tuple[type[Exception], int, str], ...] = (
     (CurrencyError, 422, "REFUSED"),
     (LootDropError, 422, "REFUSED"),
     (CharacterError, 422, "REFUSED"),
+    (SessionError, 422, "REFUSED"),
+    (CombatError, 422, "REFUSED"),
 )
 
 

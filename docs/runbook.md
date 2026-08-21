@@ -117,7 +117,7 @@ Stages 1 to 4 are built and tested, and `preflight` proves everything about them
 - **The WebSocket upgrading through Discord's proxy.** This is the one most likely to bite, and the one with the most built on top of it: `api_live.py` and `activity/src/live.js` were both written against an assumption about it. If it does not survive the proxy, the fallback is polling the reads on a timer, and the change stays inside those two files.
 - The layout on a phone, if anyone at the table plays from one.
 
-A failure in any of these costs no domain code and no stored state. That is the whole reason Stage 0 is worth doing before Stage 5.
+A failure in any of these costs no domain code and no stored state — which is what made it reasonable to build the player and DM surfaces before carrying this out, and is still the reason to carry it out before deleting anything.
 
 ## Health and maintenance
 
