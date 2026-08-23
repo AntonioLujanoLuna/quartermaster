@@ -2,9 +2,9 @@
 
 Quartermaster records the intent and outcome of a provider call, but it does
 not calculate or mirror the provider's game mechanics. The first provider
-adapter is deliberately a protocol: the Avrae-side implementation must run in
-an Avrae-owned extension or service where the real Discord actor and combat
-context are available.
+adapter is now an optional read-only status transport. State-changing calls
+still require an Avrae-owned extension or service where the real Discord actor
+and combat context are available.
 """
 
 from __future__ import annotations

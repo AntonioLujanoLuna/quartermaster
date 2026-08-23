@@ -94,10 +94,25 @@ def render_state(store: SQLiteStore, target_id: str) -> dict[str, Any]:
             previous = connection.execute(
             "SELECT session_number, where_ended FROM sessions WHERE status = 'CLOSED' ORDER BY session_number DESC LIMIT 1"
             ).fetchone()
+            combat = None
+            if active:
+                open_combat = connection.execute(
+                    """SELECT channel_id, opened_by
+                         FROM combat_encounters
+                        WHERE session_id = (
+                                  SELECT id FROM sessions
+                                   WHERE status = 'ACTIVE'
+                               ORDER BY session_number DESC LIMIT 1
+                              )
+                          AND status = 'OPEN'"""
+                ).fetchone()
+                if open_combat:
+                    combat = dict(open_combat)
             return {
                 "surface": "SESSION",
                 "active": dict(active) if active else None,
                 "previous": dict(previous) if previous else None,
+                "combat": combat,
             }
         if target_id == "dm-surface":
             return {

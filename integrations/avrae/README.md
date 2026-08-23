@@ -1,50 +1,92 @@
-# Quartermaster Avrae spike (parked)
+# Quartermaster Avrae adapter (opt-in)
 
-**Status: parked, not queued.** Gate 1 of the
-[integration plan](../../docs/avrae-integration-plan.md) was answered "no, for now" on
-2026-08-14: the table is not taking on a self-hosted Avrae fork, so nothing here is
-scheduled to run. The committed path is the hosted-Avrae workflow in the main bot.
+This directory contains the first, read-only integration slice for a
+self-hosted or forked Avrae deployment. It is not loaded by the hosted
+Quartermaster bot and it does not open, read, or write Quartermaster's SQLite
+database.
 
-This code has never been executed. It is kept as a record of the shape the integration would
-take, and it should be re-verified from scratch before anyone trusts it, because it assumes
-things about Avrae's internals that nobody has checked against a running process:
+The boundary is:
 
-- that `CombatNotFound` is importable from `cogs5e.initiative` — upstream it lives in
-  `cogs5e.models.errors`, and whether the package re-exports it is unconfirmed;
-- that `Combat.from_ctx` accepts a slash-command interaction with the attributes this Cog
-  reads off it;
-- that a second OS process may open the live Quartermaster SQLite database. WAL and the
-  2.5s busy timeout make it survivable in principle, but it turns a single-writer design
-  into a two-writer one and complicates the backup and restore story. That is a decision to
-  make deliberately, not to inherit from this file.
+1. Quartermaster's authenticated Activity request is signed with
+   `X-Quartermaster-Timestamp`, `X-Quartermaster-Nonce`, and
+   `X-Quartermaster-Signature`.
+2. The Avrae-side handler verifies the HMAC, clock skew, nonce replay, protocol,
+   operation (`status` only), and configured guild.
+3. A provider supplied by the Avrae Cog reads native status inside Avrae and
+   returns a provider result. Quartermaster displays it as provider state and
+   never stores HP, initiative, conditions, resources, or combatants.
 
-Avrae's combat internals are not a stable API. Every upstream pull is a chance for this to
-break, which is the substance of the Gate 1 answer.
+`quartermaster_adapter.py` is dependency-light and owns the signed request
+contract. Loading `quartermaster_cog.py` starts an `aiohttp` listener at
+`/quartermaster/v1/status` and reads the native combat model through
+`Combat.from_id`. The synthetic context is used only for model deserialization;
+it is never passed to a mutating command handler. The signed actor must still
+be a member of the configured guild, and the channel must belong to that guild.
 
-It is not loaded by the current Quartermaster bot and does not affect the hosted-Avrae
-workflow.
+## Quartermaster configuration
 
-The Cog adds `/qm-combat-probe`. When invoked in a guild with an active
-Quartermaster session, it:
+Configure the full POST endpoint and the same secret in Quartermaster:
 
-1. uses the real Avrae interaction actor, guild, and channel;
-2. locates the native Avrae combat with `Combat.from_ctx(inter)`;
-3. records a Quartermaster provider receipt and correlation ID; and
-4. reports whether a native combat exists, without copying HP, initiative,
-   conditions, resources, or combatants into Quartermaster.
+```text
+QM_AVRAE_ADAPTER_URL=https://avrae-host.example/quartermaster/v1/status
+QM_AVRAE_ADAPTER_SECRET=<long-random-shared-secret>
+QM_AVRAE_ADAPTER_TIMEOUT_SECONDS=2.5
 
-The extension assumes the self-hosted Avrae process can import the core
-Quartermaster package without installing its Discord adapter dependencies:
-
-```powershell
-uv pip install --python <avrae-python> --no-deps -e C:\path\to\quartermaster
+# Avrae-side listener defaults; bind loopback when using a local reverse proxy.
+QM_AVRAE_ADAPTER_HOST=127.0.0.1
+QM_AVRAE_ADAPTER_PORT=8787
 ```
 
-Add `QuartermasterAvraeCog` to the self-hosted Avrae extension loading path,
-configure `QM_DATABASE_PATH` and `QM_GUILD_ID` so the Cog reaches the canonical
-SQLite database and is pinned to one guild, and run this only in that disposable
-guild first. The next spike must prove one native state-changing operation
-through an Avrae-owned context before we add attack, cast, save, or turn-advance
-dispatch.
+When these values are absent, the existing hosted-Avrae handoff continues to
+work and the Activity reports the adapter as not configured. The initial
+status route is `GET /api/combat/avrae`; it only calls Avrae while a
+Quartermaster combat is open.
 
-None of that is scheduled. Reopening it means reopening Gate 1 first.
+For a remote bind, set `QM_AVRAE_ADAPTER_ALLOW_REMOTE=1` only when a TLS
+reverse proxy terminates HTTPS in front of the listener. The listener itself
+is plain HTTP; HMAC authenticates the request but does not encrypt it.
+
+## What is not implemented yet
+
+- the TLS/reverse-proxy deployment and live self-hosted acceptance;
+- authorization semantics beyond guild membership for future mutations;
+- any state-changing provider operation;
+- durable provider receipts for status reads or automatic retries.
+
+The disposable local spike now proves one real native status read through the
+listener with Avrae's MongoDB and Redis dependencies. A real Discord login,
+guild, TLS deployment, and harmless state change remain before this should be
+called live. Combat actions remain out of scope until actor authorization,
+idempotency, and timeout recovery are demonstrated in the Avrae process.
+
+## Disposable local validation
+
+The local Windows validation checkout is kept outside this repository. The
+repeatable setup is:
+
+```powershell
+git clone --depth 1 --branch nightly https://github.com/avrae/avrae.git avrae-local
+cd avrae-local
+uv venv --python 3.11 .venv
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+```
+
+Set `PYTHONPATH` to include the Quartermaster checkout, the Quartermaster
+`src` directory, and the Avrae checkout, then load
+`integrations.avrae.quartermaster_cog` from the Avrae virtual environment.
+For a real dependency smoke test, start only Avrae's `mongo` and `redis`
+services under a disposable compose project, insert a minimal native combat
+document into MongoDB, and run the signed HTTP round trip. This exercises the
+real `Combat.from_id` model-loading path and verifies MongoDB/Redis reachability
+without connecting to Discord. Remove the disposable containers and volumes
+afterward; do not start Avrae's bot service without its credentials and secrets.
+
+The 2026-08-23 run completed with MongoDB ping `1`, Redis `PONG`, and a
+`COMMITTED` response containing `active: true` and the native summary message
+ID. The earlier fake-Mongo smoke remains useful as a fast test of the same
+Python boundary.
+
+On the 2026-08-23 nightly checkout (`12b146f`), importing the initiative Cog
+also required local-only lazy-import workarounds for upstream circular imports.
+Those edits are confined to the disposable Avrae checkout and are not claimed
+as Quartermaster or upstream Avrae fixes.

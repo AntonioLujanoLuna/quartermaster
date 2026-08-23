@@ -16,6 +16,7 @@ from .combat import CombatService, format_duration
 from .config import Settings
 from .currency import CurrencyService
 from .db import SQLiteStore
+from .integration import AvraeGateway
 from .inventory import InventoryService
 from .loot import LootDropService
 from .receipts import ReceiptRepository
@@ -62,6 +63,7 @@ class Quartermaster:
     loot: LootDropService
     combat: CombatService
     handoff: AvraeHandoffService
+    avrae_gateway: AvraeGateway | None = None
 
     @property
     def inventory(self) -> InventoryService:

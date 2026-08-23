@@ -3,10 +3,10 @@
 Status: the hosted-Avrae path is the committed one. Gate 1 has been answered "no, for now"
 (see [Gate 1 decision](#gate-1-decision-2026-08-14)), so the self-hosted extension work is
 parked rather than pending, and the hosted fallback is being built out as the destination
-instead of a waiting room. The provider boundary in `integration.py` remains a contract with
-no live caller.
+instead of a waiting room. A separately configured read-only HTTP status caller now exists,
+but no self-hosted Avrae listener is enabled by default and no mechanic has a live caller.
 
-Updated: 2026-08-14
+Updated: 2026-08-23
 
 ## Purpose
 
@@ -34,11 +34,48 @@ The current cards use the documented native forms such as `!i begin`, `!i join`,
 
 ## Implementation slice 3: self-hosted Avrae context probe
 
-`integrations/avrae/quartermaster_cog.py` is a disposable Avrae-side extension scaffold. Its `/qm-combat-probe` command receives a real Avrae interaction, preserves the actor/guild/channel identity, loads native combat with `Combat.from_ctx(inter)`, and records a Quartermaster provider receipt and correlation ID. It reports native combat presence only; it does not copy HP, initiative, conditions, resources, or combatants into Quartermaster.
+`integrations/avrae/quartermaster_cog.py` is a disposable Avrae-side extension scaffold. The
+read-only request verifier in `integrations/avrae/quartermaster_adapter.py` receives a signed
+Quartermaster envelope, while the native context bridge reads Avrae's combat model through
+`Combat.from_id` inside the Avrae process. It does not open Quartermaster SQLite or copy HP,
+initiative, conditions, resources, or combatants into Quartermaster.
 
-The scaffold is not loaded by the current hosted Quartermaster process and has never been run inside an Avrae deployment. It is now parked behind the Gate 1 decision below rather than queued as the next task. Nothing in the running bot has ever exercised it, and its assumptions about Avrae's internals — that `CombatNotFound` is importable from `cogs5e.initiative`, that `Combat.from_ctx` accepts a slash interaction, that two OS processes may share one SQLite file — are unverified. Treat the file as a record of the intended shape, not as working code.
+The scaffold is not loaded by the current hosted Quartermaster process and has not been run
+with Avrae's Discord login or a real guild. It is now parked behind the Gate 1 decision below
+rather than queued as the next task. The opt-in Cog now uses the current `Combat.from_id` model
+seam and does not open Quartermaster SQLite. A disposable local run has also exercised the Cog
+against real MongoDB and Redis, but that remains a deployment spike rather than a supported
+hosted-Avrae feature.
 
-## Implementation slice 4: the Quartermaster combat record
+The older assumptions listed in the historical note above are no longer implementation
+requirements: the new status boundary does not share the SQLite file. The Avrae-native context
+and listener now exist in the opt-in Cog, but remain live-unverified until a Discord-connected
+self-hosted deployment runs them.
+
+## Implementation slice 4: authenticated read-only status adapter
+
+Quartermaster now has an optional `HttpAvraeGateway` and `GET /api/combat/avrae`. The route only
+calls the gateway while Quartermaster itself has an open encounter, and sends the authenticated
+actor, configured guild, native channel, session, provider reference, and correlation ID. The
+request is signed with HMAC-SHA256 over a timestamp, nonce, and exact JSON body. The Avrae-side
+handler verifies freshness, replay, protocol, operation, and guild before delegating to a native
+status provider.
+
+This slice is intentionally read-only. It creates no provider receipt, shares no SQLite file,
+and has no endpoint for `start`, `join`, `next`, `attack`, `cast`, `check`, `save`, or `end`.
+Transport timeouts are exposed as `UNKNOWN`, while a known adapter rejection is exposed as
+`FAILED`; neither result is presented as an inactive combat. The handler and wire contract are
+tested without importing Avrae. The listener and model bridge are implemented in the opt-in Cog,
+but still require a disposable self-hosted deployment before this can be called live.
+
+Local validation now uses a disposable Avrae nightly checkout outside this repository. At
+commit `12b146f`, the real Avrae dependencies, listener, HMAC gateway, and `Combat.from_id`
+model-loading path completed a loopback status smoke test with real MongoDB and Redis containers
+and a minimal native combat document. This proves the Python boundary, native model seam, and
+local database connectivity; it does not prove Discord login, TLS/reverse-proxy deployment, or
+a live guild deployment.
+
+## Implementation slice 5: the Quartermaster combat record
 
 Schema 12 adds `combat_encounters`: session, channel, open/closed status, who opened and closed it, timestamps, a close reason, and an optional DM outcome note. It has no column for HP, initiative, conditions, resources, or combatants, and a test asserts the exact column set so it cannot quietly gain one.
 
@@ -314,16 +351,18 @@ worth having", which is work the hosted bot can do on its own:
 2. Decide whether the encounter deserves a name or a short label. Right now two fights in one
    session are distinguishable only by timestamp, which is fine for the status card and thin
    for the export.
-3. Consider surfacing the open encounter on the session projection, so the channel shows a
-   fight in progress without anyone running a command.
-4. Spend the half hour on the Avrae alias signature question above, and write the answer down
+3. Spend the half hour on the Avrae alias signature question above, and write the answer down
    either way so it stops being an open loop.
+
+The session projection now shows an open Quartermaster encounter's channel and opener. It
+continues to omit every Avrae-owned mechanic, and the projection is dirtied by the existing
+combat lifecycle events so the channel can reflect the change without a command.
 
 Explicitly not queued: loading the Cog, self-hosting Avrae, provider gateway implementations,
 combat reference projections, and any surface that would hold an Avrae-owned number.
 
-The provider boundary in `integration.py` stays as a contract with no live caller. It is
-cheap to carry, its recovery semantics are the hard part and are already correct, and
-removing it would cost a migration to destroy work we would have to redo. It should not be
-read as evidence that an integration is running — the health check that watches it cannot
-fail on the current build, and says so in a comment.
+The provider receipt boundary in `integration.py` remains unused for the read-only status
+route: the optional gateway has a live caller, but status reads do not create durable receipts.
+Mechanic operations still have no live caller. The boundary is cheap to carry, its recovery
+semantics are the hard part and are already correct, and removing it would cost a migration to
+destroy work we would have to redo.

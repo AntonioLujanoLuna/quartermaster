@@ -89,9 +89,11 @@ Quartermaster's own `combat_encounters` record — session, channel, duration, o
 nothing Avrae owns; Start and End render only for a DM and check again when pressed. The other
 six controls render read-only handoff cards pointing at native Avrae commands. Ending combat
 reports outstanding Loot Drops and offers the spoils controls. The provider operation boundary is
-durable but has no live caller, and its health check cannot fail on this build. The
-extension scaffold at `integrations/avrae/quartermaster_cog.py` is parked: Gate 1 was
-answered "no, for now" on 2026-08-14, and it has never been loaded in an Avrae deployment.
+durable but still has no live caller for state-changing mechanics; the read-only status adapter
+does not create provider receipts. The extension at `integrations/avrae/quartermaster_cog.py`
+remains parked as a supported product feature: Gate 1 was answered "no, for now" on 2026-08-14.
+On 2026-08-23 it was loaded from a disposable Avrae nightly checkout and exercised through the
+signed listener with real MongoDB and Redis, but not with Discord login or a live guild.
 
 **Item shape.** Every item is a quantity stack. Unique item instances — specification 30.2
 and the unique half of 31 — are deliberately not built and are no longer listed as pending
@@ -1067,10 +1069,11 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
    the one that should wait: what the bot keeps forever is a judgement about what people
    reach for outside a session, and nobody has been outside one yet.
 
-The Avrae extension spike is no longer a priority: Gate 1 was answered "no, for now", so
-self-hosting, the Cog, provider gateway implementations, and combat reference projections
-are all parked. See [the integration plan](avrae-integration-plan.md) for the reasoning and
-for the one hosted-path question still worth answering.
+The Avrae extension spike is no longer a product priority: Gate 1 was answered "no, for now",
+so self-hosting, state-changing mechanics, and combat reference projections remain parked. The
+read-only provider gateway and Cog now exist as a locally validated deployment spike, not as a
+supported hosted-Avrae feature. See [the integration plan](avrae-integration-plan.md) for the
+reasoning and the remaining live-deployment boundary.
 
 Your Pack, Journal, Parking Lot, Downtime, faction clocks, rich continuity, and Undo remain
 evidence-gated. Do not start them.

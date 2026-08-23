@@ -8,6 +8,7 @@ import logging
 import discord
 from discord.ext import commands
 
+from .avrae_gateway import gateway_for_settings
 from .avrae_handoff import AvraeHandoffService
 from .characters import CharacterService
 from .combat import CombatService
@@ -74,6 +75,7 @@ def context_for(settings: Settings, services: BotServices) -> Quartermaster:
         or LootDropService(services.store, services.receipts, HandleRepository(services.store)),
         combat=services.combat or CombatService(services.store, services.receipts),
         handoff=services.avrae_handoff or AvraeHandoffService(services.store),
+        avrae_gateway=gateway_for_settings(settings),
     )
 
 

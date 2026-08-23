@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 class ConfigurationError(ValueError):
@@ -44,6 +45,23 @@ class Settings:
     activity_origin: str | None = None
     activity_dist: Path | None = None
     session_token_seconds: int = 3600
+    avrae_adapter_url: str | None = None
+    avrae_adapter_secret: str | None = None
+    avrae_adapter_timeout_seconds: float = 2.5
+
+    def __post_init__(self) -> None:
+        adapter_url = self.avrae_adapter_url
+        adapter_secret = self.avrae_adapter_secret
+        if (adapter_url is None) != (adapter_secret is None):
+            raise ConfigurationError(
+                "QM_AVRAE_ADAPTER_URL and QM_AVRAE_ADAPTER_SECRET must be configured together"
+            )
+        if adapter_url is not None:
+            _validate_avrae_url(adapter_url)
+        if adapter_secret is not None and not adapter_secret.strip():
+            raise ConfigurationError("QM_AVRAE_ADAPTER_SECRET must not be empty")
+        if self.avrae_adapter_timeout_seconds <= 0:
+            raise ConfigurationError("QM_AVRAE_ADAPTER_TIMEOUT_SECONDS must be a positive number")
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str]) -> Settings:
@@ -81,6 +99,11 @@ class Settings:
             activity_origin=_optional_origin(environment.get("QM_ACTIVITY_ORIGIN", "")),
             activity_dist=_optional_path(environment.get("QM_ACTIVITY_DIST", "")),
             session_token_seconds=_positive_int(environment, "QM_SESSION_TOKEN_SECONDS", 3600),
+            avrae_adapter_url=_optional_avrae_url(environment.get("QM_AVRAE_ADAPTER_URL", "")),
+            avrae_adapter_secret=environment.get("QM_AVRAE_ADAPTER_SECRET", "").strip() or None,
+            avrae_adapter_timeout_seconds=_positive_float(
+                environment, "QM_AVRAE_ADAPTER_TIMEOUT_SECONDS", 2.5
+            ),
         )
 
     def require_activity(self) -> tuple[str, str]:
@@ -115,6 +138,10 @@ class Settings:
         return not self.activity_enabled and (
             self.activity_dist is not None or self.activity_origin is not None
         )
+
+    @property
+    def avrae_adapter_enabled(self) -> bool:
+        return self.avrae_adapter_url is not None and self.avrae_adapter_secret is not None
 
     def require_discord_token(self) -> str:
         if not self.discord_token:
@@ -194,6 +221,22 @@ def _optional_origin(raw: str) -> str | None:
     if not value.startswith("https://") or len(value) <= len("https://"):
         raise ConfigurationError("QM_ACTIVITY_ORIGIN must be an https:// origin")
     return value
+
+
+def _optional_avrae_url(raw: str) -> str | None:
+    value = raw.strip().rstrip("/")
+    if not value:
+        return None
+    _validate_avrae_url(value)
+    return value
+
+
+def _validate_avrae_url(value: str) -> None:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ConfigurationError("QM_AVRAE_ADAPTER_URL must be an http:// or https:// URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ConfigurationError("QM_AVRAE_ADAPTER_URL must not contain credentials")
 
 
 def _optional_path(raw: str) -> Path | None:

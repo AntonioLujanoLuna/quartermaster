@@ -60,6 +60,7 @@ from quartermaster.currency import CurrencyService
 from quartermaster.db import SCHEMA_VERSION, SQLiteStore
 from quartermaster.discord_common import BotServices, Quartermaster
 from quartermaster.handles import HandleRepository
+from quartermaster.integration import ProviderResult, ProviderTimeout
 from quartermaster.inventory import InventoryService
 from quartermaster.loot import LootDropService
 from quartermaster.preflight import _built_page, run_preflight
@@ -868,6 +869,64 @@ class DmSurfaceTests(ApiTestCase):
         self.assertEqual(status["status"], "NO_OPEN_COMBAT")
         self.assertEqual(status["last_closed"]["outcome"], "The ogre fled")
 
+    def test_avrae_status_is_not_queried_without_an_open_quartermaster_encounter(self) -> None:
+        class Gateway:
+            def execute(self, _request):
+                raise AssertionError("Avrae must not be queried without a Q encounter")
+
+        self.app.state.quartermaster = replace(
+            self.app.state.quartermaster,
+            context=replace(self.context, avrae_gateway=Gateway()),
+        )
+        response = self.client.get("/api/combat/avrae", headers=self.headers())
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "NOT_QUERIED")
+
+    def test_avrae_status_passes_authenticated_context_to_the_read_only_gateway(self) -> None:
+        seen = []
+
+        class Gateway:
+            def execute(self, request):
+                seen.append(request)
+                return ProviderResult(
+                    status="COMMITTED",
+                    provider_reference="channel:9",
+                    provider_version="test-avrae",
+                    payload={"active": True},
+                )
+
+        self.app.state.quartermaster = replace(
+            self.app.state.quartermaster,
+            context=replace(self.context, avrae_gateway=Gateway()),
+        )
+        self.dm("/api/session/start")
+        self.dm("/api/combat/open", {"channel_id": "9"})
+        response = self.client.get("/api/combat/avrae", headers=self.headers())
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "COMMITTED")
+        self.assertEqual(response.json()["result"], {"active": True})
+        self.assertEqual(seen[0].actor_id, PLAYER_ID)
+        self.assertEqual(seen[0].guild_id, GUILD_ID)
+        self.assertEqual(seen[0].channel_id, "9")
+        self.assertEqual(seen[0].operation_kind, "status")
+
+    def test_avrae_status_timeout_is_explicitly_unknown(self) -> None:
+        class Gateway:
+            def execute(self, _request):
+                raise ProviderTimeout("status response did not arrive")
+
+        self.app.state.quartermaster = replace(
+            self.app.state.quartermaster,
+            context=replace(self.context, avrae_gateway=Gateway()),
+        )
+        self.dm("/api/session/start")
+        self.dm("/api/combat/open", {"channel_id": "9"})
+        response = self.client.get("/api/combat/avrae", headers=self.headers())
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "UNKNOWN")
+        self.assertEqual(response.json()["retryable"], False)
+
     # Characters --------------------------------------------------------------
 
     def test_a_lifecycle_change_moves_nothing_and_an_estate_moves_it_explicitly(self) -> None:
@@ -1421,6 +1480,26 @@ class ActivityConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(settings.activity_origin, "https://quartermaster.example")
         self.assertEqual(settings.api_bind, "0.0.0.0:9001")
+
+    def test_avrae_adapter_is_optional_and_validates_its_pair_of_credentials(self) -> None:
+        settings = Settings.from_env(
+            self._environment(
+                QM_AVRAE_ADAPTER_URL="https://avrae.example/quartermaster/status/",
+                QM_AVRAE_ADAPTER_SECRET="shared-secret",
+            )
+        )
+        self.assertTrue(settings.avrae_adapter_enabled)
+        self.assertEqual(settings.avrae_adapter_url, "https://avrae.example/quartermaster/status")
+        self.assertEqual(settings.avrae_adapter_timeout_seconds, 2.5)
+
+        for overrides in (
+            {"QM_AVRAE_ADAPTER_URL": "https://avrae.example/status"},
+            {"QM_AVRAE_ADAPTER_SECRET": "shared-secret"},
+            {"QM_AVRAE_ADAPTER_URL": "ftp://avrae.example/status", "QM_AVRAE_ADAPTER_SECRET": "secret"},
+        ):
+            with self.subTest(**overrides):
+                with self.assertRaises(ConfigurationError):
+                    Settings.from_env(self._environment(**overrides))
 
 
 class PreflightTests(unittest.TestCase):

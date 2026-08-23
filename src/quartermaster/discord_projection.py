@@ -52,6 +52,10 @@ def _content_for_state(target_id: str, payload: dict[str, Any]) -> str:
         previous = payload.get("previous")
         lines = ["**SESSION**", ""]
         lines.append(f"Active session: {active['session_number']}" if active else "No active session.")
+        combat = payload.get("combat")
+        if combat:
+            opened_by = f" · opened by <@{combat['opened_by']}>" if combat.get("opened_by") else ""
+            lines.append(f"Combat open in <#{combat['channel_id']}>{opened_by}.")
         if previous:
             lines.append(f"Previous endpoint: {previous.get('where_ended') or 'Not recorded'}")
         return fit_discord_lines(lines, label="session")

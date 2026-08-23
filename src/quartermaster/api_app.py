@@ -33,6 +33,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -67,6 +68,7 @@ from .db import SCHEMA_VERSION
 from .discord_common import Quartermaster
 from .export import render_export
 from .handles import HandleError
+from .integration import ProviderRequest, ProviderResult, ProviderTimeout
 from .inventory import InventoryError, SemanticStaleness
 from .loot import LootDropError
 from .operations import (
@@ -293,6 +295,74 @@ def characters(state: State, _: CurrentActor) -> dict[str, Any]:
 @router.get("/combat")
 def combat(state: State, _: CurrentActor) -> dict[str, Any]:
     return state.context.combat.status()
+
+
+@router.get("/combat/avrae")
+def avrae_combat(state: State, actor: CurrentActor) -> dict[str, Any]:
+    """Read Avrae status through the optional authenticated adapter.
+
+    Quartermaster's own combat record gates this call and supplies the
+    session/channel context. No Avrae state is copied into SQLite, and no
+    provider receipt is created because this first adapter operation is a
+    read. A timeout is returned as ``UNKNOWN`` so the client cannot mistake a
+    missing response for an inactive combat.
+    """
+
+    quartermaster_status = state.context.combat.status()
+    encounter = quartermaster_status.get("encounter")
+    if quartermaster_status.get("status") != "OPEN" or not isinstance(encounter, dict):
+        return {
+            "status": "NOT_QUERIED",
+            "provider": "avrae",
+            "quartermaster": quartermaster_status,
+            "result": None,
+        }
+
+    gateway = state.context.avrae_gateway
+    if gateway is None:
+        return {
+            "status": "NOT_CONFIGURED",
+            "provider": "avrae",
+            "quartermaster": quartermaster_status,
+            "result": None,
+            "error": "the Avrae status adapter is not configured",
+        }
+
+    channel_id = str(encounter["channel_id"])
+    request = ProviderRequest(
+        operation_id=f"status:{uuid4().hex}",
+        provider="avrae",
+        operation_kind="status",
+        actor_id=actor.id,
+        guild_id=state.settings.guild_id,
+        channel_id=channel_id,
+        session_id=str(quartermaster_status["session_id"]),
+        provider_reference=f"channel:{channel_id}",
+        correlation_id=f"qm:status:{uuid4().hex}",
+        payload={"source": "quartermaster-api"},
+    )
+    try:
+        result = gateway.execute(request).validate()
+    except ProviderTimeout as error:
+        result = ProviderResult(status="UNKNOWN", error=str(error) or "Avrae status is unknown")
+    except Exception as error:
+        # A read failure must not turn the Activity into a generic 500 page;
+        # the provider boundary still distinguishes a known failure from an
+        # unresolved timeout.
+        result = ProviderResult(status="FAILED", error=str(error) or "Avrae status failed")
+    return {
+        "status": result.status,
+        "provider": request.provider,
+        "operation_kind": request.operation_kind,
+        "operation_id": request.operation_id,
+        "correlation_id": result.correlation_id or request.correlation_id,
+        "provider_reference": result.provider_reference or request.provider_reference,
+        "provider_version": result.provider_version,
+        "result": dict(result.payload or {}),
+        "retryable": result.retryable,
+        "error": result.error,
+        "quartermaster": quartermaster_status,
+    }
 
 
 @router.get("/session/continuity")

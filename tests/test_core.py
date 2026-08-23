@@ -965,6 +965,27 @@ class QuartermasterCoreTests(unittest.TestCase):
         self.assertIn("Silvered Dagger x1", output)
         self.assertIn("Active session: 1", output)
 
+    def test_session_projection_reports_open_combat_context(self) -> None:
+        session = self.sessions.start_session()
+        with self.store.transaction() as connection:
+            connection.execute(
+                """INSERT INTO combat_encounters(
+                       id, session_id, channel_id, status, opened_by, opened_at
+                   ) VALUES ('encounter-1', ?, 'combat-channel', 'OPEN', 'dm', '2026-08-09T20:05:00Z')""",
+                (session["session_id"],),
+            )
+
+        from quartermaster.discord_projection import _content_for_state
+        from quartermaster.projections import render_state
+
+        payload = render_state(self.store, "session-surface")
+        self.assertEqual(
+            payload["combat"],
+            {"channel_id": "combat-channel", "opened_by": "dm"},
+        )
+        content = _content_for_state("session-surface", payload)
+        self.assertIn("Combat open in <#combat-channel> · opened by <@dm>.", content)
+
     def test_export_holds_the_record_every_truncated_surface_points_at(self) -> None:
         """Each list surface tells the reader the export holds the full record.
 
