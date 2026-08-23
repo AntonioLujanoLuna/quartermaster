@@ -291,7 +291,9 @@ function renderDiceResult(result) {
     block.append(element("p", "muted", `Natural ${result.natural}`));
   }
   if (result.recorded === false) {
-    block.append(element("p", "muted", "This roll was not added to the session log."));
+    block.append(element("p", "dice-status dice-private", "Private roll · not added to the session log."));
+  } else if (result.recorded === true || result.visibility === "PUBLIC") {
+    block.append(element("p", "dice-status", "Recorded in the session log."));
   }
   return block;
 }
@@ -307,6 +309,36 @@ function renderDiceScreen(state, handlers) {
     ),
   );
 
+  const presets = element("div", "dice-presets");
+  presets.setAttribute("role", "group");
+  presets.setAttribute("aria-label", "Common rolls");
+  presets.append(element("span", "dice-presets-label", "Common rolls"));
+  for (const preset of [
+    { label: "d20", expression: "d20", mode: "normal", title: "Fill the form with a normal d20" },
+    {
+      label: "Advantage",
+      expression: "d20",
+      mode: "advantage",
+      title: "Fill the form with an advantage d20",
+    },
+    {
+      label: "Disadvantage",
+      expression: "d20",
+      mode: "disadvantage",
+      title: "Fill the form with a disadvantage d20",
+    },
+  ]) {
+    presets.append(
+      button(preset.label, {
+        style: "quiet",
+        busy: state.busy,
+        title: preset.title,
+        onPress: () => handlers.setDicePreset(preset.expression, preset.mode),
+      }),
+    );
+  }
+  screen.append(presets);
+
   const form = element("div", "form dice-form");
   form.append(labelled("Roll", textField(state, "dice:expression", "d20 or 2d6+3", handlers)));
 
@@ -314,8 +346,12 @@ function renderDiceScreen(state, handlers) {
   modeLabel.append(element("span", "muted", "Mode"));
   const mode = element("select", "select");
   mode.dataset.inputKey = "dice:mode";
-  for (const value of ["normal", "advantage", "disadvantage"]) {
-    const option = element("option", null, value);
+  for (const [value, label] of [
+    ["normal", "Normal"],
+    ["advantage", "Advantage"],
+    ["disadvantage", "Disadvantage"],
+  ]) {
+    const option = element("option", null, label);
     option.value = value;
     option.selected = (state.inputs["dice:mode"] || "normal") === value;
     mode.append(option);
@@ -355,6 +391,13 @@ function renderDiceScreen(state, handlers) {
     }),
   );
   screen.append(form);
+  screen.append(
+    element(
+      "p",
+      "dice-guidance",
+      "Bonuses are explicit in the Roll field, for example d20+5. Automatic character bonuses will only appear after a verified character-sheet source is connected.",
+    ),
+  );
 
   if (state.dice?.last) {
     screen.append(element("h2", null, "Last roll"));
@@ -931,6 +974,13 @@ function renderCombatBlock(state, handlers) {
   // Quartermaster's own record and nothing Avrae owns: when it started, how
   // long it has run, and how it ended. The mechanics stay where they are.
   if (combat.status === "OPEN") {
+    block.append(
+      element(
+        "p",
+        "combat-source",
+        "Quartermaster records the encounter. Avrae owns initiative, attacks, spells, saves, HP, and conditions.",
+      ),
+    );
     block.append(
       element("p", null, `A fight has been open for ${Math.round(combat.encounter.elapsed_seconds)}s.`),
     );

@@ -1,6 +1,7 @@
 # Dice, Character Sheets, and Explainable Mechanics
 
-Status: Stage 1 Dice slice implemented locally; live Activity acceptance is still open.
+Status: Stage 1 Dice slice implemented and live-accepted in the Activity on 2026-08-23;
+second-client propagation remains open with the broader Activity release gate.
 Stages 2-5 remain proposed. This document does not authorize a local D&D mechanics engine.
 
 This is a post-v2.6 extension plan for the Activity and the existing Avrae boundary. It
@@ -100,8 +101,9 @@ return a readable refusal for malformed or excessive input.
 
 The Activity should present common actions as controls—**d20**, **Advantage**, **Disadvantage**,
 and **Custom roll**—so a player does not need to remember the grammar. The current first slice
-provides the bounded expression form and explicit mode selector; preset action buttons remain a
-small follow-up if table use shows they are valuable. The result should remain
+provides the bounded expression form, explicit mode selector, and safe d20, Advantage, and
+Disadvantage form presets. The presets fill the expression and mode without silently submitting a
+public roll. The result should remain
 usable when the live feed is unavailable; the header should say whether the roll was recorded
 and whether the table feed is currently live.
 
@@ -137,6 +139,12 @@ orientation, but it must not look current if the provider has not confirmed it.
 The first version should support one explicitly documented import/source path. It should not
 accept arbitrary client JSON as a character sheet, and it should not let a stale snapshot
 authorize a mechanic.
+
+Automatic bonus detection is deliberately not enabled by the roster or by a local helper. A
+character name is not a character sheet. Until a verified snapshot or provider result supplies
+the value, the player enters a bonus explicitly in the Dice expression (for example, `d20+5`).
+This keeps the displayed number explainable and prevents a second rules engine from quietly
+appearing in the Activity.
 
 Exit criteria:
 
@@ -268,16 +276,23 @@ Every stage needs both domain/API tests and a real Activity check. The important
 - mobile readability of the full breakdown.
 
 The first implementation slice is now locally complete at Stage 1. Stage 2 can follow once the Dice view has
-been used at the table. Stage 4 remains parked unless the group explicitly accepts the Avrae
-operational burden or a supported execution surface becomes available.
+been observed in real play rather than only in this acceptance run. Stage 4 remains parked unless the group
+explicitly accepts the Avrae operational burden or a supported execution surface becomes available.
+
+The Stage 1 live acceptance on 2026-08-23 used the configured Discord Activity after restarting
+the managed bot onto the current Dice route wiring. A public `d20+5` rendered as `d20: [17]`,
+modifier `+5`, total `22`, and natural `17`; a public advantage `d20` rendered both attempts
+and identified the counted one; a DM-only `d20` rendered its result but stated that it was not
+added to the session log. The two public results appeared in the Session 3 Discord history
+thread. This accepts the first Dice slice; it does not select a character-sheet contract.
 
 ## Immediate next implementation work
 
 1. Finish the current Activity release-gate checks that do not require new domain code.
-2. Live-accept the Stage 1 Dice slice: public roll, DM-only roll, readable breakdown, and one
-   recorded roll visible in session history.
-3. Observe which character values the table actually asks for before designing the import
-   contract. Do not build a complete character-sheet editor from assumptions.
+2. Use the accepted Stage 1 Dice slice in a real play session and observe which character
+   values the table actually asks for.
+3. Only after that observation, design the read-only character snapshot/import contract. Do
+   not build a complete character-sheet editor from assumptions.
 
 ## Explicitly not queued
 

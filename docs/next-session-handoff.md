@@ -193,14 +193,16 @@ live-accepted; a separate non-owner client and the forbidden-route refusal are s
 The repeated machine preflight passed all 13 checks, including the built page, both path
 forms, the trust boundary, and the live WebSocket upgrade.
 
-The first server-authoritative Dice slice is now implemented and locally validated. `POST
+The first server-authoritative Dice slice is implemented and live-accepted. `POST
 /api/dice/roll` accepts the bounded `d20`/`NdS±M` grammar, explicit advantage or disadvantage,
 public or DM-only visibility, labels, and an actor-scoped idempotency key. Public rolls are
 recorded against the active session and rendered through the shared narrative table; the
 Activity's Dice screen shows the individual dice, modifier, selected attempt, natural result,
 and total. Focused API/dice tests, the full suite, Ruff, and the Activity production build are
-green. It is not live-accepted yet: make one public roll, one DM-only roll, and one recorded
-session-history check before treating the screen as table-ready.
+green. On 2026-08-23, after restarting the stale pre-Dice bot process, the live Activity
+verified public `d20+5` (17 + 5 = 22), public advantage (both attempts and the counted one),
+and DM-only `d20` (19, explicitly not added to the session log). The two public rolls appeared
+in the Session 3 Discord history thread. A second-client Dice propagation check remains open.
 
 ## Fourteenth pass on 2026-08-21
 
@@ -1001,11 +1003,11 @@ other end of them:
     export is what a DM reads during an outage, and reading it inside the thing that is down
     is not the case it exists for — what is worth knowing is whether having it here at all
     is useful or merely available.
-41. Open **Dice** in the Activity and make a public `d20+5`, an advantage roll, and a DM-only
-    roll. Confirm the breakdown names the die values, modifier, selected attempt, and total;
-    the public roll appears in the session history, the DM-only roll does not, and a second
-    client sees the public update. This is the live acceptance for the locally implemented
-    Stage 1 Dice slice.
+41. **Partial — public/DM/history acceptance completed 2026-08-23.** Open **Dice** in the
+    Activity and make a public `d20+5`, an advantage roll, and a DM-only roll. The breakdown
+    named the die values, modifier, selected attempt, and total; both public rolls appeared in
+    the Session 3 history thread, and the DM-only roll did not. A second-client public-update
+    check remains open with the broader multi-client Activity gate.
 
 Runtime, unchanged by this pass and still unverified:
 
@@ -1096,10 +1098,12 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
    the one that should wait: what the bot keeps forever is a judgement about what people
    reach for outside a session, and nobody has been outside one yet.
 
-6. Live-accept the implemented server-authoritative Dice view described in [Dice, Character
-   Sheets, and Explainable Mechanics](dice-and-mechanics-plan.md), then observe which character
-   values the table actually asks for. Do not begin a local attack/spell rules engine while
-   Avrae remains the authority for D&D mechanics.
+6. Use the live-accepted server-authoritative Dice view described in [Dice, Character Sheets,
+   and Explainable Mechanics](dice-and-mechanics-plan.md) in a real play session, then observe
+   which character values the table actually asks for. The Dice view now includes safe d20,
+   Advantage, and Disadvantage form presets, explicit recorded/private status, and a clear
+   manual-bonus/source explanation. Do not begin a local attack/spell rules engine while Avrae
+   remains the authority for D&D mechanics.
 
 The Avrae extension spike is no longer a product priority: Gate 1 was answered "no, for now",
 so self-hosting, state-changing mechanics, and combat reference projections remain parked. The

@@ -65,7 +65,7 @@ npm run build
 cd ..
 ```
 
-`VITE_DISCORD_CLIENT_ID` has to be set for that build to mean anything — Vite replaces `import.meta.env` at build time, so without it the client id is statically undefined, the boot sequence returns on its first branch, and the bundler removes the whole application as unreachable. The build still succeeds. `preflight` below checks for exactly this, because a bundle of nothing is indistinguishable from a working one until Discord frames it.
+`VITE_DISCORD_CLIENT_ID` has to be set for that build to mean anything — Vite replaces `import.meta.env` at build time, so without it the client id is statically undefined and the boot sequence would return on its first branch. The Vite config now fails the build before emitting that unusable bundle. `preflight` below still checks the built page and its assets, because a stale bundle or wrong distribution directory can otherwise look like a hosting failure inside Discord.
 
 Set the Activity configuration alongside the existing values. The application ID is in the Developer Portal under General Information, the secret under OAuth2:
 
@@ -124,6 +124,14 @@ Cloudflare Quick Tunnel. The live acceptance verified:
 The expected refusal also worked before registration: taking from Party Stash
 without an active character returned `422 Unprocessable Content`. The successful
 mutation returned `200 OK`, and My Items showed the held item without a page reload.
+
+### Follow-up Dice acceptance (2026-08-23)
+
+The initial smoke run did not include Dice. After restarting the stale pre-Dice bot
+process onto the current checkout, the Activity verified a public `d20+5`, a public
+advantage roll, and a DM-only `d20`. The public results appeared in the Session 3
+history thread with their breakdowns; the DM-only result was shown as not recorded in
+the session log. A second-client Dice propagation check remains open.
 
 The quick-tunnel hostname is temporary. Recreate the URL mapping after a tunnel
 restart; use Tailscale Funnel or another stable HTTPS origin for a longer-running

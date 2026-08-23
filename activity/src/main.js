@@ -242,6 +242,12 @@ const handlers = {
     state.inputs[key] = value;
   },
 
+  setDicePreset(expression, mode) {
+    state.inputs["dice:expression"] = expression;
+    state.inputs["dice:mode"] = mode;
+    draw();
+  },
+
   dismissNotice() {
     state.notice = null;
     draw();

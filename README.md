@@ -142,7 +142,7 @@ follow-ups; the acceptance details and repeatable setup are in [the Activity run
 
 The next product layer is deliberately separate from the v2.6 continuity core:
 [Dice, Character Sheets, and Explainable Mechanics](docs/dice-and-mechanics-plan.md) now has
-its first Dice slice implemented locally, with live acceptance still open. It starts with a
+its first Dice slice live-accepted in the Activity on 2026-08-23. It starts with a
 server-authoritative Dice view, then adds read-only character explanations and only later
 considers provider-backed attacks, spells, and effects. The current Avrae boundary remains
 authoritative for D&D mechanics.

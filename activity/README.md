@@ -16,9 +16,9 @@ running where it runs and only the origin is rented.
 has the two free ways to get one, what to set, and what the first launch tested
 and left open.
 
-The Dice screen is locally validated but not yet live-accepted. It provides bounded
-server-authoritative rolls with an explainable breakdown; Avrae remains authoritative for
-attacks, spells, saves, HP, initiative, and conditions.
+The Dice screen was live-accepted on 2026-08-23. It provides bounded server-authoritative
+rolls with an explainable breakdown; Avrae remains authoritative for attacks, spells, saves,
+HP, initiative, and conditions.
 
 Everything about Stage 0 that does not involve Discord is a command:
 
@@ -162,8 +162,11 @@ Developer Portal application. It verified:
 - an active Discord-bound character could take one Party Stash item; and
 - the taken item appeared in My Items without a page reload.
 
-Dice was not part of that live smoke run; its public/DM-only visibility and session-history
-recording still need a live check.
+Dice was not part of that initial live smoke run. A follow-up Activity check on 2026-08-23
+verified a public `d20+5`, a public advantage roll, and a DM-only `d20`: the public rolls
+showed their breakdowns and appeared in the Session 3 history thread, while the DM-only roll
+was explicitly kept out of the session log. A second-client Dice propagation check remains
+open with the broader multi-client Activity gate.
 
 The negative case was also observed: a player without an active character was
 refused a take. The tunnel hostname is temporary and must be replaced in the URL
@@ -196,9 +199,8 @@ is never shadowed by a file.
 
 `VITE_DISCORD_CLIENT_ID` has to be set for the build to mean anything. Vite
 replaces `import.meta.env` at build time, so without it the client id is
-statically undefined, the boot sequence returns on its first branch, and the
-bundler removes the entire application as unreachable — a successful build of
-nothing. CI sets a placeholder for this reason.
+statically undefined and the boot sequence would return on its first branch.
+The Vite config now fails the build before emitting that unusable bundle.
 
 ## Where a DM control lives
 

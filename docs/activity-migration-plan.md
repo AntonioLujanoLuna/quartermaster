@@ -445,10 +445,13 @@ the complete DM evening remain live checks. This stage does not authorize a loca
 engine. See [the Dice and Mechanics plan](dice-and-mechanics-plan.md) for the staged path to
 explainable rolls and provider-backed actions.
 
-The first post-migration extension is now implemented locally: a sixth Activity screen, Dice,
-with a bounded server-authoritative roll API, idempotent retries, public/DM-only visibility,
-and session-history rendering. Its live acceptance remains open; it is tracked in [the Dice
-and Mechanics plan](dice-and-mechanics-plan.md), not folded into the Avrae authority boundary.
+The first post-migration extension is now implemented and live-accepted: a sixth Activity
+screen, Dice, with a bounded server-authoritative roll API, idempotent retries, public/DM-only
+visibility, and session-history rendering. The 2026-08-23 follow-up check verified public
+`d20+5` and advantage results in the Session 3 history thread and kept a DM-only roll out of
+that history. A second-client propagation check remains part of the broader Activity gate.
+The slice is tracked in [the Dice and Mechanics plan](dice-and-mechanics-plan.md), not folded
+into the Avrae authority boundary.
 
 **Stage 6 — Retire the panels.** Delete what Stage 4 and 5 replaced. Keep the entry point,
 the projection, and a deliberately small async surface (see below). *Exit:
