@@ -6,12 +6,15 @@ handshake, the live feed that keeps the screen current, four screens a player
 can act on — Party Stash, My Items, Loot, and Treasury, with the instance roster
 beside them — and everything a DM does, so that an evening needs no panel.
 
-None of it has been framed by Discord once. What is left of Stage 0 is a tunnel,
-a URL mapping, and a launch; it needs no paid hosting, because the bot keeps
+The first live Discord smoke acceptance completed on 2026-08-23. The Activity
+loaded from a voice channel, completed OAuth, opened its live WebSocket, and
+performed a successful Party Stash take into **My Items**. The acceptance used a
+temporary tunnel; a full evening, multi-client propagation, mobile layout, and a
+stable hostname remain open. It needs no paid hosting, because the bot keeps
 running where it runs and only the origin is rented.
 [Serving the Activity](../docs/runbook.md#serving-the-activity-without-paying-for-hosting)
-has the two free ways to get one, what to set, and what the first launch is
-really testing.
+has the two free ways to get one, what to set, and what the first launch tested
+and left open.
 
 Everything about Stage 0 that does not involve Discord is a command:
 
@@ -84,8 +87,9 @@ moving ten minutes ago.
 
 ## Configure the application in Discord's developer portal
 
-1. **OAuth2 → Redirects**: no redirect is needed; the Activity uses the
-   code grant through the SDK rather than a browser redirect.
+1. **OAuth2 → Redirects**: add `https://127.0.0.1` and save it. The Embedded
+   App SDK handles returning to the Activity, but Discord still requires a
+   registered redirect URI for the OAuth code grant.
 2. **Activities → Settings**: enable Activities for the application.
 3. **Activities → URL Mappings**: map the root prefix `/` to the host serving
    this app. Everything the client fetches goes through
@@ -143,6 +147,21 @@ cloudflared tunnel --url http://localhost:5173
 Put the tunnel's `https://…` hostname in the portal's URL Mappings, then launch
 the Activity from a voice channel in the configured guild.
 
+## Verified live smoke test
+
+The 2026-08-23 acceptance used a Cloudflare Quick Tunnel and the configured
+Developer Portal application. It verified:
+
+- the public health endpoint and the Activity page answered through the mapped origin;
+- Discord OAuth completed and the Activity opened its live WebSocket;
+- Party Stash, My Items, Loot, and Treasury loaded successfully;
+- an active Discord-bound character could take one Party Stash item; and
+- the taken item appeared in My Items without a page reload.
+
+The negative case was also observed: a player without an active character was
+refused a take. The tunnel hostname is temporary and must be replaced in the URL
+mapping after a Quick Tunnel restart.
+
 The dev server rewrites `/.proxy/api/*` to the API and strips the prefix, so the
 same paths work behind the real proxy and in development without the client
 knowing which it is in. It carries the WebSocket upgrade on the same prefix, so
@@ -198,6 +217,7 @@ the token per request, so the check is the API's, not the tab's.
 
 ## What is not here yet
 
-Stage 6: the panels are all still there. What the bot keeps forever is a
-judgement about what people reach for *outside* a session, and that is worth
-making after one has been played on the Activity rather than before.
+Stage 6: the panels are all still there. The initial Activity smoke test is
+complete, but what the bot keeps forever is a judgement about what people reach
+for *outside* a session; that is worth making after a full session has been
+played on the Activity rather than before.

@@ -182,11 +182,21 @@ class DiscordIdentityProvider:
 
     TOKEN_URL = "https://discord.com/api/oauth2/token"
     MEMBER_URL = "https://discord.com/api/users/@me/guilds/{guild_id}/member"
+    ACTIVITY_REDIRECT_URI = "https://127.0.0.1"
 
-    def __init__(self, *, client_id: str, client_secret: str, guild_id: str, session_factory: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        client_id: str,
+        client_secret: str,
+        guild_id: str,
+        redirect_uri: str = ACTIVITY_REDIRECT_URI,
+        session_factory: Any = None,
+    ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
         self.guild_id = guild_id
+        self.redirect_uri = redirect_uri
         self._session_factory = session_factory
 
     def _session(self) -> Any:
@@ -208,6 +218,7 @@ class DiscordIdentityProvider:
                     "client_secret": self.client_secret,
                     "grant_type": "authorization_code",
                     "code": code,
+                    "redirect_uri": self.redirect_uri,
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             ) as response:

@@ -1,16 +1,13 @@
 # Moving the table surface into a Discord Activity
 
-Status: Stages 1, 2, 3, 4, and 5 implemented and driven end to end against a
-real server — a real socket, real SQLite, the real service layer — with
-Discord's code exchange as the only faked part. None of them has been run
-against the guild, because that is what Stage 0 is for. Stage 0's answer is
-written down in [the runbook](runbook.md), and its machine half is now carried
-out and repeatable: `python -m quartermaster preflight` serves the application
-and checks every Stage 0 property that does not require Discord. What remains
-of it is a tunnel, a URL mapping, and a launch, none of which any code can do.
-Stage 6 is proposed, and should stay proposed until a session has been played
-on the Activity: it deletes the panels, and what the bot keeps is a judgement
-only real use can make.
+Status: Stages 1, 2, 3, 4, and 5 are implemented and driven end to end against a
+real server — a real socket, real SQLite, and the real service layer. The first
+Discord Activity smoke acceptance completed on 2026-08-23: the OAuth exchange,
+live WebSocket, player reads, active-character binding, and a Party Stash take
+were exercised in the configured guild through a temporary HTTPS tunnel. A full
+evening, multi-client propagation, mobile layout, and the DM Activity surface
+remain to be verified. Stage 6 is proposed and should stay proposed until that
+real use supplies the judgement for retiring the panels.
 
 ## Why
 
@@ -296,15 +293,14 @@ only when the Activity is enabled — the export CLI must keep running without t
 
 Each stage is independently shippable and leaves the bot working.
 
-**Stage 0 — Hosting.** Not code, and the real blocker. Today Quartermaster is one process
-with a SQLite file and a Windows startup script (`docs/runbook.md`). An Activity needs a
-publicly reachable HTTPS origin with a real certificate. Decide where it runs and how the
-database is backed up there before writing frontend code. *Exit: an origin exists and
-serves a static page through the Discord proxy.* **Half met: the page, the API, and the
-socket are served and verified on this machine by `preflight`; the origin in front of them
-is a tunnel, a mapping, and a launch, and those are still to do.**
+**Stage 0 — Hosting.** *Smoke exit met on 2026-08-23.* Today Quartermaster is one process
+with a SQLite file and a Windows startup script (`docs/runbook.md`). The Activity needs a
+publicly reachable HTTPS origin with a real certificate; the first live acceptance used a
+Cloudflare Quick Tunnel, a Developer Portal URL mapping, and the existing local process.
+*Exit: an origin exists and serves a static page through the Discord proxy.* **Met for the
+smoke acceptance; a stable hostname and production hosting decision remain deferred.**
 
-*Answered, not yet carried out.* The decision this stage was waiting on was framed as
+*Answered and carried out for the smoke acceptance.* The decision this stage was waiting on was framed as
 "where does this move to," and the answer is that it does not move. One process, one SQLite
 writer, and a bot holding a gateway connection is the wrong shape for a free web tier —
 those sleep an idle service and hand it an ephemeral disk, so the choice was between paying
@@ -323,11 +319,12 @@ wants a policy file it can write to. Both are written up in
 commitment: the mapping is one field in the Developer Portal, so moving to a paid origin
 later changes a hostname and nothing else.
 
-*Carried out, as far as this side goes.* The stage splits cleanly in two, and the split is
+*Carried out for the initial live acceptance.* The stage splits cleanly in two, and the split is
 worth naming because only one half was ever about hosting. The half that is a fact about
-Discord — a tunnel is up, a mapping points at it, the app is installed in the guild — is
-still three manual steps and is written out in the runbook. The half that is a fact about
-this machine is now a command, `preflight`, and it found two things that would have
+Discord — a tunnel was up, a mapping pointed at it, and the app was launched in the guild —
+was completed for the smoke test. The steps remain manual after each Quick Tunnel restart
+and are written out in the runbook. The half that is a fact about this machine is now a
+command, `preflight`, and it found two things that would have
 surfaced as a blank frame:
 
 - **The live feed could not be served at all.** `websockets` is in the `activity` extra and
@@ -354,31 +351,30 @@ Every read in the table above is reachable, `actor_id` comes only from a signed 
 the home composition moved to `snapshots` so both surfaces read one of it. *Exit met:
 `pytest -q` and `ruff check .` green.*
 
-**Stage 2 — Walking skeleton.** *Built, not yet launched.* `activity/` holds the SDK
+**Stage 2 — Walking skeleton.** *Smoke-accepted live on 2026-08-23; broader UX remains open.* `activity/` holds the SDK
 handshake and one read-only Party Stash screen with the instance roster beside it. The
 build is served by the API itself under `QM_ACTIVITY_DIST`, so the page and its data share
-an origin and one URL mapping covers both. *Exit still open: it needs an https origin and
-a real launch in the guild — see Stage 0.* Serving is now proved rather than assumed: the
+an origin and one URL mapping covers both. *Initial launch exit met; mobile and broader
+table flows remain open.* Serving is now proved rather than assumed: the
 built page, its assets, and the API all answer on one origin under both path forms, which
 is what "one URL mapping covers both" was claiming. Nothing needs registering to launch it
 — Discord creates the Entry Point command when Activities is enabled, and it is global,
 while the bot syncs guild commands only, so `/quartermaster` and the panels are unaffected
 in both directions.
 
-**Stage 3 — Live feed.** *Built, not yet launched.* `api_live` holds the pump and the
+**Stage 3 — Live feed.** *Smoke-accepted live on 2026-08-23; multi-client and reconnect flows remain open.* `api_live` holds the pump and the
 subscriptions, `/api/live` is the socket, and `activity/src/live.js` is the client that
 reconnects from its cursor and answers a notification by refetching. The screen says whether
-it is live, because a surface that reads live has to say when it has stopped. *Exit still
-open: `tests/test_api.py` proves a grant made through the service layer reaches an open
-socket, which is the criterion as far as a test can carry it — the rest of it is a grant
-issued from the bot in the guild appearing on a screen in Discord, and that needs Stage 0.*
+it is live, because a surface that reads live has to say when it has stopped. *Initial
+launch exit met: the Activity opened the socket and displayed `Live`; bot-side propagation,
+reconnect, and token-refresh behaviour remain open.*
 
 Session tokens last an hour and an evening does not, so the client now re-runs the handshake
 when one is refused rather than going quiet — on the socket and on the reads both. That gap
 existed from Stage 1; a live screen is what made it visible, because a screen that stops
 reading still looks connected.
 
-**Stage 4 — Player mutations.** *Built, not yet launched.* Take, give, use, claim, coin,
+**Stage 4 — Player mutations.** *Smoke-accepted live on 2026-08-23; full player coverage remains open.* Take, give, use, claim, coin,
 character registration — the mutation table above, `activity/src/actions.js` as the client
 half, and four screens to act on. The first stage where a handle round-trips through the
 new transport, and the stage that decided when a handle is minted at all.
@@ -401,7 +397,7 @@ read, the handle round trip, a stale take answered on the confirm route, a spent
 refused, a replayed key returning its own receipt, another actor's key not returning it,
 and a body naming an actor being ignored rather than obeyed.
 
-**Stage 5 — DM surface.** *Built, not yet launched.* Grant, corrections, drops,
+**Stage 5 — DM surface.** *Built; Activity DM workflows remain unverified live.* Grant, corrections, drops,
 treasury adjustment and split, session start and end, combat, the roster's
 lifecycle and estates, and maintenance. Thirteen routes, the DM half of
 `activity/src/actions.js`, and a fifth screen.

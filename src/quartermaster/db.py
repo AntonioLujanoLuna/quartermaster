@@ -423,7 +423,21 @@ class SQLiteStore:
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA synchronous = FULL")
         self.connection.execute("PRAGMA busy_timeout = 2500")
-        self.apply_migrations()
+        try:
+            self.apply_migrations()
+        except BaseException:
+            # A failed migration can happen before the caller owns the store
+            # and therefore cannot call close(). Release the connection here,
+            # especially on Windows where the open handle prevents cleanup of
+            # the database and its WAL sidecars.
+            connection = self.connection
+            self.connection = None
+            if connection is not None:
+                try:
+                    connection.close()
+                except sqlite3.Error:
+                    pass
+            raise
         return self
 
     def close(self) -> None:

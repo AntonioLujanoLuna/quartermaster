@@ -93,10 +93,11 @@ Every check has to pass before a hostname is worth putting in a URL mapping. Eac
 Start the tunnel, then the bot, then configure the Developer Portal:
 
 1. **Settings → enable Activities.**
-2. **URL Mappings → root mapping `/`** → the tunnel hostname, without the scheme. One mapping is enough: the built page and the API share an origin, because the API serves `QM_ACTIVITY_DIST` at `/` and its own routes under `/api`.
+2. **OAuth2 → Redirects** → add `https://127.0.0.1` and save it. Discord requires a registered redirect URI for the Activity OAuth code grant; the SDK handles the return to the embedded frame.
+3. **URL Mappings → root mapping `/`** → the tunnel hostname, without the scheme. One mapping is enough: the built page and the API share an origin, because the API serves `QM_ACTIVITY_DIST` at `/` and its own routes under `/api`.
 
    The client addresses every call as `/.proxy/api/...`, which the proxy forwards to `/api/...` here; since 2025-07-30 the prefix is optional and an unprefixed path is forwarded the same way. The API answers on both, so the mapping does not depend on which behaviour is live — and so the built page can be opened straight from the bind for a smoke test, with no proxy in front of it.
-3. **Entry Point command.** Discord creates a "Launch" command automatically when Activities is enabled, so there is nothing to register. It is a global command and the bot syncs guild commands only, so `/quartermaster` and the panels are unaffected in both directions.
+4. **Entry Point command.** Discord creates a "Launch" command automatically when Activities is enabled, so there is nothing to register. It is a global command and the bot syncs guild commands only, so `/quartermaster` and the panels are unaffected in both directions.
 
 Confirm the origin before opening Discord at all:
 
@@ -108,16 +109,39 @@ curl https://<hostname>/api/health
 
 Then launch it from the App Launcher in a voice channel.
 
-### What the first launch is actually testing
+### Verified live smoke test (2026-08-23)
 
-Stages 1 to 4 are built and tested, and `preflight` proves everything about them that does not involve Discord: the handshake, the reads, the mutations, the handle round trip, and the live feed have all been driven against a real server on a real socket. What is left is the part where Discord is the other end, and all of it is cheap to find out now and expensive to find out mid-session:
+The first Discord launch was completed against the configured guild using a
+Cloudflare Quick Tunnel. The live acceptance verified:
 
-- The page loading inside the iframe at all — the URL mapping and the client's content security policy.
-- The OAuth handshake completing against `/api/token`. Everything but the code exchange itself is covered; the exchange is the one call that has only ever been made against a fake.
-- **The WebSocket upgrading through Discord's proxy.** This is the one most likely to bite, and the one with the most built on top of it: `api_live.py` and `activity/src/live.js` were both written against an assumption about it. If it does not survive the proxy, the fallback is polling the reads on a timer, and the change stays inside those two files.
-- The layout on a phone, if anyone at the table plays from one.
+- the public health endpoint and the Activity page through the Developer Portal URL mapping;
+- the OAuth code exchange through `/api/token`;
+- a live `/api/live` WebSocket connection;
+- successful reads for Party Stash, My Items, Loot, and Treasury; and
+- a complete player mutation: after registering an active Discord-bound character,
+  `Take 1` moved one `Handoff Loot Gem` from Party Stash to My Items.
 
-A failure in any of these costs no domain code and no stored state — which is what made it reasonable to build the player and DM surfaces before carrying this out, and is still the reason to carry it out before deleting anything.
+The expected refusal also worked before registration: taking from Party Stash
+without an active character returned `422 Unprocessable Content`. The successful
+mutation returned `200 OK`, and My Items showed the held item without a page reload.
+
+The quick-tunnel hostname is temporary. Recreate the URL mapping after a tunnel
+restart; use Tailscale Funnel or another stable HTTPS origin for a longer-running
+campaign.
+
+### What remains after the first live launch
+
+The smoke test covered the first launch and one positive player mutation. The
+following still need a broader table session or additional clients:
+
+- two clients receiving a bot-side change simultaneously;
+- reconnect and token-refresh behaviour after interruption or expiry;
+- mobile layout and backgrounding behaviour;
+- the full DM workflow without opening `/quartermaster`; and
+- a complete evening, including session, loot, treasury, combat, and continuity flows.
+
+A failure in any of these costs no domain code and no stored state, but they
+should be answered before retiring the existing panel surface.
 
 ## Health and maintenance
 

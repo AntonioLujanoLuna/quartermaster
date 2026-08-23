@@ -1,6 +1,6 @@
 # Next-session handoff
 
-Updated: 2026-08-21 · Schema 12
+Updated: 2026-08-23 · Schema 12
 
 ## How to use this document
 
@@ -163,6 +163,21 @@ on every pull request, and CI builds the Activity bundle — with `VITE_DISCORD_
 set, which matters: without it the client id is statically undefined, `boot()` returns on
 its first line, and Vite tree-shakes the entire application out of the bundle it just
 proved compiles.
+
+## Live Activity acceptance on 2026-08-23
+
+The first Discord Activity smoke acceptance is complete. A temporary Cloudflare Quick
+Tunnel was mapped in the Developer Portal and launched from the configured voice channel.
+The Activity completed the OAuth code exchange, opened `/api/live`, showed `Live`, and
+loaded Party Stash, My Items, Loot, and Treasury. Before registration, a take correctly
+returned the active-character refusal. After registering `Activity Bound Character` to the
+Discord user, `Take 1` moved one `Handoff Loot Gem` from Party Stash to My Items; the
+successful commit returned `200 OK` and the held item appeared without a reload.
+
+This proves the first-launch path and one end-to-end player mutation. It does not yet prove
+multi-client propagation, reconnect or token refresh, mobile layout, the Activity DM
+screens, or a full evening run. The temporary tunnel hostname must be remapped after a
+Quick Tunnel restart.
 
 ## Fourteenth pass on 2026-08-21
 
@@ -895,14 +910,14 @@ Panel surface:
 12. **Combat**, and confirm the handoff cards are open to players while Start and End are not
     even rendered for them.
 
-Activity surface. None of it has run against Discord, and none of it can until the manual
-half of Stage 0 — a tunnel, a URL mapping, a launch — is carried out; the machine half is
-done and `python -m quartermaster preflight` re-checks it in a few seconds. Everything here
-is a question neither the test suite nor `preflight` can ask, because Discord is the other
-end of all of them:
+Activity surface. The first-launch smoke test is complete, including OAuth, the live
+WebSocket, the player reads, and one successful stash take. The broader scenarios below
+remain questions neither the test suite nor `preflight` can answer, because Discord is the
+other end of them:
 
-23. Launch the Activity from a voice channel in the guild and confirm the handshake
-    completes, the Party Stash renders, and the roster names who is actually present.
+23. **Smoke-accepted 2026-08-23.** Launch the Activity from a voice channel in the guild and
+    confirm the handshake completes, the Party Stash renders, and the roster names who is
+    actually present. The remaining launch work is to repeat this on mobile.
 24. With two clients open, grant an item from `/quartermaster` and confirm both screens
     change without anyone touching them, and that the header says `Live` on both. This is
     Stage 3's exit criterion, and the half of it a test cannot reach.
@@ -918,9 +933,10 @@ end of all of them:
 28. Watch the log through an evening for live-feed lines. What is worth knowing is whether
     the wake-on-commit ever misses — the 30-second poll would cover it silently — and whether
     a reset is ever issued to a client that was merely slow rather than gone.
-29. Take something from the Activity and read the session log line it produces beside one a
-    panel produced. The ledger should not be able to tell which surface acted, and this is
-    Stage 4's exit criterion for the half a test can only approximate.
+29. **The stash take was smoke-accepted 2026-08-23.** Read the session log line it produces
+    beside one a panel produced. The ledger should not be able to tell which surface acted,
+    and this comparison remains Stage 4's exit criterion for the half a test can only
+    approximate.
 30. Have two players press **Take all** on the same stack at the same moment. One of them
     should get the question, and it should read as a genuine conflict rather than as an
     error. This is the only path in the product with no live evidence behind it at all, and
@@ -1012,6 +1028,10 @@ Runtime, unchanged by this pass and still unverified:
   token lives only in `QM_DISCORD_TOKEN` and is not stored in Git, this document, or chat.
 - The bot runs under the managed Windows supervisor wrapper.
 - Backups are local-only by policy: leave `QM_BACKUP_OFF_DEVICE_DIRECTORY` unset.
+- Activities are enabled for application `1536120052871602256`.
+- OAuth2 Redirects includes `https://127.0.0.1`.
+- The root Activity URL mapping points to the current Quick Tunnel hostname; it is temporary
+  and must be updated after the tunnel restarts.
 
 ## Deliberate test state
 
@@ -1020,9 +1040,10 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
 
 ## Next priorities
 
-1. Work through "Not yet verified live" above. This is now a release-gate item in the
-   implementation plan rather than a wish: everything else on that gate is answerable from
-   CI, and none of it can tell you a control is in the wrong place.
+1. Work through the remaining items in "Not yet verified live" above. The first-launch
+   smoke path is now green, so the release-gate questions are multi-client freshness,
+   reconnect and token refresh, mobile layout, Activity DM placement, and one complete
+   evening.
 2. Play one session on the panel and watch where the DM hesitates. The surface pass replaced
    a command list with a shape, and a shape is only right if the thing you want next is
    already on screen — how many presses a real grant, a real take, and a real end-of-session
@@ -1032,16 +1053,10 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
    observation is worth more than any further combat feature.
 4. Choose evidence-based latency and freshness budgets from observed play if the current
    estimates prove wrong.
-5. Carry out what is left of Stage 0 of the Activity migration: open a tunnel, map the
-   hostname in the Developer Portal, and launch the Activity in the guild once. The question
-   the stage was waiting on — where it runs, and how the database is backed up there — is
-   answered in [the runbook](runbook.md#serving-the-activity-without-paying-for-hosting):
-   nothing moves, the bot keeps running where it runs, and only the origin is rented. The
-   machine half is carried out and repeatable as `python -m quartermaster preflight`, which
-   serves the real application and checks every Stage 0 property that does not need Discord.
-   Three manual steps are left, and no code moves any of them. This is now the only thing
-   between the Activity and a real evening: Stages 1 through 5 are built, and every one of
-   their exit criteria that is still open is open because it needs a launch.
+5. Decide whether the temporary Quick Tunnel is sufficient for continued testing or whether
+   to install a stable HTTPS origin such as Tailscale Funnel. The machine stays where it is
+   and the backups stay local; only the public hostname changes. The repeatable setup and
+   the completed smoke evidence are in [the runbook](runbook.md#serving-the-activity-without-paying-for-hosting).
 
    Stage 5 was built before that launch, as Stage 4 was, and on the same reasoning: it adds
    no domain code and every route is a call a panel already makes, so if the hosting answer
