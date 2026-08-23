@@ -35,6 +35,7 @@ const state = {
   loot: null,
   treasury: null,
   combat: null,
+  dice: { rolls: [], last: null },
   continuity: null,
   // What `health` or `export` last printed. It is a document rather than a
   // notice: nobody reads a health report in the corner of a screen.
@@ -92,6 +93,10 @@ const READERS = {
   continuity: async () => {
     state.continuity = await api.continuity();
   },
+  dice: async () => {
+    const last = state.dice?.last ?? null;
+    state.dice = { ...(await api.diceRolls()), last };
+  },
 };
 
 // What each screen needs on top of the two every screen needs. Reading only
@@ -105,6 +110,7 @@ const SCREEN_READS = {
   // The roster is read for every screen already; the fight is not, and it is
   // the only thing the DM screen needs that nothing else asks for.
   dm: ["combat"],
+  dice: ["dice"],
 };
 
 async function refresh() {
@@ -409,6 +415,22 @@ const handlers = {
   closeCombat(outcome) {
     run(async () => {
       if (await actions.closeCombat((outcome || "").trim())) clearInputs("combat:");
+    });
+  },
+
+  rollDice(expression, mode, label, visibility) {
+    const value = (expression || "").trim();
+    if (!value) {
+      notify("bad", "Enter a dice expression such as d20 or 2d6+3.");
+      return;
+    }
+    run(async () => {
+      const result = await actions.rollDice(value, mode, (label || "").trim(), visibility);
+      if (result) {
+        state.dice.last = result;
+        clearInputs("dice:");
+        draw();
+      }
     });
   },
 

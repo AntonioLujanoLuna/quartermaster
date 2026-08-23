@@ -20,6 +20,12 @@ The plan deliberately separates three ambitions:
 
 The first two are Quartermaster work. The third requires an Avrae-side integration surface and must not be assumed to exist in the hosted Avrae bot.
 
+The proposed player-facing extension is documented separately in
+[Dice, Character Sheets, and Explainable Mechanics](dice-and-mechanics-plan.md). That plan
+starts with a Quartermaster-owned general Dice view, but keeps Avrae authoritative for native
+D&D attacks, spells, saves, HP, initiative, conditions, and resources. It does not reopen
+Gate 1 by implication.
+
 ## Implementation slice 1: durable provider boundary
 
 Quartermaster now has a schema-9 `provider_operations` record linked by operation and interaction IDs to the existing receipt protocol. It records the authenticated actor, guild, channel, session, operation kind, provider reference, correlation ID, integration/provider versions, request payload, and one of `REQUESTED`, `COMMITTED`, `FAILED`, or `UNKNOWN`.

@@ -59,6 +59,14 @@ def _combat_closed_line(payload: Mapping[str, Any]) -> str:
     return sentence + (f": {payload['outcome']}." if payload.get("outcome") else ".")
 
 
+def _dice_rolled_line(payload: Mapping[str, Any]) -> str:
+    expression = payload.get("expression", "dice")
+    label = payload.get("label") or expression
+    mode = payload.get("mode")
+    qualifier = f" ({mode})" if mode in {"advantage", "disadvantage"} else ""
+    return f"{label}: {payload['total']} from {expression}{qualifier}."
+
+
 # Every event that reaches a person renders through this table. An event type
 # that is missing from it still delivers and still exports, as its raw JSON
 # payload — which is how a Discord user ID or an internal UUID ends up read out
@@ -99,6 +107,7 @@ EVENT_RENDERERS: dict[str, Callable[[Mapping[str, Any]], str]] = {
     ),
     "COMBAT_OPENED": lambda payload: f"Combat opened in <#{payload['channel_id']}>.",
     "COMBAT_CLOSED": _combat_closed_line,
+    "DICE_ROLLED": _dice_rolled_line,
 }
 
 

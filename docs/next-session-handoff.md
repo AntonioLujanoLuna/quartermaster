@@ -143,8 +143,8 @@ tree-shaken away, both path forms, the page and its assets, the refusal of an
 unauthenticated read, and that `/api/live` upgrades and refuses a token this process did
 not sign.
 
-`activity/` is the frontend: the SDK handshake, five screens — Party Stash, My Items, Loot,
-Treasury, and a DM screen only a DM is shown — the instance roster beside them, a
+`activity/` is the frontend: the SDK handshake, six screens — Party Stash, My Items, Loot,
+Treasury, Dice, and a DM screen only a DM is shown — the instance roster beside them, a
 reconnecting socket that resumes from its cursor, a header that says whether it is live,
 and a re-handshake when a session token is refused. A player takes, gives, uses, claims,
 and moves coin from it.
@@ -160,7 +160,8 @@ one, because a form has no component budget to spend. Every one of those routes 
 by the API for a token that does not say DM, so a screen that renders none of them is a
 courtesy rather than the check.
 
-**Checks.** 380 tests pass under `uv run pytest -q`; `ruff check` is clean. Both run in CI
+**Checks.** 406 tests pass under `uv run pytest -q`; `ruff check` is clean. The Activity
+production build also passes with `npm run build`. Both run in CI
 on every pull request, and CI builds the Activity bundle — with `VITE_DISCORD_CLIENT_ID`
 set, which matters: without it the client id is statically undefined, `boot()` returns on
 its first line, and Vite tree-shakes the entire application out of the bundle it just
@@ -177,9 +178,29 @@ Discord user, `Take 1` moved one `Handoff Loot Gem` from Party Stash to My Items
 successful commit returned `200 OK` and the held item appeared without a reload.
 
 This proves the first-launch path and one end-to-end player mutation. It does not yet prove
-multi-client propagation, reconnect or token refresh, mobile layout, the Activity DM
-screens, or a full evening run. The temporary tunnel hostname must be remapped after a
+multi-client propagation, reconnect or token refresh, mobile layout, a non-owner player's
+DM refusal, or a full evening run. The temporary tunnel hostname must be remapped after a
 Quick Tunnel restart.
+
+The first smoke run also exposed a real authority mismatch: `/quartermaster` recognized the
+server owner as a DM, while the Activity initially showed only the four player tabs. The
+Activity token now combines configured DM roles with a bot-authoritative guild-owner check;
+when the gateway cache has no `owner_id`, it fetches the guild before deciding. After a bot
+restart and a fresh Activity launch, the live log recorded an owner match and the owner saw
+the fifth **DM** tab, the **GRANT TO THE PARTY STASH** control, and the DM screen with session,
+combat, health, maintenance, and export controls. The owner DM path is therefore
+live-accepted; a separate non-owner client and the forbidden-route refusal are still open.
+The repeated machine preflight passed all 13 checks, including the built page, both path
+forms, the trust boundary, and the live WebSocket upgrade.
+
+The first server-authoritative Dice slice is now implemented and locally validated. `POST
+/api/dice/roll` accepts the bounded `d20`/`NdS±M` grammar, explicit advantage or disadvantage,
+public or DM-only visibility, labels, and an actor-scoped idempotency key. Public rolls are
+recorded against the active session and rendered through the shared narrative table; the
+Activity's Dice screen shows the individual dice, modifier, selected attempt, natural result,
+and total. Focused API/dice tests, the full suite, Ruff, and the Activity production build are
+green. It is not live-accepted yet: make one public roll, one DM-only roll, and one recorded
+session-history check before treating the screen as table-ready.
 
 ## Fourteenth pass on 2026-08-21
 
@@ -961,8 +982,9 @@ other end of them:
     it, split the treasury, end the session with a real endpoint. This is Stage 5's exit
     criterion, and the only thing that can answer it. Note every point at which you reach
     for a panel anyway — that is the list of what the DM screen has in the wrong place.
-36. Confirm a player launching the Activity sees four tabs and no DM tab, and that the DM
-    sees five. Then have the player press something a DM control would reach — the browser
+36. The server-owner side is smoke-accepted: it sees six tabs, the DM screen, and the
+    Party Stash grant control. Still confirm a non-owner player sees five tabs and no DM
+    tab, then have that player press something a DM control would reach — the browser
     console is enough — and confirm the API refuses it rather than the screen having been
     the only thing stopping them.
 37. Grant from the Activity while a second client has the Party Stash open, and read the
@@ -979,6 +1001,11 @@ other end of them:
     export is what a DM reads during an outage, and reading it inside the thing that is down
     is not the case it exists for — what is worth knowing is whether having it here at all
     is useful or merely available.
+41. Open **Dice** in the Activity and make a public `d20+5`, an advantage roll, and a DM-only
+    roll. Confirm the breakdown names the die values, modifier, selected attempt, and total;
+    the public roll appears in the session history, the DM-only roll does not, and a second
+    client sees the public update. This is the live acceptance for the locally implemented
+    Stage 1 Dice slice.
 
 Runtime, unchanged by this pass and still unverified:
 
@@ -1043,9 +1070,9 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
 ## Next priorities
 
 1. Work through the remaining items in "Not yet verified live" above. The first-launch
-   smoke path is now green, so the release-gate questions are multi-client freshness,
-   reconnect and token refresh, mobile layout, Activity DM placement, and one complete
-   evening.
+   smoke path and the server-owner DM path are now green, so the release-gate questions are
+   multi-client freshness, reconnect and token refresh, mobile layout, non-owner DM refusal,
+   and one complete evening.
 2. Play one session on the panel and watch where the DM hesitates. The surface pass replaced
    a command list with a shape, and a shape is only right if the thing you want next is
    already on screen — how many presses a real grant, a real take, and a real end-of-session
@@ -1068,6 +1095,11 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
    item 35 of the checklist rather than by waiting. Stage 6, which deletes the panels, is
    the one that should wait: what the bot keeps forever is a judgement about what people
    reach for outside a session, and nobody has been outside one yet.
+
+6. Live-accept the implemented server-authoritative Dice view described in [Dice, Character
+   Sheets, and Explainable Mechanics](dice-and-mechanics-plan.md), then observe which character
+   values the table actually asks for. Do not begin a local attack/spell rules engine while
+   Avrae remains the authority for D&D mechanics.
 
 The Avrae extension spike is no longer a product priority: Gate 1 was answered "no, for now",
 so self-hosting, state-changing mechanics, and combat reference projections remain parked. The

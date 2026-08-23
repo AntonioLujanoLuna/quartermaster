@@ -15,6 +15,7 @@ from .combat import CombatService
 from .config import Settings
 from .currency import CurrencyService
 from .db import SQLiteStore
+from .dice import DiceService
 from .discord_commands import register_commands
 from .discord_common import (
     BotServices,
@@ -47,6 +48,7 @@ def assemble_services(
     """
     loot = LootDropService(store, receipts, handles)
     combat = CombatService(store, receipts)
+    dice = DiceService(store, receipts)
     return BotServices(
         store=store,
         receipts=receipts,
@@ -56,6 +58,7 @@ def assemble_services(
         currency=CurrencyService(store, receipts, handles=handles),
         loot=loot,
         combat=combat,
+        dice=dice,
     )
 
 
@@ -76,6 +79,7 @@ def context_for(settings: Settings, services: BotServices) -> Quartermaster:
         combat=services.combat or CombatService(services.store, services.receipts),
         handoff=services.avrae_handoff or AvraeHandoffService(services.store),
         avrae_gateway=gateway_for_settings(settings),
+        dice=services.dice or DiceService(services.store, services.receipts),
     )
 
 
@@ -119,7 +123,26 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
             # them for a table that has not enabled the Activity.
             from .api_server import serve_api
 
-            api_task = asyncio.create_task(serve_api(context, stop_event))
+            async def owner_checker(user_id: str) -> bool:
+                try:
+                    configured_guild = bot.get_guild(int(settings.guild_id))
+                    if configured_guild is None or configured_guild.owner_id is None:
+                        configured_guild = await bot.fetch_guild(int(settings.guild_id))
+                    is_owner = configured_guild.owner_id == int(user_id)
+                    logger.info(
+                        "Activity guild-owner check: user=%s owner=%s result=%s",
+                        user_id,
+                        configured_guild.owner_id,
+                        is_owner,
+                    )
+                    return is_owner
+                except (discord.HTTPException, ValueError):
+                    logger.warning("Activity guild-owner check failed for user=%s", user_id)
+                    return False
+
+            api_task = asyncio.create_task(
+                serve_api(context, stop_event, owner_checker=owner_checker)
+            )
         elif settings.activity_half_configured:
             # A configuration that half arrived rather than a table that has not
             # enabled the Activity — most often a value that never reached the

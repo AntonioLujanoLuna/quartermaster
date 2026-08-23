@@ -144,6 +144,9 @@ class ApiTestCase(unittest.TestCase):
                 "dm-code": Identity(
                     user_id=DM_ID, guild_roles=("1", DM_ROLE_ID), access_token="discord-dm-token"
                 ),
+                "owner-code": Identity(
+                    user_id=DM_ID, guild_roles=("1",), is_owner=True, access_token="discord-owner-token"
+                ),
             }
         )
         self.tokens = SessionTokens(CLIENT_SECRET, ttl_seconds=3600)
@@ -213,6 +216,9 @@ class TokenExchangeTests(ApiTestCase):
     def test_dm_authority_comes_from_the_guild_roles_discord_reported(self) -> None:
         self.assertTrue(self.authenticate("dm-code")["is_dm"])
         self.assertFalse(self.authenticate("player-code")["is_dm"])
+
+    def test_guild_owner_has_dm_authority_without_a_configured_role(self) -> None:
+        self.assertTrue(self.authenticate("owner-code")["is_dm"])
 
     def test_a_rejected_code_is_not_a_session(self) -> None:
         response = self.client.post("/api/token", json={"code": "forged", "instance_id": None})
@@ -309,6 +315,7 @@ class ReadSurfaceTests(ApiTestCase):
             "/api/characters",
             "/api/combat",
             "/api/session/continuity",
+            "/api/dice/rolls",
             "/api/export",
         ):
             with self.subTest(path=path):
@@ -326,6 +333,76 @@ class ReadSurfaceTests(ApiTestCase):
         body = self.client.get("/api/health").json()
         self.assertEqual(body["status"], "ok")
         self.assertNotIn("stash_count", body)
+
+
+class DiceApiTests(ApiTestCase):
+    def start_session(self) -> None:
+        response = self.post("/api/session/start", code="dm-code")
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def roll(self, *, code: str = "player-code", key: str = "dice-roll"):
+        return self.post(
+            "/api/dice/roll",
+            {"expression": "d20+5", "label": "Check", "visibility": "PUBLIC"},
+            code=code,
+            key=key,
+        )
+
+    def test_a_roll_returns_an_explainable_breakdown(self) -> None:
+        response = self.roll()
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()["result"]
+        self.assertEqual(result["expression"], "d20+5")
+        self.assertEqual(result["dice"][0]["sides"], 20)
+        self.assertEqual(len(result["dice"][0]["values"]), 1)
+        self.assertEqual(result["total"], result["dice"][0]["values"][0] + 5)
+        self.assertFalse(result["recorded"])
+
+    def test_the_same_key_replays_one_recorded_public_roll(self) -> None:
+        self.start_session()
+        first = self.roll(key="same-roll")
+        second = self.roll(key="same-roll")
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json(), second.json())
+        self.assertTrue(first.json()["result"]["recorded"])
+
+        public = self.client.get("/api/dice/rolls", headers=self.headers()).json()
+        self.assertEqual(public["total"], 1)
+        self.assertEqual(public["rolls"][0]["label"], "Check")
+        self.assertNotIn("actor_id", public["rolls"][0])
+
+    def test_advantage_returns_both_attempts(self) -> None:
+        response = self.post(
+            "/api/dice/roll",
+            {"expression": "d20", "mode": "advantage"},
+            key="advantage-roll",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()["result"]
+        self.assertEqual(len(result["dice"]), 2)
+        self.assertIn(result["selected"], (0, 1))
+
+    def test_a_player_cannot_make_a_dm_only_roll(self) -> None:
+        response = self.post(
+            "/api/dice/roll",
+            {"expression": "d20", "visibility": "DM_ONLY"},
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_a_dm_only_roll_is_not_published_to_the_party(self) -> None:
+        self.start_session()
+        response = self.post(
+            "/api/dice/roll",
+            {"expression": "d20", "visibility": "DM_ONLY"},
+            code="dm-code",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["result"]["recorded"])
+        self.assertEqual(self.client.get("/api/dice/rolls", headers=self.headers()).json()["total"], 0)
+
+    def test_an_unrecognised_expression_is_refused(self) -> None:
+        response = self.post("/api/dice/roll", {"expression": "1d20+1d6"})
+        self.assertEqual(response.status_code, 422)
 
 
 class TakeTests(ApiTestCase):

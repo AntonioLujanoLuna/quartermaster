@@ -414,6 +414,58 @@ table.listing td.controls {
   border-top: 1px solid var(--line);
 }
 
+.dice-form {
+  margin: 12px 0 18px;
+}
+
+.dice-result {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--raised);
+}
+
+.dice-result h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.dice-result p {
+  margin: 4px 0;
+}
+
+.dice-breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 8px 0;
+  padding: 0;
+  list-style: none;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.dice-selected {
+  color: var(--ink);
+}
+
+.dice-discarded {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.dice-total {
+  font-size: 19px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.dice-rolls {
+  display: grid;
+  gap: 8px;
+}
+
 .drop + .drop {
   margin-top: 20px;
 }

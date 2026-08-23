@@ -18,7 +18,7 @@ import hashlib
 import hmac
 import json
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -54,6 +54,7 @@ class Identity:
 
     user_id: str
     guild_roles: tuple[str, ...] = ()
+    is_owner: bool = False
     access_token: str = ""
 
 
@@ -81,6 +82,9 @@ class IdentityProvider(Protocol):
         member of the configured guild.
         """
         ...
+
+
+OwnerChecker = Callable[[str], Awaitable[bool]]
 
 
 def _b64encode(raw: bytes) -> str:
@@ -176,8 +180,10 @@ class DiscordIdentityProvider:
 
     Two calls, both with the caller's own access token rather than the bot's.
     The second one — the guild member lookup — is what makes the guild check
-    and the DM check facts about Discord's state rather than about what the
-    client sent us.
+    and the role-based DM check facts about Discord's state rather than about
+    what the client sent us. Guild ownership is checked through the bot's
+    already-authoritative guild object when one is supplied, because the
+    member endpoint does not report the guild owner.
     """
 
     TOKEN_URL = "https://discord.com/api/oauth2/token"
@@ -192,12 +198,14 @@ class DiscordIdentityProvider:
         guild_id: str,
         redirect_uri: str = ACTIVITY_REDIRECT_URI,
         session_factory: Any = None,
+        owner_checker: OwnerChecker | None = None,
     ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
         self.guild_id = guild_id
         self.redirect_uri = redirect_uri
         self._session_factory = session_factory
+        self._owner_checker = owner_checker
 
     def _session(self) -> Any:
         if self._session_factory is not None:
@@ -242,8 +250,12 @@ class DiscordIdentityProvider:
         if not user_id:
             raise IdentityError("Discord returned a member with no user")
         roles = member.get("roles") or []
+        is_owner = False
+        if self._owner_checker is not None:
+            is_owner = await self._owner_checker(str(user_id))
         return Identity(
             user_id=str(user_id),
             guild_roles=tuple(str(role) for role in roles),
+            is_owner=is_owner,
             access_token=str(access_token),
         )

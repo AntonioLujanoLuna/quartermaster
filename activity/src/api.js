@@ -113,6 +113,7 @@ export const api = {
   characters: () => request("/characters"),
   combat: () => request("/combat"),
   continuity: () => request("/session/continuity"),
+  diceRolls: () => request("/dice/rolls"),
   health: () => request("/maintenance/health"),
   exportRecord: () => request("/export"),
 
@@ -169,6 +170,8 @@ export const api = {
     mutate("/characters/transition", { character_id: characterId, lifecycle }, key),
   resolveEstate: (characterId, destination, key) =>
     mutate("/characters/estate", { character_id: characterId, destination }, key),
+  rollDice: (expression, mode, label, visibility, key) =>
+    mutate("/dice/roll", { expression, mode, label, visibility }, key),
 
   // Neither of these is a mutation of the campaign, so neither carries a key:
   // there is no receipt to replay. Maintenance removes what is past its

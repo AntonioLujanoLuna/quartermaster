@@ -164,6 +164,7 @@ const SCREENS = [
   { id: "items", label: "My Items" },
   { id: "loot", label: "Loot" },
   { id: "treasury", label: "Treasury" },
+  { id: "dice", label: "Dice" },
   // Stage 5. Grant, correct, drops, adjust, and split live on the screens that
   // already show what they change, because that is where the DM is looking
   // when they reach for them. This tab is what has no such screen: the
@@ -257,6 +258,119 @@ function renderRoster(state, handlers) {
   }
   aside.append(list);
   return aside;
+}
+
+function modifierText(modifier) {
+  if (!modifier) return "0";
+  return modifier > 0 ? `+${modifier}` : String(modifier);
+}
+
+function renderDiceResult(result) {
+  const block = element("article", "dice-result");
+  const title = result.label || result.expression;
+  block.append(element("h3", null, title));
+  const mode = result.mode === "normal" ? "normal" : result.mode;
+  block.append(element("p", "muted", `${result.expression} · ${mode}`));
+
+  const breakdown = element("ul", "dice-breakdown");
+  for (const [index, die] of (result.dice || []).entries()) {
+    const selected = result.selected === null || result.selected === index;
+    const values = Array.isArray(die.values) ? die.values.join(", ") : "?";
+    breakdown.append(
+      element(
+        "li",
+        selected ? "dice-selected" : "dice-discarded",
+        `d${die.sides}: [${values}]${selected ? " · counted" : " · not counted"}`,
+      ),
+    );
+  }
+  block.append(breakdown);
+  block.append(element("p", "muted", `Modifier ${modifierText(result.modifier)}`));
+  block.append(element("p", "dice-total", `Total ${result.total}`));
+  if (result.natural !== null && result.natural !== undefined) {
+    block.append(element("p", "muted", `Natural ${result.natural}`));
+  }
+  if (result.recorded === false) {
+    block.append(element("p", "muted", "This roll was not added to the session log."));
+  }
+  return block;
+}
+
+function renderDiceScreen(state, handlers) {
+  const screen = element("section", "screen");
+  screen.append(element("h2", null, "Dice"));
+  screen.append(
+    element(
+      "p",
+      "muted",
+      "Rolls show every die, modifier, and selected result. Use Avrae for attacks, spells, and character mechanics.",
+    ),
+  );
+
+  const form = element("div", "form dice-form");
+  form.append(labelled("Roll", textField(state, "dice:expression", "d20 or 2d6+3", handlers)));
+
+  const modeLabel = element("label", "field-label");
+  modeLabel.append(element("span", "muted", "Mode"));
+  const mode = element("select", "select");
+  mode.dataset.inputKey = "dice:mode";
+  for (const value of ["normal", "advantage", "disadvantage"]) {
+    const option = element("option", null, value);
+    option.value = value;
+    option.selected = (state.inputs["dice:mode"] || "normal") === value;
+    mode.append(option);
+  }
+  mode.addEventListener("change", () => handlers.setInput("dice:mode", mode.value));
+  modeLabel.append(mode);
+  form.append(modeLabel);
+
+  form.append(labelled("Label", textField(state, "dice:label", "Strength check", handlers)));
+
+  const visibilityLabel = element("label", "field-label");
+  visibilityLabel.append(element("span", "muted", "Show"));
+  const visibility = element("select", "select");
+  visibility.dataset.inputKey = "dice:visibility";
+  const visibilityOptions = [{ value: "PUBLIC", label: "Public" }];
+  if (state.actor?.isDm) visibilityOptions.push({ value: "DM_ONLY", label: "DM only" });
+  for (const optionValue of visibilityOptions) {
+    const option = element("option", null, optionValue.label);
+    option.value = optionValue.value;
+    option.selected = (state.inputs["dice:visibility"] || "PUBLIC") === option.value;
+    visibility.append(option);
+  }
+  visibility.addEventListener("change", () => handlers.setInput("dice:visibility", visibility.value));
+  visibilityLabel.append(visibility);
+  form.append(visibilityLabel);
+  form.append(
+    button("Roll", {
+      style: "primary",
+      busy: state.busy,
+      onPress: () =>
+        handlers.rollDice(
+          state.inputs["dice:expression"] || "",
+          state.inputs["dice:mode"] || "normal",
+          state.inputs["dice:label"] || "",
+          state.inputs["dice:visibility"] || "PUBLIC",
+        ),
+    }),
+  );
+  screen.append(form);
+
+  if (state.dice?.last) {
+    screen.append(element("h2", null, "Last roll"));
+    screen.append(renderDiceResult(state.dice.last));
+  }
+
+  screen.append(element("h2", null, "Public rolls"));
+  const rolls = state.dice?.rolls || [];
+  if (rolls.length === 0) {
+    screen.append(element("p", "muted", "No public rolls have been recorded yet."));
+  } else {
+    const history = element("div", "dice-rolls");
+    for (const result of rolls) history.append(renderDiceResult(result));
+    screen.append(history);
+  }
+  return screen;
 }
 
 function emptyRow(columns, message) {
@@ -955,6 +1069,7 @@ const SCREEN_BODIES = {
   items: renderItemsScreen,
   loot: renderLootScreen,
   treasury: renderTreasuryScreen,
+  dice: renderDiceScreen,
   dm: renderDmScreen,
 };
 

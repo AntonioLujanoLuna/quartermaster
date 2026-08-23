@@ -131,7 +131,7 @@ For managed Windows startup, backup/restore, health, maintenance, dead-lettered 
 
 That boundary is also what makes a different surface thinkable. [The Activity migration plan](docs/activity-migration-plan.md) proposes moving play into a Discord Activity — a web UI embedded in the client, where the party joins by launching it rather than by each holding a private panel — and keeping the bot for the pinned projection, the session log, and asynchronous use.
 
-Its first five stages are implemented. Every read a panel performs and every mutation either a player or a DM makes is available over HTTP from `api_app`, and [the Activity itself](activity/README.md) is four screens a player acts on — Party Stash, My Items, Loot, Treasury — with the instance roster Discord supplies rather than one Quartermaster builds, and a fifth only a DM is shown. Each DM control sits on the screen showing what it changes; the DM screen holds what has no such screen, which is the session, the fight, the roster's lifecycle, and the operator's controls. The API runs on the bot's own loop against the bot's own store, because SQLite has one writer and recovery assumes one runtime. It stays off until `QM_DISCORD_CLIENT_ID` and `QM_DISCORD_CLIENT_SECRET` are configured, and FastAPI is an optional extra, so a table that has not enabled it runs exactly as before.
+Its first five stages are implemented. Every read a panel performs and every mutation either a player or a DM makes is available over HTTP from `api_app`, and [the Activity itself](activity/README.md) is five screens a player acts on — Party Stash, My Items, Loot, Treasury, and Dice — with the instance roster Discord supplies rather than one Quartermaster builds, and a sixth only a DM is shown. Each DM control sits on the screen showing what it changes; the DM screen holds what has no such screen, which is the session, the fight, the roster's lifecycle, and the operator's controls. The API runs on the bot's own loop against the bot's own store, because SQLite has one writer and recovery assumes one runtime. It stays off until `QM_DISCORD_CLIENT_ID` and `QM_DISCORD_CLIENT_SECRET` are configured, and FastAPI is an optional extra, so a table that has not enabled it runs exactly as before.
 
 The first live Discord smoke acceptance completed on 2026-08-23 through a temporary
 Cloudflare Quick Tunnel. The Activity loaded from a voice channel, completed the OAuth
@@ -139,6 +139,13 @@ code exchange, opened its live WebSocket, rendered the player screens, and took 
 Party Stash item into **My Items** after an active character was registered. A full
 evening, multi-client propagation, mobile layout, and a stable hostname remain live
 follow-ups; the acceptance details and repeatable setup are in [the Activity runbook](docs/runbook.md#verified-live-smoke-test-2026-08-23).
+
+The next product layer is deliberately separate from the v2.6 continuity core:
+[Dice, Character Sheets, and Explainable Mechanics](docs/dice-and-mechanics-plan.md) now has
+its first Dice slice implemented locally, with live acceptance still open. It starts with a
+server-authoritative Dice view, then adds read-only character explanations and only later
+considers provider-backed attacks, spells, and effects. The current Avrae boundary remains
+authoritative for D&D mechanics.
 
 The screen is live rather than a snapshot. `/api/live` is a WebSocket keyed on `domain_events.sequence` — the cursor the ledger already assigns inside the transaction that made the change — so a grant issued from the bot reaches every open screen at the table. It carries notifications rather than state: a client is told a sequence and an event type and answers by asking for the read it has on screen again, because a payload on the socket would be a second rendering of a fact the reads already answer for. The feed is woken by the store rather than polled on a timer, so an idle table costs no queries, and a client that cannot keep up is told to read everything again rather than allowed to hold the feed. Reconnecting from the last sequence seen makes a dropped socket a gap to fill instead of a screen to rebuild.
 

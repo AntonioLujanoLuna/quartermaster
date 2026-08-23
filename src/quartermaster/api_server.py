@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import logging
+from collections.abc import Awaitable, Callable
 
 from .api_app import create_app
 from .api_auth import DiscordIdentityProvider
@@ -61,7 +62,12 @@ def _require_websockets() -> None:
     )
 
 
-async def serve_api(context: Quartermaster, stop_event: asyncio.Event) -> None:
+async def serve_api(
+    context: Quartermaster,
+    stop_event: asyncio.Event,
+    *,
+    owner_checker: Callable[[str], Awaitable[bool]] | None = None,
+) -> None:
     """Run the API until the bot's stop event is set.
 
     Returns rather than raising when the Activity is not configured, so the
@@ -90,6 +96,7 @@ async def serve_api(context: Quartermaster, stop_event: asyncio.Event) -> None:
             client_id=client_id,
             client_secret=client_secret,
             guild_id=settings.guild_id,
+            owner_checker=owner_checker,
         ),
     )
     host, port = _split_bind(settings.api_bind)

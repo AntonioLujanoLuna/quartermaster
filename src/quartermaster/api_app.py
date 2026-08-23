@@ -65,6 +65,7 @@ from .combat import CombatError
 from .config import ConfigurationError, Settings
 from .currency import CurrencyError, CurrencySemanticStaleness
 from .db import SCHEMA_VERSION
+from .dice import DiceRollError, DiceService
 from .discord_common import Quartermaster
 from .export import render_export
 from .handles import HandleError
@@ -164,6 +165,12 @@ def current_dm(actor: CurrentActor) -> Actor:
 CurrentDM = Annotated[Actor, Depends(current_dm)]
 
 
+def _dice_service(context: Quartermaster) -> DiceService:
+    """Use the assembled service, while keeping older test contexts valid."""
+
+    return context.dice or DiceService(context.store, context.services.receipts)
+
+
 #: What a client-generated idempotency key may look like. A Discord interaction
 #: id was a number nobody could choose; this is a string a browser picks, and it
 #: becomes the primary key of a receipt row, so it is bounded here rather than
@@ -223,7 +230,7 @@ async def issue_token(state: State, request: TokenRequest) -> TokenResponse:
         raise HTTPException(status_code=401, detail=str(error)) from error
     actor = Actor(
         id=confirmed.user_id,
-        is_dm=is_dm(confirmed.guild_roles, state.settings.dm_role_ids),
+        is_dm=confirmed.is_owner or is_dm(confirmed.guild_roles, state.settings.dm_role_ids),
         instance_id=request.instance_id,
     )
     return TokenResponse(
@@ -370,6 +377,11 @@ def continuity(state: State, _: CurrentActor, limit: int = 20) -> dict[str, Any]
     return state.context.sessions.continuity(limit=_bounded(limit))
 
 
+@router.get("/dice/rolls")
+def dice_rolls(state: State, _: CurrentActor, limit: int = 20) -> dict[str, Any]:
+    return _dice_service(state.context).public_rolls(limit=_bounded(limit))
+
+
 @router.get("/export")
 def export(state: State, _: CurrentDM) -> dict[str, Any]:
     return {"export": render_export(state.context.store)}
@@ -451,6 +463,13 @@ class TransitionRequest(BaseModel):
     lifecycle: str = Field(min_length=1, max_length=32)
 
 
+class DiceRollRequest(BaseModel):
+    expression: str = Field(min_length=1, max_length=40)
+    mode: Literal["normal", "advantage", "disadvantage"] = "normal"
+    label: str | None = Field(default=None, max_length=100)
+    visibility: Literal["PUBLIC", "DM_ONLY"] = "PUBLIC"
+
+
 def _committed(result: ReceiptResult) -> dict[str, Any]:
     """A mutation's answer: what it did, and the receipt that says it did it."""
     return {
@@ -458,6 +477,29 @@ def _committed(result: ReceiptResult) -> dict[str, Any]:
         "receipt_status": result.status,
         "result": result.logical_response,
     }
+
+
+@router.post("/dice/roll")
+def dice_roll(
+    state: State,
+    actor: CurrentActor,
+    action: Idempotency,
+    request: DiceRollRequest,
+) -> dict[str, Any]:
+    if request.visibility == "DM_ONLY" and not actor.is_dm:
+        raise HTTPException(status_code=403, detail="DM-only rolls require DM authority")
+    try:
+        result = _dice_service(state.context).roll_interaction(
+            action,
+            actor_id=actor.id,
+            expression=request.expression,
+            mode=request.mode,
+            label=request.label,
+            visibility=request.visibility,
+        )
+    except DiceRollError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return _committed(result)
 
 
 # Taking from the Party Stash ------------------------------------------------

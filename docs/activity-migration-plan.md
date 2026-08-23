@@ -4,10 +4,13 @@ Status: Stages 1, 2, 3, 4, and 5 are implemented and driven end to end against a
 real server — a real socket, real SQLite, and the real service layer. The first
 Discord Activity smoke acceptance completed on 2026-08-23: the OAuth exchange,
 live WebSocket, player reads, active-character binding, and a Party Stash take
-were exercised in the configured guild through a temporary HTTPS tunnel. A full
-evening, multi-client propagation, mobile layout, and the DM Activity surface
-remain to be verified. Stage 6 is proposed and should stay proposed until that
-real use supplies the judgement for retiring the panels.
+were exercised in the configured guild through a temporary HTTPS tunnel. The
+server-owner DM path is now also live-accepted: the owner sees the DM tab and its
+session, combat, maintenance, and grant controls. A full evening, multi-client
+propagation, mobile layout, and non-owner DM refusal remain to be verified. Stage 6
+is proposed and should stay proposed until that real use supplies the judgement for
+retiring the panels. Proposed mechanics extensions are tracked separately in
+[the Dice and Mechanics plan](dice-and-mechanics-plan.md).
 
 ## Why
 
@@ -397,7 +400,7 @@ read, the handle round trip, a stale take answered on the confirm route, a spent
 refused, a replayed key returning its own receipt, another actor's key not returning it,
 and a body naming an actor being ignored rather than obeyed.
 
-**Stage 5 — DM surface.** *Built; Activity DM workflows remain unverified live.* Grant, corrections, drops,
+**Stage 5 — DM surface.** *Built; the server-owner DM path is smoke-accepted live, while full Activity DM workflows remain open.* Grant, corrections, drops,
 treasury adjustment and split, session start and end, combat, the roster's
 lifecycle and estates, and maintenance. Thirteen routes, the DM half of
 `activity/src/actions.js`, and a fifth screen.
@@ -434,6 +437,18 @@ start, grant, correct, drop, claim, close, combat, adjust, split, a roster that
 moves under a prepared split, an estate, maintenance, backup, end — has been
 run over real HTTP against a served process, with every DM route refusing a
 player over the wire.*
+
+The owner-specific Activity authority path is now live-accepted after the gateway cache was
+found to omit `owner_id` and the bot-side check was made to fetch the authoritative guild when
+that happened. The owner saw the DM tab and the DM screen; the player-side refusal and
+the complete DM evening remain live checks. This stage does not authorize a local D&D rules
+engine. See [the Dice and Mechanics plan](dice-and-mechanics-plan.md) for the staged path to
+explainable rolls and provider-backed actions.
+
+The first post-migration extension is now implemented locally: a sixth Activity screen, Dice,
+with a bounded server-authoritative roll API, idempotent retries, public/DM-only visibility,
+and session-history rendering. Its live acceptance remains open; it is tracked in [the Dice
+and Mechanics plan](dice-and-mechanics-plan.md), not folded into the Avrae authority boundary.
 
 **Stage 6 — Retire the panels.** Delete what Stage 4 and 5 replaced. Keep the entry point,
 the projection, and a deliberately small async surface (see below). *Exit:

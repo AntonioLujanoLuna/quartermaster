@@ -123,6 +123,13 @@ export function createActions({ notify, ask, reload }) {
     return `${it.character_name} gave ${it.quantity} ${it.item_name} to ${it.destination_name}. ${it.remaining} still held.`;
   };
 
+  const describeRoll = (result) => {
+    const mode = result.mode === "normal" ? "" : ` with ${result.mode}`;
+    const label = result.label || result.expression;
+    const recorded = result.recorded === false ? " It was not added to the session log." : "";
+    return `${label}: ${result.total}${mode}.${recorded}`;
+  };
+
   return {
     async take(item, amount) {
       await perform(async () => {
@@ -163,6 +170,16 @@ export function createActions({ notify, ask, reload }) {
         const it = (await api.use(item.id, quantity, reason || null, actionKey())).result;
         return `You used ${it.quantity} ${it.item_name}. ${it.remaining} still held.`;
       });
+    },
+
+    async rollDice(expression, mode, label, visibility) {
+      let result = null;
+      await perform(async () => {
+        const answer = await api.rollDice(expression, mode, label || null, visibility, actionKey());
+        result = answer.result;
+        return describeRoll(result);
+      });
+      return result;
     },
 
     async claim(dropItem, amount) {

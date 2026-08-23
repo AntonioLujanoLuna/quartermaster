@@ -2,8 +2,8 @@
 
 The web surface Discord embeds in its own client. Stages 1 to 5 of
 [the migration plan](../docs/activity-migration-plan.md): the API, the OAuth
-handshake, the live feed that keeps the screen current, four screens a player
-can act on — Party Stash, My Items, Loot, and Treasury, with the instance roster
+handshake, the live feed that keeps the screen current, five screens a player
+can act on — Party Stash, My Items, Loot, Treasury, and Dice, with the instance roster
 beside them — and everything a DM does, so that an evening needs no panel.
 
 The first live Discord smoke acceptance completed on 2026-08-23. The Activity
@@ -15,6 +15,10 @@ running where it runs and only the origin is rented.
 [Serving the Activity](../docs/runbook.md#serving-the-activity-without-paying-for-hosting)
 has the two free ways to get one, what to set, and what the first launch tested
 and left open.
+
+The Dice screen is locally validated but not yet live-accepted. It provides bounded
+server-authoritative rolls with an explainable breakdown; Avrae remains authoritative for
+attacks, spells, saves, HP, initiative, and conditions.
 
 Everything about Stage 0 that does not involve Discord is a command:
 
@@ -157,6 +161,9 @@ Developer Portal application. It verified:
 - Party Stash, My Items, Loot, and Treasury loaded successfully;
 - an active Discord-bound character could take one Party Stash item; and
 - the taken item appeared in My Items without a page reload.
+
+Dice was not part of that live smoke run; its public/DM-only visibility and session-history
+recording still need a live check.
 
 The negative case was also observed: a player without an active character was
 refused a take. The tunnel hostname is temporary and must be replaced in the URL
