@@ -35,6 +35,7 @@ const state = {
   loot: null,
   treasury: null,
   combat: null,
+  continuity: null,
   // What `health` or `export` last printed. It is a document rather than a
   // notice: nobody reads a health report in the corner of a screen.
   report: null,
@@ -88,6 +89,9 @@ const READERS = {
   combat: async () => {
     state.combat = await api.combat();
   },
+  continuity: async () => {
+    state.continuity = await api.continuity();
+  },
 };
 
 // What each screen needs on top of the two every screen needs. Reading only
@@ -104,7 +108,7 @@ const SCREEN_READS = {
 };
 
 async function refresh() {
-  const wanted = new Set(["home", "roster", ...(SCREEN_READS[state.screen] || [])]);
+  const wanted = new Set(["home", "continuity", "roster", ...(SCREEN_READS[state.screen] || [])]);
   await Promise.all([...wanted].map((name) => READERS[name]()));
   draw();
 }

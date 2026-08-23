@@ -383,6 +383,31 @@ table.listing td.controls {
   margin-top: 0;
 }
 
+.continuity {
+  margin-bottom: 18px;
+  padding: 12px 14px;
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.continuity h2 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.continuity p {
+  margin: 4px 0;
+}
+
+.continuity-recap {
+  margin: 8px 0;
+  padding-left: 24px;
+}
+
 .dm-block {
   margin-top: 24px;
   padding-top: 16px;

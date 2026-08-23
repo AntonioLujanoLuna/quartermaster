@@ -127,6 +127,38 @@ function renderSummary(home) {
   return bar;
 }
 
+function renderContinuity(continuity) {
+  if (!continuity || continuity.active_session_number !== null || !continuity.previous) return null;
+
+  const section = element("section", "continuity");
+  section.append(element("h2", null, "Last time"));
+  const endpoint = continuity.previous.where_ended
+    ? `Ended at: ${continuity.previous.where_ended}`
+    : "No endpoint was recorded.";
+  section.append(element("p", null, endpoint));
+
+  const recap = Array.isArray(continuity.recap) ? continuity.recap : [];
+  if (recap.length > 0) {
+    const list = element("ol", "continuity-recap");
+    for (const line of recap) list.append(element("li", null, line));
+    section.append(list);
+  } else {
+    section.append(element("p", "muted", "No recorded history for that session."));
+  }
+
+  const earlier = Math.max(0, Number(continuity.recap_total || 0) - recap.length);
+  if (earlier > 0) {
+    section.append(
+      element(
+        "p",
+        "muted",
+        `${earlier} earlier ${earlier === 1 ? "line" : "lines"} not shown; the session log and export hold the full record.`,
+      ),
+    );
+  }
+  return section;
+}
+
 const SCREENS = [
   { id: "stash", label: "Party Stash" },
   { id: "items", label: "My Items" },
@@ -938,6 +970,8 @@ export function renderApp(state, handlers) {
   root.append(header);
 
   const main = element("main");
+  const continuity = renderContinuity(state.continuity);
+  if (continuity) main.append(continuity);
   const notice = renderNotice(state, handlers);
   if (notice) main.append(notice);
   const prompt = renderPrompt(state, handlers);

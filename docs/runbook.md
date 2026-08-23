@@ -196,6 +196,15 @@ WARNING quartermaster.discord_projection: could not pin the Party Stash projecti
 
 Grant the permission or free a pin slot; the surface pins itself on the next delivery, with no operator action and no lost updates in between. `health` will not report this — the projection is current, it is just scrolling with the channel.
 
+## Upgrading to schema 12
+
+Schema 12 adds Quartermaster's `combat_encounters` record. It stores the session,
+channel, open/closed state, timestamps, and the DM's outcome note; it does not store
+Avrae mechanics such as HP, initiative, conditions, resources, or combatants. The
+migration needs no operator action. Opening or closing a Quartermaster combat remains
+separate from running the native Avrae combat, and ending a session closes any
+Quartermaster encounter left open.
+
 ## Upgrading to schema 11
 
 Schema 11 adds a failure counter to `projection_targets`. It takes a default and needs no operator action.

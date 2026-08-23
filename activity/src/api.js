@@ -112,6 +112,7 @@ export const api = {
   treasury: () => request("/treasury"),
   characters: () => request("/characters"),
   combat: () => request("/combat"),
+  continuity: () => request("/session/continuity"),
   health: () => request("/maintenance/health"),
   exportRecord: () => request("/export"),
 
