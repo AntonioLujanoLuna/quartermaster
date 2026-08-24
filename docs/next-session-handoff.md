@@ -97,9 +97,15 @@ from a disposable Avrae nightly checkout and exercised through the signed status
 real MongoDB and Redis, but not with Discord login or a live guild. The bounded attack, check,
 save, and cast paths are implemented locally but remain live-unverified; combat lifecycle and other mutations
 remain disabled.
-The 2026-08-24 live-gate inspection found the Avrae Compose contract for `mongo`, `redis`, and
-`bot`, but the Docker daemon was not running and no local Avrae/Discord environment variables
-or configuration file were present, so no Discord-connected operation smoke test was attempted.
+The 2026-08-24 live-gate inspection first found Docker unavailable; after Docker Desktop came
+up, the disposable `mongo`, `redis`, and `mongo-express` services were started. Their
+authenticated health checks returned `1` and `PONG`, and the Avrae Docker image built
+successfully from the nightly checkout. A fresh signed status request then passed through the adapter,
+loaded a seeded combat through Avrae's native `Combat.from_id` path against that MongoDB, and
+returned `COMMITTED` with the native summary message ID. The Avrae `bot` service remains
+stopped: `docker/env` is absent and no separate Avrae `DISCORD_BOT_TOKEN` is configured. The
+Quartermaster token must not be reused for that bot, so Discord-connected operation acceptance
+remains blocked on that credential and the shared listener configuration.
 
 **Item shape.** Every item is a quantity stack. Unique item instances — specification 30.2
 and the unique half of 31 — are deliberately not built and are no longer listed as pending
