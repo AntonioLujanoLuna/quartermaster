@@ -1,12 +1,13 @@
 # Quartermaster and Avrae Integration Plan
 
-Status: the hosted-Avrae path is the committed one. Gate 1 has been answered "no, for now"
-(see [Gate 1 decision](#gate-1-decision-2026-08-14)), so the self-hosted extension work is
-parked rather than pending, and the hosted fallback is being built out as the destination
-instead of a waiting room. A separately configured read-only HTTP status caller now exists,
-but no self-hosted Avrae listener is enabled by default and no mechanic has a live caller.
+Status: the hosted-Avrae path remains supported, and the self-hosted extension path was
+explicitly reopened on 2026-08-24. The first bounded provider slices are now implemented:
+Quartermaster can request native Avrae turn advance (`next`), attack, check, save, and bounded spell casts through a separately configured
+operation endpoint. It is not live-accepted yet; the remaining gate is a Discord-connected,
+self-hosted Avrae deployment with real actor, authorization, idempotency, and timeout evidence.
+Combat start/end and combatant mutation remain disabled.
 
-Updated: 2026-08-23
+Updated: 2026-08-24
 
 ## Purpose
 
@@ -47,11 +48,12 @@ Quartermaster envelope, while the native context bridge reads Avrae's combat mod
 initiative, conditions, resources, or combatants into Quartermaster.
 
 The scaffold is not loaded by the current hosted Quartermaster process and has not been run
-with Avrae's Discord login or a real guild. It is now parked behind the Gate 1 decision below
-rather than queued as the next task. The opt-in Cog now uses the current `Combat.from_id` model
-seam and does not open Quartermaster SQLite. A disposable local run has also exercised the Cog
-against real MongoDB and Redis, but that remains a deployment spike rather than a supported
-hosted-Avrae feature.
+with Avrae's Discord login or a real guild. The opt-in Cog now uses the current `Combat.from_id`
+model seam, does not open Quartermaster SQLite, and exposes bounded native `next`, `attack`,
+`check`, and `save` operations.
+A disposable local run has exercised the status path against real MongoDB and Redis, but that
+remains a deployment spike rather than a supported hosted-Avrae feature. The operation path is
+implemented locally and still requires the live deployment gate below.
 
 The older assumptions listed in the historical note above are no longer implementation
 requirements: the new status boundary does not share the SQLite file. The Avrae-native context
@@ -67,8 +69,9 @@ request is signed with HMAC-SHA256 over a timestamp, nonce, and exact JSON body.
 handler verifies freshness, replay, protocol, operation, and guild before delegating to a native
 status provider.
 
-This slice is intentionally read-only. It creates no provider receipt, shares no SQLite file,
-and has no endpoint for `start`, `join`, `next`, `attack`, `cast`, `check`, `save`, or `end`.
+This status slice is intentionally read-only. It creates no provider receipt, shares no SQLite
+file, and has no status endpoint for `start`, `join`, `next`, `attack`, `cast`, `check`, `save`,
+or `end`.
 Transport timeouts are exposed as `UNKNOWN`, while a known adapter rejection is exposed as
 `FAILED`; neither result is presented as an inactive combat. The handler and wire contract are
 tested without importing Avrae. The listener and model bridge are implemented in the opt-in Cog,
@@ -94,6 +97,33 @@ Schema 12 adds `combat_encounters`: session, channel, open/closed status, who op
 The other six actions remain pure handoff cards open to any player. Closing a session closes any encounter still open, with reason `SESSION_CLOSED`, the same way it closes outstanding Loot Drops.
 
 This is the closeout the fallback was missing: combat ending is the moment loot exists, and it used to be the moment Quartermaster stopped talking. None of it requires an Avrae API, and none of it makes Quartermaster authoritative for a mechanic.
+
+## Implementation slice 6: first bounded native operation
+
+The reopened Gate 2 work adds five deliberately bounded provider operations. `next` advances
+the active Avrae turn through Avrae's own `Combat.from_id`, authorization, and
+`advance_turn()`/`final()` path. `attack` resolves one explicitly named native attack against
+one explicitly named combatant target through Avrae's `run_attack()` and final commit path.
+`check` resolves one explicit native skill using Avrae's `checkutils.run_check()`; `save` resolves
+one explicit native saving throw using `checkutils.run_save()`. Neither changes Quartermaster or
+Avrae combat state; both return provider-owned roll results. `cast` resolves one explicit known
+and prepared spell against one explicit target through Avrae's `actionutils.cast_spell()` path,
+which owns slot consumption, preparation, automation, and native commit. The Avrae Cog exposes all five at
+`POST /quartermaster/v1/operation` with a separate signed operation protocol. It accepts no
+other operation kind.
+
+Quartermaster exposes `POST /api/combat/avrae/next`, `/attack`, `/check`, `/save`, and `/cast`. Each requires an open Quartermaster combat,
+passes the authenticated Discord actor, guild, channel, session, and provider reference, and
+records the request through the existing DEFERRED receipt and `provider_operations` boundary.
+A provider timeout becomes `UNKNOWN`; a known provider rejection becomes `FAILED`; the
+operation is not automatically retried. The operation endpoint is opt-in through
+`QM_AVRAE_OPERATION_URL` and is separate from the read-only status URL.
+
+The gateway, signed adapter, native-provider contract, API routes, operation receipts, replay,
+and timeout behavior are locally tested. The current hosted bot has no operation URL and the
+live Activity does not expose these controls yet. Real Discord actor authorization, native turn
+advancement, attack output, check output, save output, and spell output remain acceptance work,
+not assumptions made from the local tests.
 
 ## Research findings
 
@@ -261,6 +291,13 @@ be described that way rather than as work that is coming. Everything downstream 
 Revisit only if someone at the table actively wants to operate that infrastructure. Nothing
 in the current build depends on the answer changing.
 
+#### Gate 1 reopened, 2026-08-24
+
+The user explicitly chose to continue the Avrae integration. That supersedes the parked
+queue for a bounded Gate 2 slice, not the original operating-cost judgment. The first slice is
+native turn advance (`next`) only; the self-hosted deployment decision and live acceptance are
+still outstanding, and no broader mechanic is implied.
+
 One direction remains genuinely unexplored and does not need a fork: Avrae aliases can emit
 signed invocation data, which would let combat events flow Avrae → Quartermaster rather than
 the reverse. The catch is that Draconic aliases appear to have no outbound network access, so
@@ -294,7 +331,11 @@ In a disposable test guild, prove the smallest Avrae-side extension:
 - commit through Avrae's own model path;
 - return a correlation ID and result to Quartermaster.
 
-The spike must also determine whether the integration belongs inside Avrae, behind an authenticated local RPC endpoint, or in another supported extension boundary.
+The local contract now proves the signed operation boundary, native-provider seam, durable
+Quartermaster receipt, replay behavior, and timeout mapping for `next`. The remaining spike
+must run that path in a disposable Discord-connected Avrae deployment and determine whether
+the integration should remain inside Avrae, behind an authenticated local RPC endpoint, or use
+another supported extension boundary.
 
 ### Gate 3: actor and idempotency semantics
 
@@ -349,26 +390,32 @@ The integration is not ready for table use until all of the following are true:
 
 ## Immediate next implementation work
 
-Gate 1 is answered, so the queue is no longer "prove the spike". It is "make the fallback
-worth having", which is work the hosted bot can do on its own:
+The next work is live acceptance of the bounded operations, not a broad mechanic expansion:
 
-1. Play a real session with the combat record and see whether the closeout actually gets
-   used. If the DM never presses **Record spoils**, the button is in the wrong place.
-2. Decide whether the encounter deserves a name or a short label. Right now two fights in one
-   session are distinguishable only by timestamp, which is fine for the status card and thin
-   for the export.
-3. Spend the half hour on the Avrae alias signature question above, and write the answer down
-   either way so it stops being an open loop.
+1. Configure a disposable self-hosted Avrae instance with MongoDB, Redis, the opt-in Cog, and
+   `QM_AVRAE_OPERATION_URL`, without changing the current hosted bot or the dirty external
+   Avrae checkout.
+2. Run a real Discord-connected test with one active combat and `next`, one explicit-target
+   `attack`, one native `check`, one native `save`, and one prepared `cast`. Verify the signed
+   actor, Avrae's normal combat-DM/turn authorization, native results, resource consumption,
+   correlation ID, duplicate delivery behavior, and timeout recovery.
+3. Only after that acceptance, decide whether to expose `Next turn`, `Attack`, `Check`, `Save`,
+   and `Cast` controls in the Activity or Discord surface. Keep combat lifecycle and other
+   actions out of the pilot.
+4. In parallel, play a real session with the Quartermaster combat record and see whether the
+   closeout and spoils handoff are actually used.
 
 The session projection now shows an open Quartermaster encounter's channel and opener. It
 continues to omit every Avrae-owned mechanic, and the projection is dirtied by the existing
 combat lifecycle events so the channel can reflect the change without a command.
 
-Explicitly not queued: loading the Cog, self-hosting Avrae, provider gateway implementations,
-combat reference projections, and any surface that would hold an Avrae-owned number.
+Explicitly not queued: combat lifecycle mechanics, combat reference projections, and any surface
+that would hold an Avrae-owned number. The Cog, operation gateway, and receipt boundary are
+implemented, but loading and operating them in a live deployment remain gated acceptance work.
 
 The provider receipt boundary in `integration.py` remains unused for the read-only status
 route: the optional gateway has a live caller, but status reads do not create durable receipts.
-Mechanic operations still have no live caller. The boundary is cheap to carry, its recovery
-semantics are the hard part and are already correct, and removing it would cost a migration to
-destroy work we would have to redo.
+The bounded `next`, `attack`, `check`, `save`, and `cast` operations now have callers and durable
+receipts in the local API path, but no live Avrae operation endpoint is configured. Their
+recovery semantics are covered locally; live actor and native-state evidence is the remaining
+proof.

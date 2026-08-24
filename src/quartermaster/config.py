@@ -46,6 +46,7 @@ class Settings:
     activity_dist: Path | None = None
     session_token_seconds: int = 3600
     avrae_adapter_url: str | None = None
+    avrae_operation_url: str | None = None
     avrae_adapter_secret: str | None = None
     avrae_adapter_timeout_seconds: float = 2.5
     discord_surface: str = "retained"
@@ -59,6 +60,12 @@ class Settings:
             )
         if adapter_url is not None:
             _validate_avrae_url(adapter_url)
+        if self.avrae_operation_url is not None:
+            if adapter_url is None:
+                raise ConfigurationError(
+                    "QM_AVRAE_OPERATION_URL requires QM_AVRAE_ADAPTER_URL"
+                )
+            _validate_avrae_url(self.avrae_operation_url)
         if adapter_secret is not None and not adapter_secret.strip():
             raise ConfigurationError("QM_AVRAE_ADAPTER_SECRET must not be empty")
         if self.avrae_adapter_timeout_seconds <= 0:
@@ -103,6 +110,7 @@ class Settings:
             activity_dist=_optional_path(environment.get("QM_ACTIVITY_DIST", "")),
             session_token_seconds=_positive_int(environment, "QM_SESSION_TOKEN_SECONDS", 3600),
             avrae_adapter_url=_optional_avrae_url(environment.get("QM_AVRAE_ADAPTER_URL", "")),
+            avrae_operation_url=_optional_avrae_url(environment.get("QM_AVRAE_OPERATION_URL", "")),
             avrae_adapter_secret=environment.get("QM_AVRAE_ADAPTER_SECRET", "").strip() or None,
             avrae_adapter_timeout_seconds=_positive_float(
                 environment, "QM_AVRAE_ADAPTER_TIMEOUT_SECONDS", 2.5

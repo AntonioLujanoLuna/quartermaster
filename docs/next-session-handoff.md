@@ -89,11 +89,17 @@ Quartermaster's own `combat_encounters` record — session, channel, duration, o
 nothing Avrae owns; Start and End render only for a DM and check again when pressed. The other
 six controls render read-only handoff cards pointing at native Avrae commands. Ending combat
 reports outstanding Loot Drops and offers the spoils controls. The provider operation boundary is
-durable but still has no live caller for state-changing mechanics; the read-only status adapter
-does not create provider receipts. The extension at `integrations/avrae/quartermaster_cog.py`
-remains parked as a supported product feature: Gate 1 was answered "no, for now" on 2026-08-14.
-On 2026-08-23 it was loaded from a disposable Avrae nightly checkout and exercised through the
-signed listener with real MongoDB and Redis, but not with Discord login or a live guild.
+durable; the read-only status adapter does not create provider receipts, while the reopened
+bounded `next`, `attack`, `check`, `save`, and `cast` operations now have local caller and receipt paths. The extension at
+`integrations/avrae/quartermaster_cog.py` remains opt-in and live-unverified: Gate 1 was
+reopened on 2026-08-24 for these first bounded native operations. On 2026-08-23 it was loaded
+from a disposable Avrae nightly checkout and exercised through the signed status listener with
+real MongoDB and Redis, but not with Discord login or a live guild. The bounded attack, check,
+save, and cast paths are implemented locally but remain live-unverified; combat lifecycle and other mutations
+remain disabled.
+The 2026-08-24 live-gate inspection found the Avrae Compose contract for `mongo`, `redis`, and
+`bot`, but the Docker daemon was not running and no local Avrae/Discord environment variables
+or configuration file were present, so no Discord-connected operation smoke test was attempted.
 
 **Item shape.** Every item is a quantity stack. Unique item instances — specification 30.2
 and the unique half of 31 — are deliberately not built and are no longer listed as pending
@@ -1115,11 +1121,14 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
    manual-bonus/source explanation. Do not begin a local attack/spell rules engine while Avrae
    remains the authority for D&D mechanics.
 
-The Avrae extension spike is no longer a product priority: Gate 1 was answered "no, for now",
-so self-hosting, state-changing mechanics, and combat reference projections remain parked. The
-read-only provider gateway and Cog now exist as a locally validated deployment spike, not as a
-supported hosted-Avrae feature. See [the integration plan](avrae-integration-plan.md) for the
-reasoning and the remaining live-deployment boundary.
+The Avrae extension path is reopened only for live acceptance of the bounded `next`,
+explicit-target `attack`, native `check`, native `save`, and prepared `cast` operations. Configure a disposable self-hosted Avrae deployment with
+the opt-in Cog and `QM_AVRAE_OPERATION_URL`, then verify the real Discord actor, Avrae
+authorization, native turn/attack/check/save/cast results, resource consumption, duplicate
+delivery, correlation, and timeout behavior. Do not expose the Activity controls or broaden into
+combat lifecycle mutations until that
+evidence exists. See
+[the integration plan](avrae-integration-plan.md) for the remaining live-deployment boundary.
 
 Your Pack, Journal, Parking Lot, Downtime, faction clocks, rich continuity, and Undo remain
 evidence-gated. Do not start them.

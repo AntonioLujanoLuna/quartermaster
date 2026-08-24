@@ -5,11 +5,13 @@ import json
 import unittest
 
 from integrations.avrae.quartermaster_adapter import (
+    QuartermasterOperationAdapter,
     QuartermasterStatusAdapter,
     RequestRejected,
 )
 
 from quartermaster.avrae_gateway import (
+    AVRAE_OPERATION_PROTOCOL,
     AVRAE_STATUS_PROTOCOL,
     NONCE_HEADER,
     PROTOCOL_HEADER,
@@ -85,8 +87,128 @@ class AvraeGatewayTests(unittest.TestCase):
         )
         self.assertEqual(json.loads(body)["operation_kind"], "status")
 
-    def test_gateway_refuses_a_state_changing_operation_before_network(self) -> None:
-        request = self.provider_request.__class__(**{**self.provider_request.__dict__, "operation_kind": "attack"})
+    def test_gateway_refuses_an_unimplemented_state_changing_operation_before_network(self) -> None:
+        request = self.provider_request.__class__(**{**self.provider_request.__dict__, "operation_kind": "start"})
+        gateway = HttpAvraeGateway("https://avrae.example/status", "shared-secret", transport=lambda *_: b"{}")
+        with self.assertRaises(ProviderIntegrationError):
+            gateway.execute(request)
+
+    def test_gateway_sends_the_bounded_turn_operation_to_its_separate_endpoint(self) -> None:
+        captured = {}
+        request = self.provider_request.__class__(**{**self.provider_request.__dict__, "operation_kind": "next"})
+
+        def transport(http_request, _timeout):
+            captured["request"] = http_request
+            return b'{"status":"COMMITTED","payload":{"operation":"next"}}'
+
+        gateway = HttpAvraeGateway(
+            "https://avrae.example/status",
+            "shared-secret",
+            operation_endpoint_url="https://avrae.example/operation",
+            transport=transport,
+        )
+        self.assertEqual(gateway.execute(request).status, "COMMITTED")
+        self.assertEqual(captured["request"].full_url, "https://avrae.example/operation")
+        self.assertEqual(captured["request"].headers["X-quartermaster-protocol"], AVRAE_OPERATION_PROTOCOL)
+
+    def test_gateway_sends_the_bounded_attack_operation_to_the_operation_endpoint(self) -> None:
+        captured = {}
+        request = self.provider_request.__class__(
+            **{
+                **self.provider_request.__dict__,
+                "operation_kind": "attack",
+                "payload": {"attack": "Longsword", "target": "Goblin"},
+            }
+        )
+
+        def transport(http_request, _timeout):
+            captured["request"] = http_request
+            return b'{"status":"COMMITTED","payload":{"operation":"attack"}}'
+
+        gateway = HttpAvraeGateway(
+            "https://avrae.example/status",
+            "shared-secret",
+            operation_endpoint_url="https://avrae.example/operation",
+            transport=transport,
+        )
+        self.assertEqual(gateway.execute(request).status, "COMMITTED")
+        self.assertEqual(captured["request"].full_url, "https://avrae.example/operation")
+        self.assertEqual(captured["request"].headers["X-quartermaster-protocol"], AVRAE_OPERATION_PROTOCOL)
+
+    def test_gateway_sends_the_bounded_check_operation_to_the_operation_endpoint(self) -> None:
+        captured = {}
+        request = self.provider_request.__class__(
+            **{
+                **self.provider_request.__dict__,
+                "operation_kind": "check",
+                "payload": {"skill": "Perception"},
+            }
+        )
+
+        def transport(http_request, _timeout):
+            captured["request"] = http_request
+            return b'{"status":"COMMITTED","payload":{"operation":"check"}}'
+
+        gateway = HttpAvraeGateway(
+            "https://avrae.example/status",
+            "shared-secret",
+            operation_endpoint_url="https://avrae.example/operation",
+            transport=transport,
+        )
+        self.assertEqual(gateway.execute(request).status, "COMMITTED")
+        self.assertEqual(captured["request"].full_url, "https://avrae.example/operation")
+        self.assertEqual(captured["request"].headers["X-quartermaster-protocol"], AVRAE_OPERATION_PROTOCOL)
+
+    def test_gateway_sends_the_bounded_save_operation_to_the_operation_endpoint(self) -> None:
+        captured = {}
+        request = self.provider_request.__class__(
+            **{
+                **self.provider_request.__dict__,
+                "operation_kind": "save",
+                "payload": {"save": "Wisdom Save"},
+            }
+        )
+
+        def transport(http_request, _timeout):
+            captured["request"] = http_request
+            return b'{"status":"COMMITTED","payload":{"operation":"save"}}'
+
+        gateway = HttpAvraeGateway(
+            "https://avrae.example/status",
+            "shared-secret",
+            operation_endpoint_url="https://avrae.example/operation",
+            transport=transport,
+        )
+        self.assertEqual(gateway.execute(request).status, "COMMITTED")
+        self.assertEqual(captured["request"].full_url, "https://avrae.example/operation")
+        self.assertEqual(captured["request"].headers["X-quartermaster-protocol"], AVRAE_OPERATION_PROTOCOL)
+
+    def test_gateway_sends_the_bounded_cast_operation_to_the_operation_endpoint(self) -> None:
+        captured = {}
+        request = self.provider_request.__class__(
+            **{
+                **self.provider_request.__dict__,
+                "operation_kind": "cast",
+                "payload": {"spell": "Bless", "target": "Ally"},
+            }
+        )
+
+        def transport(http_request, _timeout):
+            captured["request"] = http_request
+            return b'{"status":"COMMITTED","payload":{"operation":"cast"}}'
+
+        gateway = HttpAvraeGateway(
+            "https://avrae.example/status",
+            "shared-secret",
+            operation_endpoint_url="https://avrae.example/operation",
+            transport=transport,
+        )
+        self.assertEqual(gateway.execute(request).status, "COMMITTED")
+        self.assertEqual(captured["request"].full_url, "https://avrae.example/operation")
+        self.assertEqual(captured["request"].headers["X-quartermaster-protocol"], AVRAE_OPERATION_PROTOCOL)
+
+    def test_gateway_requires_an_operation_endpoint_before_network(self) -> None:
+        request = self.provider_request.__class__(**{**self.provider_request.__dict__, "operation_kind": "next"})
         gateway = HttpAvraeGateway("https://avrae.example/status", "shared-secret", transport=lambda *_: b"{}")
         with self.assertRaises(ProviderIntegrationError):
             gateway.execute(request)
@@ -198,3 +320,171 @@ class AvraeAdapterTests(unittest.TestCase):
                 body=body,
                 now=1_100,
             )
+
+    def test_operation_adapter_dispatches_the_bounded_turn_operation(self) -> None:
+        seen = []
+
+        class Provider:
+            def execute_operation(self, request):
+                seen.append(request)
+                return {"operation": "next", "round": 2, "turn": 17}
+
+        request = self._request().__class__(**{**self._request().__dict__, "operation_kind": "next"})
+        body = encode_wire_request(request)
+        headers = {
+            PROTOCOL_HEADER: AVRAE_OPERATION_PROTOCOL,
+            TIMESTAMP_HEADER: "1000",
+            NONCE_HEADER: "operation-nonce",
+            SIGNATURE_HEADER: signature_for(
+                secret="shared-secret", timestamp="1000", nonce="operation-nonce", body=body
+            ),
+        }
+        adapter = QuartermasterOperationAdapter("shared-secret", "guild-1", Provider())
+        result = asyncio.run(adapter.handle(body, headers=headers, now=1_000))
+
+        self.assertEqual(result["status"], "COMMITTED")
+        self.assertEqual(result["payload"]["operation"], "next")
+        self.assertEqual(seen[0]["actor_id"], "actor-1")
+
+    def test_operation_adapter_maps_a_native_failure_to_failed(self) -> None:
+        class Provider:
+            def execute_operation(self, _request):
+                raise RuntimeError("native operation unavailable")
+
+        request = self._request().__class__(**{**self._request().__dict__, "operation_kind": "next"})
+        body = encode_wire_request(request)
+        headers = {
+            PROTOCOL_HEADER: AVRAE_OPERATION_PROTOCOL,
+            TIMESTAMP_HEADER: "1000",
+            NONCE_HEADER: "operation-failure",
+            SIGNATURE_HEADER: signature_for(
+                secret="shared-secret", timestamp="1000", nonce="operation-failure", body=body
+            ),
+        }
+        adapter = QuartermasterOperationAdapter("shared-secret", "guild-1", Provider())
+        result = asyncio.run(adapter.handle(body, headers=headers, now=1_000))
+        self.assertEqual(result["status"], "FAILED")
+
+    def test_operation_adapter_dispatches_the_bounded_attack_operation(self) -> None:
+        seen = []
+
+        class Provider:
+            def execute_operation(self, request):
+                seen.append(request)
+                return {"operation": "attack", "attack": "Longsword"}
+
+        request = self._request().__class__(
+            **{
+                **self._request().__dict__,
+                "operation_kind": "attack",
+                "payload": {"attack": "Longsword", "target": "goblin"},
+            }
+        )
+        body = encode_wire_request(request)
+        headers = {
+            PROTOCOL_HEADER: AVRAE_OPERATION_PROTOCOL,
+            TIMESTAMP_HEADER: "1000",
+            NONCE_HEADER: "attack-operation",
+            SIGNATURE_HEADER: signature_for(
+                secret="shared-secret", timestamp="1000", nonce="attack-operation", body=body
+            ),
+        }
+        adapter = QuartermasterOperationAdapter("shared-secret", "guild-1", Provider())
+        result = asyncio.run(adapter.handle(body, headers=headers, now=1_000))
+
+        self.assertEqual(result["status"], "COMMITTED")
+        self.assertEqual(result["payload"]["operation"], "attack")
+        self.assertEqual(seen[0]["payload"]["target"], "goblin")
+
+    def test_operation_adapter_dispatches_the_bounded_check_operation(self) -> None:
+        seen = []
+
+        class Provider:
+            def execute_operation(self, request):
+                seen.append(request)
+                return {"operation": "check", "skill": "Perception"}
+
+        request = self._request().__class__(
+            **{
+                **self._request().__dict__,
+                "operation_kind": "check",
+                "payload": {"skill": "Perception"},
+            }
+        )
+        body = encode_wire_request(request)
+        headers = {
+            PROTOCOL_HEADER: AVRAE_OPERATION_PROTOCOL,
+            TIMESTAMP_HEADER: "1000",
+            NONCE_HEADER: "check-operation",
+            SIGNATURE_HEADER: signature_for(
+                secret="shared-secret", timestamp="1000", nonce="check-operation", body=body
+            ),
+        }
+        adapter = QuartermasterOperationAdapter("shared-secret", "guild-1", Provider())
+        result = asyncio.run(adapter.handle(body, headers=headers, now=1_000))
+
+        self.assertEqual(result["status"], "COMMITTED")
+        self.assertEqual(result["payload"]["operation"], "check")
+        self.assertEqual(seen[0]["payload"]["skill"], "Perception")
+
+    def test_operation_adapter_dispatches_the_bounded_save_operation(self) -> None:
+        seen = []
+
+        class Provider:
+            def execute_operation(self, request):
+                seen.append(request)
+                return {"operation": "save", "save": "Wisdom"}
+
+        request = self._request().__class__(
+            **{
+                **self._request().__dict__,
+                "operation_kind": "save",
+                "payload": {"save": "Wisdom Save"},
+            }
+        )
+        body = encode_wire_request(request)
+        headers = {
+            PROTOCOL_HEADER: AVRAE_OPERATION_PROTOCOL,
+            TIMESTAMP_HEADER: "1000",
+            NONCE_HEADER: "save-operation",
+            SIGNATURE_HEADER: signature_for(
+                secret="shared-secret", timestamp="1000", nonce="save-operation", body=body
+            ),
+        }
+        adapter = QuartermasterOperationAdapter("shared-secret", "guild-1", Provider())
+        result = asyncio.run(adapter.handle(body, headers=headers, now=1_000))
+
+        self.assertEqual(result["status"], "COMMITTED")
+        self.assertEqual(result["payload"]["operation"], "save")
+        self.assertEqual(seen[0]["payload"]["save"], "Wisdom Save")
+
+    def test_operation_adapter_dispatches_the_bounded_cast_operation(self) -> None:
+        seen = []
+
+        class Provider:
+            def execute_operation(self, request):
+                seen.append(request)
+                return {"operation": "cast", "spell": "Bless"}
+
+        request = self._request().__class__(
+            **{
+                **self._request().__dict__,
+                "operation_kind": "cast",
+                "payload": {"spell": "Bless", "target": "Ally"},
+            }
+        )
+        body = encode_wire_request(request)
+        headers = {
+            PROTOCOL_HEADER: AVRAE_OPERATION_PROTOCOL,
+            TIMESTAMP_HEADER: "1000",
+            NONCE_HEADER: "cast-operation",
+            SIGNATURE_HEADER: signature_for(
+                secret="shared-secret", timestamp="1000", nonce="cast-operation", body=body
+            ),
+        }
+        adapter = QuartermasterOperationAdapter("shared-secret", "guild-1", Provider())
+        result = asyncio.run(adapter.handle(body, headers=headers, now=1_000))
+
+        self.assertEqual(result["status"], "COMMITTED")
+        self.assertEqual(result["payload"]["operation"], "cast")
+        self.assertEqual(seen[0]["payload"]["target"], "Ally")

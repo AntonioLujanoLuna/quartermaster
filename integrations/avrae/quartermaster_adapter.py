@@ -1,9 +1,10 @@
-"""Dependency-light Avrae-side half of the Quartermaster status protocol.
+"""Dependency-light Avrae-side half of the Quartermaster provider protocol.
 
 This file is intended to be imported by a self-hosted Avrae Cog. It does not
 open Quartermaster's SQLite database. The Cog supplies a native status reader
 that runs inside Avrae, while this handler authenticates and validates the
-request envelope before calling it.
+request envelope before calling it. The operation adapter currently permits
+only the bounded ``next``, ``attack``, ``check``, and ``save`` operations.
 
 An HTTP server is intentionally not started here. Avrae's extension should
 own the listener lifecycle (and its bind address, TLS, and process policy) and
@@ -20,6 +21,8 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from quartermaster.avrae_gateway import (
+    AVRAE_OPERATION_KINDS,
+    AVRAE_OPERATION_PROTOCOL,
     AVRAE_STATUS_PROTOCOL,
     DEFAULT_CLOCK_SKEW_SECONDS,
     NONCE_HEADER,
@@ -36,6 +39,13 @@ class NativeStatusProvider(Protocol):
 
     def combat_status(self, request: Mapping[str, Any]) -> Mapping[str, Any] | Any:
         """Return a provider-owned status projection for the native context."""
+
+
+class NativeOperationProvider(Protocol):
+    """The Avrae-internal seam for bounded provider operations."""
+
+    def execute_operation(self, request: Mapping[str, Any]) -> Mapping[str, Any] | Any:
+        """Execute the already-authenticated native operation."""
 
 
 class RequestRejected(ProviderIntegrationError):
@@ -83,29 +93,13 @@ class QuartermasterStatusAdapter:
     ) -> dict[str, Any]:
         """Validate a POST and return a JSON-serializable provider result."""
 
-        timestamp = headers.get(TIMESTAMP_HEADER, "")
-        nonce = headers.get(NONCE_HEADER, "")
-        signature = headers.get(SIGNATURE_HEADER, "")
-        if headers.get(PROTOCOL_HEADER) != AVRAE_STATUS_PROTOCOL:
-            raise RequestRejected("Avrae request protocol is missing or unsupported")
-        observed_now = time.time() if now is None else now
-        verify_signature(
-            secret=self.secret,
-            timestamp=timestamp,
-            nonce=nonce,
-            signature=signature,
-            body=body,
-            now=observed_now,
-            max_clock_skew_seconds=self.max_clock_skew_seconds,
+        request = self._validated_request(
+            body,
+            headers=headers,
+            expected_protocol=AVRAE_STATUS_PROTOCOL,
+            expected_operation="status",
+            now=now,
         )
-        self._nonces.claim(nonce, now=observed_now)
-        request = _decode_request(body)
-        if request["protocol"] != AVRAE_STATUS_PROTOCOL:
-            raise RequestRejected("Avrae request body protocol is unsupported")
-        if request["provider"] != "avrae" or request["operation_kind"] != "status":
-            raise RequestRejected("Avrae adapter only accepts the status operation")
-        if request["guild_id"] != self.guild_id:
-            raise RequestRejected("Avrae adapter request targets the wrong guild")
 
         try:
             payload = self.provider.combat_status(request)
@@ -133,6 +127,97 @@ class QuartermasterStatusAdapter:
             "provider_reference": request["provider_reference"],
             "correlation_id": request["correlation_id"],
             "provider_version": "avrae-native-status-v1",
+            "payload": dict(payload),
+            "retryable": False,
+        }
+
+    def _validated_request(
+        self,
+        body: bytes,
+        *,
+        headers: Mapping[str, str],
+        expected_protocol: str,
+        expected_operation: str | None,
+        now: float | None,
+    ) -> dict[str, Any]:
+        timestamp = headers.get(TIMESTAMP_HEADER, "")
+        nonce = headers.get(NONCE_HEADER, "")
+        signature = headers.get(SIGNATURE_HEADER, "")
+        if headers.get(PROTOCOL_HEADER) != expected_protocol:
+            raise RequestRejected("Avrae request protocol is missing or unsupported")
+        observed_now = time.time() if now is None else now
+        verify_signature(
+            secret=self.secret,
+            timestamp=timestamp,
+            nonce=nonce,
+            signature=signature,
+            body=body,
+            now=observed_now,
+            max_clock_skew_seconds=self.max_clock_skew_seconds,
+        )
+        self._nonces.claim(nonce, now=observed_now)
+        request = _decode_request(body)
+        if request["protocol"] != expected_protocol:
+            raise RequestRejected("Avrae request body protocol is unsupported")
+        if request["provider"] != "avrae":
+            raise RequestRejected("Avrae adapter only accepts the Avrae provider")
+        if expected_operation is not None and request["operation_kind"] != expected_operation:
+            raise RequestRejected(f"Avrae adapter only accepts the {expected_operation} operation")
+        if request["guild_id"] != self.guild_id:
+            raise RequestRejected("Avrae adapter request targets the wrong guild")
+        return request
+
+
+@dataclass
+class QuartermasterOperationAdapter(QuartermasterStatusAdapter):
+    """Verify and dispatch the bounded state-changing operations.
+
+    The native provider must authorize the real actor and commit through
+    Avrae's own combat model; Quartermaster only carries the request identity
+    and records the outcome on its side.
+    """
+
+    provider: NativeOperationProvider
+
+    async def handle(
+        self,
+        body: bytes,
+        *,
+        headers: Mapping[str, str],
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        request = self._validated_request(
+            body,
+            headers=headers,
+            expected_protocol=AVRAE_OPERATION_PROTOCOL,
+            expected_operation=None,
+            now=now,
+        )
+        if request["operation_kind"] not in AVRAE_OPERATION_KINDS:
+            raise RequestRejected("Avrae adapter does not permit this operation")
+        try:
+            payload = self.provider.execute_operation(request)
+            if inspect.isawaitable(payload):
+                payload = await payload
+        except RequestRejected:
+            raise
+        except Exception:
+            return {
+                "status": "FAILED",
+                "provider_reference": request["provider_reference"],
+                "correlation_id": request["correlation_id"],
+                "provider_version": "avrae-native-operation-v1",
+                "payload": {},
+                "error": "native Avrae operation is unavailable",
+                "retryable": False,
+            }
+        if not isinstance(payload, Mapping):
+            raise RequestRejected("native Avrae operation must return an object")
+        return {
+            "status": "COMMITTED",
+            "provider_reference": request["provider_reference"],
+            "correlation_id": request["correlation_id"],
+            "provider_version": "avrae-native-operation-v1",
             "payload": dict(payload),
             "retryable": False,
         }

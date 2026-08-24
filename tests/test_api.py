@@ -60,7 +60,7 @@ from quartermaster.currency import CurrencyService
 from quartermaster.db import SCHEMA_VERSION, SQLiteStore
 from quartermaster.discord_common import BotServices, Quartermaster
 from quartermaster.handles import HandleRepository
-from quartermaster.integration import ProviderResult, ProviderTimeout
+from quartermaster.integration import ProviderIntegrationService, ProviderResult, ProviderTimeout
 from quartermaster.inventory import InventoryService
 from quartermaster.loot import LootDropService
 from quartermaster.preflight import _built_page, run_preflight
@@ -310,6 +310,215 @@ class DossierTests(ApiTestCase):
             key="dossier-import-3",
         )
         self.assertEqual(response.status_code, 403)
+
+
+class AvraeOperationTests(ApiTestCase):
+    def _open_quartermaster_combat(self) -> None:
+        self.context.sessions.start_interaction("avrae-session-next", actor_id=DM_ID)
+        opened = self.context.combat.open_interaction(
+            "avrae-combat-next", actor_id=DM_ID, channel_id="channel-1"
+        )
+        self.assertEqual(opened.logical_response["status"], "OPENED")
+
+    def _with_gateway(self, gateway) -> None:
+        self.context = replace(
+            self.context,
+            avrae_gateway=gateway,
+            provider_operations=ProviderIntegrationService(self.store, self.context.services.receipts),
+        )
+        self.app = create_app(self.context, self.identity, tokens=self.tokens)
+        self.client = TestClient(self.app)
+
+    def test_turn_advance_is_not_queried_without_open_quartermaster_combat(self) -> None:
+        response = self.post("/api/combat/avrae/next", key="avrae-next-no-combat")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "NOT_QUERIED")
+
+    def test_turn_advance_records_the_real_actor_and_replays_without_second_provider_call(self) -> None:
+        self._open_quartermaster_combat()
+
+        class Gateway:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def execute(self, request):
+                self.requests.append(request)
+                return ProviderResult(
+                    status="COMMITTED",
+                    provider_version="native-test",
+                    payload={"operation": "next", "round": 2, "turn": 17},
+                )
+
+        gateway = Gateway()
+        self._with_gateway(gateway)
+        first = self.post("/api/combat/avrae/next", key="avrae-next-1")
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["status"], "COMMITTED")
+        self.assertEqual(first.json()["result"]["operation"], "next")
+        self.assertEqual(gateway.requests[0].actor_id, PLAYER_ID)
+        self.assertEqual(gateway.requests[0].channel_id, "channel-1")
+
+        replay = self.post("/api/combat/avrae/next", key="avrae-next-1")
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertEqual(replay.json(), first.json())
+        self.assertEqual(len(gateway.requests), 1)
+        row = self.store.connection.execute(
+            "SELECT status, operation_kind FROM provider_operations"
+        ).fetchone()
+        self.assertEqual((row["status"], row["operation_kind"]), ("COMMITTED", "next"))
+
+    def test_turn_advance_exposes_an_unresolved_provider_timeout(self) -> None:
+        self._open_quartermaster_combat()
+
+        class Gateway:
+            def execute(self, _request):
+                raise ProviderTimeout("Avrae did not confirm the turn")
+
+        self._with_gateway(Gateway())
+        response = self.post("/api/combat/avrae/next", key="avrae-next-timeout")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "UNKNOWN")
+        self.assertFalse(response.json()["retryable"])
+
+    def test_attack_records_native_attack_and_target_in_the_provider_request(self) -> None:
+        self._open_quartermaster_combat()
+
+        class Gateway:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def execute(self, request):
+                self.requests.append(request)
+                return ProviderResult(
+                    status="COMMITTED",
+                    provider_version="native-test",
+                    payload={"operation": "attack", "attack": "Longsword"},
+                )
+
+        gateway = Gateway()
+        self._with_gateway(gateway)
+        response = self.post(
+            "/api/combat/avrae/attack",
+            {"attack": "Longsword", "target": "Goblin", "args": "-adv"},
+            key="avrae-attack-1",
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "COMMITTED")
+        self.assertEqual(gateway.requests[0].operation_kind, "attack")
+        self.assertEqual(
+            gateway.requests[0].payload,
+            {"source": "quartermaster-api", "attack": "Longsword", "target": "Goblin", "args": "-adv"},
+        )
+        row = self.store.connection.execute(
+            "SELECT status, operation_kind FROM provider_operations"
+        ).fetchone()
+        self.assertEqual((row["status"], row["operation_kind"]), ("COMMITTED", "attack"))
+
+    def test_check_records_native_skill_in_the_provider_request(self) -> None:
+        self._open_quartermaster_combat()
+
+        class Gateway:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def execute(self, request):
+                self.requests.append(request)
+                return ProviderResult(
+                    status="COMMITTED",
+                    provider_version="native-test",
+                    payload={"operation": "check", "skill": "Perception"},
+                )
+
+        gateway = Gateway()
+        self._with_gateway(gateway)
+        response = self.post(
+            "/api/combat/avrae/check",
+            {"skill": "Perception", "args": "-adv"},
+            key="avrae-check-1",
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "COMMITTED")
+        self.assertEqual(gateway.requests[0].operation_kind, "check")
+        self.assertEqual(
+            gateway.requests[0].payload,
+            {"source": "quartermaster-api", "skill": "Perception", "args": "-adv"},
+        )
+        row = self.store.connection.execute(
+            "SELECT status, operation_kind FROM provider_operations"
+        ).fetchone()
+        self.assertEqual((row["status"], row["operation_kind"]), ("COMMITTED", "check"))
+
+    def test_save_records_native_saving_throw_in_the_provider_request(self) -> None:
+        self._open_quartermaster_combat()
+
+        class Gateway:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def execute(self, request):
+                self.requests.append(request)
+                return ProviderResult(
+                    status="COMMITTED",
+                    provider_version="native-test",
+                    payload={"operation": "save", "save": "Wisdom"},
+                )
+
+        gateway = Gateway()
+        self._with_gateway(gateway)
+        response = self.post(
+            "/api/combat/avrae/save",
+            {"save": "Wisdom Save", "args": "-adv"},
+            key="avrae-save-1",
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "COMMITTED")
+        self.assertEqual(gateway.requests[0].operation_kind, "save")
+        self.assertEqual(
+            gateway.requests[0].payload,
+            {"source": "quartermaster-api", "save": "Wisdom Save", "args": "-adv"},
+        )
+        row = self.store.connection.execute(
+            "SELECT status, operation_kind FROM provider_operations"
+        ).fetchone()
+        self.assertEqual((row["status"], row["operation_kind"]), ("COMMITTED", "save"))
+
+    def test_cast_records_native_spell_and_target_in_the_provider_request(self) -> None:
+        self._open_quartermaster_combat()
+
+        class Gateway:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def execute(self, request):
+                self.requests.append(request)
+                return ProviderResult(
+                    status="COMMITTED",
+                    provider_version="native-test",
+                    payload={"operation": "cast", "spell": "Bless"},
+                )
+
+        gateway = Gateway()
+        self._with_gateway(gateway)
+        response = self.post(
+            "/api/combat/avrae/cast",
+            {"spell": "Bless", "target": "Ally", "args": "-l 1"},
+            key="avrae-cast-1",
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "COMMITTED")
+        self.assertEqual(gateway.requests[0].operation_kind, "cast")
+        self.assertEqual(
+            gateway.requests[0].payload,
+            {"source": "quartermaster-api", "spell": "Bless", "target": "Ally", "args": "-l 1"},
+        )
+        row = self.store.connection.execute(
+            "SELECT status, operation_kind FROM provider_operations"
+        ).fetchone()
+        self.assertEqual((row["status"], row["operation_kind"]), ("COMMITTED", "cast"))
 
 class AuthorizationTests(ApiTestCase):
     def test_a_read_without_a_token_is_refused(self) -> None:
@@ -1642,10 +1851,30 @@ class ActivityConfigurationTests(unittest.TestCase):
         self.assertEqual(settings.avrae_adapter_url, "https://avrae.example/quartermaster/status")
         self.assertEqual(settings.avrae_adapter_timeout_seconds, 2.5)
 
+        with_operation = Settings.from_env(
+            self._environment(
+                QM_AVRAE_ADAPTER_URL="https://avrae.example/quartermaster/status",
+                QM_AVRAE_OPERATION_URL="https://avrae.example/quartermaster/operation",
+                QM_AVRAE_ADAPTER_SECRET="shared-secret",
+            )
+        )
+        self.assertEqual(
+            with_operation.avrae_operation_url,
+            "https://avrae.example/quartermaster/operation",
+        )
+
         for overrides in (
             {"QM_AVRAE_ADAPTER_URL": "https://avrae.example/status"},
             {"QM_AVRAE_ADAPTER_SECRET": "shared-secret"},
             {"QM_AVRAE_ADAPTER_URL": "ftp://avrae.example/status", "QM_AVRAE_ADAPTER_SECRET": "secret"},
+            {
+                "QM_AVRAE_OPERATION_URL": "https://avrae.example/operation",
+            },
+            {
+                "QM_AVRAE_ADAPTER_URL": "https://avrae.example/status",
+                "QM_AVRAE_ADAPTER_SECRET": "secret",
+                "QM_AVRAE_OPERATION_URL": "ftp://avrae.example/operation",
+            },
         ):
             with self.subTest(**overrides):
                 with self.assertRaises(ConfigurationError):

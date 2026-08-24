@@ -18,7 +18,7 @@ from .currency import CurrencyService
 from .db import SQLiteStore
 from .dice import DiceService
 from .dossiers import CharacterDossierService
-from .integration import AvraeGateway
+from .integration import AvraeGateway, ProviderIntegrationService
 from .inventory import InventoryService
 from .loot import LootDropService
 from .receipts import ReceiptRepository
@@ -47,6 +47,7 @@ class BotServices:
     combat: CombatService | None = None
     dice: DiceService | None = None
     dossiers: CharacterDossierService | None = None
+    provider_operations: ProviderIntegrationService | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class Quartermaster:
     avrae_gateway: AvraeGateway | None = None
     dice: DiceService | None = None
     dossiers: CharacterDossierService | None = None
+    provider_operations: ProviderIntegrationService | None = None
 
     @property
     def inventory(self) -> InventoryService:

@@ -1,4 +1,4 @@
-"""Authenticated, read-only HTTP transport for the Avrae provider boundary.
+"""Authenticated HTTP transport for the Avrae provider boundary.
 
 This module is deliberately a client, not a second combat implementation. The
 Quartermaster process sends the actor, guild, channel, session, and correlation
@@ -29,6 +29,8 @@ from uuid import uuid4
 from .integration import ProviderIntegrationError, ProviderRequest, ProviderResult, ProviderTimeout
 
 AVRAE_STATUS_PROTOCOL = "qm-avrae-status-v1"
+AVRAE_OPERATION_PROTOCOL = "qm-avrae-operation-v1"
+AVRAE_OPERATION_KINDS = frozenset({"next", "attack", "check", "save", "cast"})
 SIGNATURE_HEADER = "X-Quartermaster-Signature"
 TIMESTAMP_HEADER = "X-Quartermaster-Timestamp"
 NONCE_HEADER = "X-Quartermaster-Nonce"
@@ -61,12 +63,16 @@ class AvraeWireRequest:
 
     @classmethod
     def from_provider_request(cls, request: ProviderRequest) -> AvraeWireRequest:
-        if request.operation_kind != "status":
+        if request.operation_kind == "status":
+            protocol = AVRAE_STATUS_PROTOCOL
+        elif request.operation_kind in AVRAE_OPERATION_KINDS:
+            protocol = AVRAE_OPERATION_PROTOCOL
+        else:
             raise ProviderIntegrationError(
-                "the initial Avrae HTTP adapter only permits the read-only status operation"
+                "the Avrae HTTP adapter does not yet permit this operation"
             )
         return cls(
-            protocol=AVRAE_STATUS_PROTOCOL,
+            protocol=protocol,
             operation_id=request.operation_id,
             provider=request.provider,
             operation_kind=request.operation_kind,
@@ -166,6 +172,7 @@ class HttpAvraeGateway:
         secret: str,
         *,
         timeout_seconds: float = 2.5,
+        operation_endpoint_url: str | None = None,
         transport: AvraeGatewayTransport | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -177,31 +184,52 @@ class HttpAvraeGateway:
             raise ValueError("Avrae adapter endpoint URL must be an http:// or https:// URL")
         if parsed_url.username is not None or parsed_url.password is not None:
             raise ValueError("Avrae adapter endpoint URL must not contain credentials")
+        if operation_endpoint_url is not None:
+            operation_endpoint_url = operation_endpoint_url.strip()
+            operation_parsed_url = urlsplit(operation_endpoint_url)
+            if operation_parsed_url.scheme not in {"http", "https"} or not operation_parsed_url.netloc:
+                raise ValueError("Avrae operation endpoint URL must be an http:// or https:// URL")
+            if operation_parsed_url.username is not None or operation_parsed_url.password is not None:
+                raise ValueError("Avrae operation endpoint URL must not contain credentials")
         if not secret.strip():
             raise ValueError("Avrae adapter secret must not be empty")
         if timeout_seconds <= 0:
             raise ValueError("Avrae adapter timeout must be positive")
         self.endpoint_url = endpoint_url
+        self.operation_endpoint_url = operation_endpoint_url
         self.secret = secret
         self.timeout_seconds = timeout_seconds
         self.transport = transport or _read_url
         self.clock = clock
 
     def execute(self, request: ProviderRequest) -> ProviderResult:
-        body = encode_wire_request(request)
+        wire = AvraeWireRequest.from_provider_request(request)
+        try:
+            body = json.dumps(
+                wire.as_mapping(), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise ProviderIntegrationError("Avrae request payload must be JSON-serializable") from error
         timestamp = str(int(self.clock()))
         nonce = new_nonce()
         headers = {
             "Content-Type": "application/json",
-            PROTOCOL_HEADER: AVRAE_STATUS_PROTOCOL,
+            PROTOCOL_HEADER: wire.protocol,
             TIMESTAMP_HEADER: timestamp,
             NONCE_HEADER: nonce,
             SIGNATURE_HEADER: signature_for(
                 secret=self.secret, timestamp=timestamp, nonce=nonce, body=body
             ),
         }
+        endpoint_url = self.endpoint_url
+        if request.operation_kind != "status":
+            if self.operation_endpoint_url is None:
+                raise ProviderIntegrationError(
+                    "state-changing Avrae operations require an operation endpoint URL"
+                )
+            endpoint_url = self.operation_endpoint_url
         http_request = urllib.request.Request(
-            self.endpoint_url,
+            endpoint_url,
             data=body,
             headers=headers,
             method="POST",
@@ -256,4 +284,5 @@ def gateway_for_settings(settings: Any) -> HttpAvraeGateway | None:
         settings.avrae_adapter_url,
         settings.avrae_adapter_secret,
         timeout_seconds=settings.avrae_adapter_timeout_seconds,
+        operation_endpoint_url=settings.avrae_operation_url,
     )

@@ -1,7 +1,7 @@
 # Quartermaster Avrae adapter (opt-in)
 
-This directory contains the first, read-only integration slice for a
-self-hosted or forked Avrae deployment. It is not loaded by the hosted
+This directory contains the first bounded integration slice for a self-hosted
+or forked Avrae deployment. It is not loaded by the hosted
 Quartermaster bot and it does not open, read, or write Quartermaster's SQLite
 database.
 
@@ -11,17 +11,25 @@ The boundary is:
    `X-Quartermaster-Timestamp`, `X-Quartermaster-Nonce`, and
    `X-Quartermaster-Signature`.
 2. The Avrae-side handler verifies the HMAC, clock skew, nonce replay, protocol,
-   operation (`status` only), and configured guild.
-3. A provider supplied by the Avrae Cog reads native status inside Avrae and
-   returns a provider result. Quartermaster displays it as provider state and
-   never stores HP, initiative, conditions, resources, or combatants.
+   operation (`status`, the bounded `next` turn operation, an explicit
+   `attack`, a native `check`, a native `save`, or a bounded `cast`), and
+   configured guild.
+3. A provider supplied by the Avrae Cog reads native status, advances the
+   native turn, resolves one native attack, rolls one native check or save, or
+   casts one native spell inside Avrae and returns a provider result. Quartermaster keeps the operation
+   receipt and provider outcome, but never calculates or stores HP, initiative,
+   conditions, resources, or combatants.
 
 `quartermaster_adapter.py` is dependency-light and owns the signed request
 contract. Loading `quartermaster_cog.py` starts an `aiohttp` listener at
-`/quartermaster/v1/status` and reads the native combat model through
-`Combat.from_id`. The synthetic context is used only for model deserialization;
-it is never passed to a mutating command handler. The signed actor must still
-be a member of the configured guild, and the channel must belong to that guild.
+`/quartermaster/v1/status` and `/quartermaster/v1/operation`, reads the native
+combat model through `Combat.from_id`, and performs only the bounded native
+`next`, explicit-target `attack`, bounded `check`, bounded `save`, and bounded
+`cast` operations. The synthetic context is used
+for model loading and native commit; it is never passed to an unrelated
+mutating command handler. The signed actor must still be a member of the
+configured guild, the channel must belong to that guild, and Avrae's normal
+combat-DM/turn authorization applies.
 
 ## Quartermaster configuration
 
@@ -29,6 +37,7 @@ Configure the full POST endpoint and the same secret in Quartermaster:
 
 ```text
 QM_AVRAE_ADAPTER_URL=https://avrae-host.example/quartermaster/v1/status
+QM_AVRAE_OPERATION_URL=https://avrae-host.example/quartermaster/v1/operation
 QM_AVRAE_ADAPTER_SECRET=<long-random-shared-secret>
 QM_AVRAE_ADAPTER_TIMEOUT_SECONDS=2.5
 
@@ -39,8 +48,11 @@ QM_AVRAE_ADAPTER_PORT=8787
 
 When these values are absent, the existing hosted-Avrae handoff continues to
 work and the Activity reports the adapter as not configured. The initial
-status route is `GET /api/combat/avrae`; it only calls Avrae while a
-Quartermaster combat is open.
+status route is `GET /api/combat/avrae`; the bounded provider routes are
+`POST /api/combat/avrae/next`, `/api/combat/avrae/attack`,
+`/api/combat/avrae/check`, `/api/combat/avrae/save`, and
+`/api/combat/avrae/cast`. They only call Avrae while a Quartermaster combat is
+open and record provider operation receipts.
 
 For a remote bind, set `QM_AVRAE_ADAPTER_ALLOW_REMOTE=1` only when a TLS
 reverse proxy terminates HTTPS in front of the listener. The listener itself
@@ -49,15 +61,18 @@ is plain HTTP; HMAC authenticates the request but does not encrypt it.
 ## What is not implemented yet
 
 - the TLS/reverse-proxy deployment and live self-hosted acceptance;
-- authorization semantics beyond guild membership for future mutations;
-- any state-changing provider operation;
+- live acceptance of the bounded `next` operation and its actor/idempotency
+  behavior;
+- state-changing operations beyond `next`, `attack`, `check`, `save`, and
+  `cast` (combat start/end and combatant mutation);
 - durable provider receipts for status reads or automatic retries.
 
-The disposable local spike now proves one real native status read through the
-listener with Avrae's MongoDB and Redis dependencies. A real Discord login,
-guild, TLS deployment, and harmless state change remain before this should be
-called live. Combat actions remain out of scope until actor authorization,
-idempotency, and timeout recovery are demonstrated in the Avrae process.
+The disposable local spike proves one real native status read through the
+listener with Avrae's MongoDB and Redis dependencies. The `next`, `attack`,
+`check`, `save`, and `cast` paths are covered at the signed gateway, adapter, and
+Quartermaster receipt boundary, but none has yet been exercised through a Discord-connected
+self-hosted Avrae deployment. A real Discord login, guild, TLS deployment, and
+native mechanic result remain before this should be called live.
 
 ## Disposable local validation
 

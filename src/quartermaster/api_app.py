@@ -70,7 +70,13 @@ from .discord_common import Quartermaster
 from .dossiers import CharacterDossierService, DossierError
 from .export import render_export
 from .handles import HandleError
-from .integration import ProviderRequest, ProviderResult, ProviderTimeout
+from .integration import (
+    ProviderIntegrationError,
+    ProviderIntegrationService,
+    ProviderRequest,
+    ProviderResult,
+    ProviderTimeout,
+)
 from .inventory import InventoryError, SemanticStaleness
 from .loot import LootDropError
 from .operations import (
@@ -176,6 +182,12 @@ def _dossier_service(context: Quartermaster) -> CharacterDossierService:
     """Use the assembled dossier service while keeping older test contexts valid."""
 
     return context.dossiers or CharacterDossierService(context.store, context.services.receipts)
+
+
+def _provider_operations(context: Quartermaster) -> ProviderIntegrationService:
+    """Use the assembled provider service while keeping older test contexts valid."""
+
+    return context.provider_operations or ProviderIntegrationService(context.store, context.services.receipts)
 
 
 #: What a client-generated idempotency key may look like. A Discord interaction
@@ -860,6 +872,28 @@ class CombatCloseRequest(BaseModel):
     outcome: str | None = Field(default=None, max_length=200)
 
 
+class AvraeAttackRequest(BaseModel):
+    attack: str = Field(min_length=1, max_length=120)
+    target: str = Field(min_length=1, max_length=120)
+    args: str = Field(default="", max_length=500)
+
+
+class AvraeCheckRequest(BaseModel):
+    skill: str = Field(min_length=1, max_length=120)
+    args: str = Field(default="", max_length=500)
+
+
+class AvraeSaveRequest(BaseModel):
+    save: str = Field(min_length=1, max_length=120)
+    args: str = Field(default="", max_length=500)
+
+
+class AvraeCastRequest(BaseModel):
+    spell: str = Field(min_length=1, max_length=120)
+    target: str = Field(min_length=1, max_length=120)
+    args: str = Field(default="", max_length=500)
+
+
 class EstateRequest(BaseModel):
     character_id: str = Field(min_length=1, max_length=64)
     destination: str = Field(default="party", min_length=1, max_length=64)
@@ -1043,6 +1077,275 @@ def close_combat(
     return _committed(
         state.context.combat.close_interaction(action, actor_id=dm.id, outcome=request.outcome)
     )
+
+
+@router.post("/combat/avrae/next")
+def advance_avrae_turn(state: State, actor: CurrentActor, action: Idempotency) -> dict[str, Any]:
+    """Ask Avrae to advance the native turn, preserving its authority checks.
+
+    Quartermaster only supplies the authenticated actor and the channel-bound
+    encounter context. Avrae decides whether that actor may advance the turn
+    and commits the native combat model; the durable provider receipt records
+    the result or an unresolved timeout.
+    """
+
+    quartermaster_status = state.context.combat.status()
+    encounter = quartermaster_status.get("encounter")
+    if quartermaster_status.get("status") != "OPEN" or not isinstance(encounter, dict):
+        return {
+            "status": "NOT_QUERIED",
+            "provider": "avrae",
+            "operation_kind": "next",
+            "quartermaster": quartermaster_status,
+            "result": None,
+        }
+
+    gateway = state.context.avrae_gateway
+    if gateway is None:
+        return {
+            "status": "NOT_CONFIGURED",
+            "provider": "avrae",
+            "operation_kind": "next",
+            "quartermaster": quartermaster_status,
+            "result": None,
+            "error": "the Avrae operation adapter is not configured",
+        }
+
+    channel_id = str(encounter["channel_id"])
+    provider_operations = _provider_operations(state.context)
+    execution = provider_operations.begin(
+        action,
+        actor_id=actor.id,
+        guild_id=state.settings.guild_id,
+        channel_id=channel_id,
+        session_id=str(quartermaster_status["session_id"]),
+        operation_kind="next",
+        provider_reference=f"channel:{channel_id}",
+        payload={"source": "quartermaster-api"},
+    )
+    try:
+        result = provider_operations.execute(execution, gateway)
+    except ProviderIntegrationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return result.logical_response
+
+
+@router.post("/combat/avrae/attack")
+def execute_avrae_attack(
+    state: State,
+    actor: CurrentActor,
+    action: Idempotency,
+    request: AvraeAttackRequest,
+) -> dict[str, Any]:
+    """Ask Avrae to resolve one native attack for the active combatant."""
+
+    quartermaster_status = state.context.combat.status()
+    encounter = quartermaster_status.get("encounter")
+    if quartermaster_status.get("status") != "OPEN" or not isinstance(encounter, dict):
+        return {
+            "status": "NOT_QUERIED",
+            "provider": "avrae",
+            "operation_kind": "attack",
+            "quartermaster": quartermaster_status,
+            "result": None,
+        }
+
+    gateway = state.context.avrae_gateway
+    if gateway is None:
+        return {
+            "status": "NOT_CONFIGURED",
+            "provider": "avrae",
+            "operation_kind": "attack",
+            "quartermaster": quartermaster_status,
+            "result": None,
+            "error": "the Avrae operation adapter is not configured",
+        }
+
+    channel_id = str(encounter["channel_id"])
+    provider_operations = _provider_operations(state.context)
+    execution = provider_operations.begin(
+        action,
+        actor_id=actor.id,
+        guild_id=state.settings.guild_id,
+        channel_id=channel_id,
+        session_id=str(quartermaster_status["session_id"]),
+        operation_kind="attack",
+        provider_reference=f"channel:{channel_id}",
+        payload={
+            "source": "quartermaster-api",
+            "attack": request.attack,
+            "target": request.target,
+            "args": request.args,
+        },
+    )
+    try:
+        result = provider_operations.execute(execution, gateway)
+    except ProviderIntegrationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return result.logical_response
+
+
+@router.post("/combat/avrae/check")
+def execute_avrae_check(
+    state: State,
+    actor: CurrentActor,
+    action: Idempotency,
+    request: AvraeCheckRequest,
+) -> dict[str, Any]:
+    """Ask Avrae to resolve one native ability check for the active combatant."""
+
+    quartermaster_status = state.context.combat.status()
+    encounter = quartermaster_status.get("encounter")
+    if quartermaster_status.get("status") != "OPEN" or not isinstance(encounter, dict):
+        return {
+            "status": "NOT_QUERIED",
+            "provider": "avrae",
+            "operation_kind": "check",
+            "quartermaster": quartermaster_status,
+            "result": None,
+        }
+
+    gateway = state.context.avrae_gateway
+    if gateway is None:
+        return {
+            "status": "NOT_CONFIGURED",
+            "provider": "avrae",
+            "operation_kind": "check",
+            "quartermaster": quartermaster_status,
+            "result": None,
+            "error": "the Avrae operation adapter is not configured",
+        }
+
+    channel_id = str(encounter["channel_id"])
+    provider_operations = _provider_operations(state.context)
+    execution = provider_operations.begin(
+        action,
+        actor_id=actor.id,
+        guild_id=state.settings.guild_id,
+        channel_id=channel_id,
+        session_id=str(quartermaster_status["session_id"]),
+        operation_kind="check",
+        provider_reference=f"channel:{channel_id}",
+        payload={
+            "source": "quartermaster-api",
+            "skill": request.skill,
+            "args": request.args,
+        },
+    )
+    try:
+        result = provider_operations.execute(execution, gateway)
+    except ProviderIntegrationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return result.logical_response
+
+
+@router.post("/combat/avrae/save")
+def execute_avrae_save(
+    state: State,
+    actor: CurrentActor,
+    action: Idempotency,
+    request: AvraeSaveRequest,
+) -> dict[str, Any]:
+    """Ask Avrae to resolve one native saving throw for the active combatant."""
+
+    quartermaster_status = state.context.combat.status()
+    encounter = quartermaster_status.get("encounter")
+    if quartermaster_status.get("status") != "OPEN" or not isinstance(encounter, dict):
+        return {
+            "status": "NOT_QUERIED",
+            "provider": "avrae",
+            "operation_kind": "save",
+            "quartermaster": quartermaster_status,
+            "result": None,
+        }
+
+    gateway = state.context.avrae_gateway
+    if gateway is None:
+        return {
+            "status": "NOT_CONFIGURED",
+            "provider": "avrae",
+            "operation_kind": "save",
+            "quartermaster": quartermaster_status,
+            "result": None,
+            "error": "the Avrae operation adapter is not configured",
+        }
+
+    channel_id = str(encounter["channel_id"])
+    provider_operations = _provider_operations(state.context)
+    execution = provider_operations.begin(
+        action,
+        actor_id=actor.id,
+        guild_id=state.settings.guild_id,
+        channel_id=channel_id,
+        session_id=str(quartermaster_status["session_id"]),
+        operation_kind="save",
+        provider_reference=f"channel:{channel_id}",
+        payload={
+            "source": "quartermaster-api",
+            "save": request.save,
+            "args": request.args,
+        },
+    )
+    try:
+        result = provider_operations.execute(execution, gateway)
+    except ProviderIntegrationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return result.logical_response
+
+
+@router.post("/combat/avrae/cast")
+def execute_avrae_cast(
+    state: State,
+    actor: CurrentActor,
+    action: Idempotency,
+    request: AvraeCastRequest,
+) -> dict[str, Any]:
+    """Ask Avrae to cast one native prepared spell at one native target."""
+
+    quartermaster_status = state.context.combat.status()
+    encounter = quartermaster_status.get("encounter")
+    if quartermaster_status.get("status") != "OPEN" or not isinstance(encounter, dict):
+        return {
+            "status": "NOT_QUERIED",
+            "provider": "avrae",
+            "operation_kind": "cast",
+            "quartermaster": quartermaster_status,
+            "result": None,
+        }
+
+    gateway = state.context.avrae_gateway
+    if gateway is None:
+        return {
+            "status": "NOT_CONFIGURED",
+            "provider": "avrae",
+            "operation_kind": "cast",
+            "quartermaster": quartermaster_status,
+            "result": None,
+            "error": "the Avrae operation adapter is not configured",
+        }
+
+    channel_id = str(encounter["channel_id"])
+    provider_operations = _provider_operations(state.context)
+    execution = provider_operations.begin(
+        action,
+        actor_id=actor.id,
+        guild_id=state.settings.guild_id,
+        channel_id=channel_id,
+        session_id=str(quartermaster_status["session_id"]),
+        operation_kind="cast",
+        provider_reference=f"channel:{channel_id}",
+        payload={
+            "source": "quartermaster-api",
+            "spell": request.spell,
+            "target": request.target,
+            "args": request.args,
+        },
+    )
+    try:
+        result = provider_operations.execute(execution, gateway)
+    except ProviderIntegrationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return result.logical_response
 
 
 # Characters -----------------------------------------------------------------
