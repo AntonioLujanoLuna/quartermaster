@@ -1,8 +1,9 @@
 # Dice, Character Sheets, and Explainable Mechanics
 
-Status: Stage 1 Dice slice implemented and live-accepted in the Activity on 2026-08-23;
-second-client propagation remains open with the broader Activity release gate.
-Stages 2-5 remain proposed. This document does not authorize a local D&D mechanics engine.
+Status: Stage 1 Dice slice and the local Stage 2 read-only dossier slice are implemented;
+Stage 1 was live-accepted in the Activity on 2026-08-23. Second-client propagation,
+real-play observation, and provider-backed freshness remain open with the broader Activity
+release gate. This document does not authorize a local D&D mechanics engine.
 
 This is a post-v2.6 extension plan for the Activity and the existing Avrae boundary. It
 does not change SQLite's role as Quartermaster's canonical store for continuity, inventory,
@@ -136,9 +137,10 @@ The initial snapshot contract should carry:
 The Activity should show a stale or unavailable indicator. A cached sheet is useful for
 orientation, but it must not look current if the provider has not confirmed it.
 
-The first version should support one explicitly documented import/source path. It should not
-accept arbitrary client JSON as a character sheet, and it should not let a stale snapshot
-authorize a mechanic.
+The first version now supports one explicitly documented source path: a DM-only typed
+`POST /api/characters/dossier` manual import, stored as a versioned snapshot. The Activity
+reads it through `/api/me/dossier` on the **Character** screen. It does not accept a provider
+label from the caller, and it does not let a stale snapshot authorize a mechanic.
 
 Automatic bonus detection is deliberately not enabled by the roster or by a local helper. A
 character name is not a character sheet. Until a verified snapshot or provider result supplies
@@ -275,9 +277,10 @@ Every stage needs both domain/API tests and a real Activity check. The important
 - a second client receiving a recorded result;
 - mobile readability of the full breakdown.
 
-The first implementation slice is now locally complete at Stage 1. Stage 2 can follow once the Dice view has
-been observed in real play rather than only in this acceptance run. Stage 4 remains parked unless the group
-explicitly accepts the Avrae operational burden or a supported execution surface becomes available.
+The first implementation slice is now locally complete at Stage 2. The contract is deliberately
+generic until the dossier has been observed in real play; a full editor and automatic bonus
+detection remain out of scope. Stage 4 remains parked unless the group explicitly accepts the
+Avrae operational burden or a supported execution surface becomes available.
 
 The Stage 1 live acceptance on 2026-08-23 used the configured Discord Activity after restarting
 the managed bot onto the current Dice route wiring. A public `d20+5` rendered as `d20: [17]`,
@@ -286,13 +289,19 @@ and identified the counted one; a DM-only `d20` rendered its result but stated t
 added to the session log. The two public results appeared in the Session 3 Discord history
 thread. This accepts the first Dice slice; it does not select a character-sheet contract.
 
+On 2026-08-24 the live Activity Character screen loaded through a fresh mapped Quick Tunnel
+and showed the expected unavailable state for the bound character: no verified snapshot had
+been imported. This validates the read path and its refusal to imply current sheet values.
+It does not count as real-play observation of which fields the table needs, so the generic
+snapshot contract remains unchanged.
+
 ## Immediate next implementation work
 
 1. Finish the current Activity release-gate checks that do not require new domain code.
-2. Use the accepted Stage 1 Dice slice in a real play session and observe which character
+2. Use the accepted Dice and dossier slices in a real play session and observe which character
    values the table actually asks for.
-3. Only after that observation, design the read-only character snapshot/import contract. Do
-   not build a complete character-sheet editor from assumptions.
+3. Refine the read-only snapshot contract from that observation. Do not build a complete
+   character-sheet editor or a local rules engine from assumptions.
 
 ## Explicitly not queued
 

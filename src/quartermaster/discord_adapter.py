@@ -23,6 +23,7 @@ from .discord_common import (
     _send_error,
 )
 from .discord_projection import DiscordProjectionTransport, ProjectionRunner
+from .dossiers import CharacterDossierService
 from .handles import HandleRepository
 from .inventory import InventoryService
 from .loot import LootDropService
@@ -59,6 +60,7 @@ def assemble_services(
         loot=loot,
         combat=combat,
         dice=dice,
+        dossiers=CharacterDossierService(store, receipts),
     )
 
 
@@ -80,6 +82,7 @@ def context_for(settings: Settings, services: BotServices) -> Quartermaster:
         handoff=services.avrae_handoff or AvraeHandoffService(services.store),
         avrae_gateway=gateway_for_settings(settings),
         dice=services.dice or DiceService(services.store, services.receipts),
+        dossiers=services.dossiers or CharacterDossierService(services.store, services.receipts),
     )
 
 

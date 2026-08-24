@@ -18,11 +18,14 @@ from discord import app_commands
 from discord.ext import commands
 
 from .discord_common import Quartermaster
-from .discord_panels import open_home
+from .discord_panels import open_home as open_legacy_home
+from .discord_retained import open_home as open_retained_home
 
 
 def register_commands(bot: commands.Bot, guild: discord.Object, context: Quartermaster) -> None:
     """Register the Quartermaster entry point on the given bot tree."""
+
+    open_home = open_retained_home if context.settings.discord_surface == "retained" else open_legacy_home
 
     @bot.tree.command(name="quartermaster", description="Open Quartermaster")
     @app_commands.guilds(guild)

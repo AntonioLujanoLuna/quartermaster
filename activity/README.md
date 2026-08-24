@@ -2,8 +2,8 @@
 
 The web surface Discord embeds in its own client. Stages 1 to 5 of
 [the migration plan](../docs/activity-migration-plan.md): the API, the OAuth
-handshake, the live feed that keeps the screen current, five screens a player
-can act on — Party Stash, My Items, Loot, Treasury, and Dice, with the instance roster
+handshake, the live feed that keeps the screen current, six screens a player
+can act on or read — Party Stash, My Items, Character, Loot, Treasury, and Dice, with the instance roster
 beside them — and everything a DM does, so that an evening needs no panel.
 
 The first live Discord smoke acceptance completed on 2026-08-23. The Activity
@@ -103,8 +103,8 @@ moving ten minutes ago.
    answers on both, so this does not depend on which behaviour is live — and it
    is what lets the built page be opened straight from the bind for a smoke
    test, with no proxy in front of it.
-4. **Entry Point Command**: the launcher. `/quartermaster` continues to open
-   the panel until Stage 6 decides what the bot keeps.
+4. **Entry Point Command**: the launcher. `/quartermaster` opens the retained
+   browse surface by default; set `QM_DISCORD_SURFACE=legacy` only for rollback.
 
 Copy the application's **Client ID** and **Client Secret** — the backend needs
 both, and the frontend needs the id.
@@ -168,6 +168,11 @@ showed their breakdowns and appeared in the Session 3 history thread, while the 
 was explicitly kept out of the session log. A second-client Dice propagation check remains
 open with the broader multi-client Activity gate.
 
+On 2026-08-24 the live Activity also opened the **Character** screen for the bound player.
+Because no verified dossier snapshot had been imported, it displayed the explicit unavailable
+state rather than presenting guessed sheet values. This confirms the read-only unavailable
+path; real-play observation still decides whether the generic dossier contract needs to grow.
+
 The negative case was also observed: a player without an active character was
 refused a take. The tunnel hostname is temporary and must be replaced in the URL
 mapping after a Quick Tunnel restart.
@@ -226,7 +231,8 @@ the token per request, so the check is the API's, not the tab's.
 
 ## What is not here yet
 
-Stage 6: the panels are all still there. The initial Activity smoke test is
-complete, but what the bot keeps forever is a judgement about what people reach
-for *outside* a session; that is worth making after a full session has been
-played on the Activity rather than before.
+Stage 6: the retained bot surface is now the default; the full panels remain available
+only through `QM_DISCORD_SURFACE=legacy` while the table confirms what it still needs.
+The initial Activity smoke test is complete, but what the bot keeps forever is a judgement
+about what people reach for *outside* a session; that is worth making after a full session
+has been played on the Activity rather than before.

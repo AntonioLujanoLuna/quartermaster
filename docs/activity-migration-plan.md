@@ -7,9 +7,10 @@ live WebSocket, player reads, active-character binding, and a Party Stash take
 were exercised in the configured guild through a temporary HTTPS tunnel. The
 server-owner DM path is now also live-accepted: the owner sees the DM tab and its
 session, combat, maintenance, and grant controls. A full evening, multi-client
-propagation, mobile layout, and non-owner DM refusal remain to be verified. Stage 6
-is proposed and should stay proposed until that real use supplies the judgement for
-retiring the panels. Proposed mechanics extensions are tracked separately in
+propagation, mobile layout, and non-owner DM refusal remain to be verified. Stage 6's
+retained-surface slice is now the default bot entry point; the full panels remain
+available only through the explicit legacy compatibility setting until live use supplies
+the judgement for deleting them. Proposed mechanics extensions are tracked separately in
 [the Dice and Mechanics plan](dice-and-mechanics-plan.md).
 
 ## Why
@@ -453,9 +454,15 @@ that history. A second-client propagation check remains part of the broader Acti
 The slice is tracked in [the Dice and Mechanics plan](dice-and-mechanics-plan.md), not folded
 into the Avrae authority boundary.
 
-**Stage 6 — Retire the panels.** Delete what Stage 4 and 5 replaced. Keep the entry point,
-the projection, and a deliberately small async surface (see below). *Exit:
-`discord_panels.py` and `discord_views.py` are gone or reduced to the retained surface.*
+**Stage 6 — Retain the useful bot surface.** *First slice implemented.* The default
+`QM_DISCORD_SURFACE=retained` entry point keeps Party Stash browse, My Items browse,
+Refresh, and the DM's Grant shortcut. The Activity owns the table mutations and the
+session-time workflows. `QM_DISCORD_SURFACE=legacy` is an explicit rollback switch for
+the old full panel surface while it is being retired.
+
+*Exit remains open:* run the retained surface through a real evening, then remove the
+legacy switch and the duplicate panel code once the table has confirmed what it still
+needs between sessions.
 
 Stages 1–3 are the ones worth doing before committing to the rest. If the proxy, the
 handshake, or the hosting turns out to be intolerable, that is knowable by the end of

@@ -41,6 +41,7 @@ const state = {
   // notice: nobody reads a health report in the corner of a screen.
   report: null,
   roster: [],
+  dossier: null,
   playing: new Set(),
   live: "connecting",
   // What has been typed but not yet sent. Held here rather than only in the
@@ -90,6 +91,9 @@ const READERS = {
   combat: async () => {
     state.combat = await api.combat();
   },
+  dossier: async () => {
+    state.dossier = await api.dossier();
+  },
   continuity: async () => {
     state.continuity = await api.continuity();
   },
@@ -105,6 +109,7 @@ const READERS = {
 const SCREEN_READS = {
   stash: ["stash"],
   items: ["holdings"],
+  dossier: ["dossier"],
   loot: ["loot"],
   treasury: ["treasury"],
   // The roster is read for every screen already; the fight is not, and it is

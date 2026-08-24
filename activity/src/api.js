@@ -111,6 +111,7 @@ export const api = {
   loot: () => request("/loot"),
   treasury: () => request("/treasury"),
   characters: () => request("/characters"),
+  dossier: () => request("/me/dossier"),
   combat: () => request("/combat"),
   continuity: () => request("/session/continuity"),
   diceRolls: () => request("/dice/rolls"),

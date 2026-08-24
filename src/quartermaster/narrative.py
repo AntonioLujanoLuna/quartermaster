@@ -105,6 +105,10 @@ EVENT_RENDERERS: dict[str, Callable[[Mapping[str, Any]], str]] = {
     "CHARACTER_LIFECYCLE_CHANGED": lambda payload: (
         f"{payload['name']} moved from {payload['from']} to {payload['to']}."
     ),
+    "CHARACTER_DOSSIER_IMPORTED": lambda payload: (
+        f"A {payload['source_freshness'].lower()} character dossier was imported for "
+        f"{payload['character_name']} (snapshot {payload['snapshot_version']})."
+    ),
     "COMBAT_OPENED": lambda payload: f"Combat opened in <#{payload['channel_id']}>.",
     "COMBAT_CLOSED": _combat_closed_line,
     "DICE_ROLLED": _dice_rolled_line,

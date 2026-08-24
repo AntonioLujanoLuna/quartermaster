@@ -74,6 +74,8 @@ $env:QM_DISCORD_CLIENT_ID = "..."
 $env:QM_DISCORD_CLIENT_SECRET = "..."
 $env:QM_API_BIND = "127.0.0.1:8080"
 $env:QM_ACTIVITY_DIST = ".\activity\dist"
+# Optional rollback while retiring the old bot panels. The default is retained.
+$env:QM_DISCORD_SURFACE = "retained"
 ```
 
 These can be set user-level like the backup values, and `start-quartermaster.ps1` imports every `QM_` value it finds there. It previously imported only the five required ones, which meant an Activity configured user-level reached the Developer Portal but never reached the process; if that has already been set up against an older copy of the script, take this one.
@@ -203,6 +205,12 @@ WARNING quartermaster.discord_projection: could not pin the Party Stash projecti
 ```
 
 Grant the permission or free a pin slot; the surface pins itself on the next delivery, with no operator action and no lost updates in between. `health` will not report this — the projection is current, it is just scrolling with the channel.
+
+## Upgrading to schema 13
+
+Schema 13 adds versioned `character_dossiers` snapshots. The first source is a DM-only
+typed manual import; the Activity reads the snapshot but never uses it to authorize or
+calculate a mechanic. The migration needs no operator action.
 
 ## Upgrading to schema 12
 

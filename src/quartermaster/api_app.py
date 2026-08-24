@@ -67,6 +67,7 @@ from .currency import CurrencyError, CurrencySemanticStaleness
 from .db import SCHEMA_VERSION
 from .dice import DiceRollError, DiceService
 from .discord_common import Quartermaster
+from .dossiers import CharacterDossierService, DossierError
 from .export import render_export
 from .handles import HandleError
 from .integration import ProviderRequest, ProviderResult, ProviderTimeout
@@ -169,6 +170,12 @@ def _dice_service(context: Quartermaster) -> DiceService:
     """Use the assembled service, while keeping older test contexts valid."""
 
     return context.dice or DiceService(context.store, context.services.receipts)
+
+
+def _dossier_service(context: Quartermaster) -> CharacterDossierService:
+    """Use the assembled dossier service while keeping older test contexts valid."""
+
+    return context.dossiers or CharacterDossierService(context.store, context.services.receipts)
 
 
 #: What a client-generated idempotency key may look like. A Discord interaction
@@ -297,6 +304,13 @@ def treasury(state: State, actor: CurrentActor) -> dict[str, Any]:
 def characters(state: State, _: CurrentActor) -> dict[str, Any]:
     roster = state.context.characters.list_characters()
     return {"characters": roster, "total": len(roster)}
+
+
+@router.get("/me/dossier")
+def my_dossier(state: State, actor: CurrentActor) -> dict[str, Any]:
+    """Read the caller's imported snapshot, never a client-supplied sheet."""
+
+    return _dossier_service(state.context).read_for_actor(actor.id)
 
 
 @router.get("/combat")
@@ -456,6 +470,28 @@ class TreasuryGiveRequest(BaseModel):
 class CharacterRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     discord_user_id: str | None = Field(default=None, max_length=32)
+
+
+class CharacterDossierRequest(BaseModel):
+    character_id: str = Field(min_length=1, max_length=64)
+    source_reference: str | None = Field(default=None, max_length=200)
+    system: str = Field(min_length=1, max_length=80)
+    rules_version: str = Field(min_length=1, max_length=80)
+    level: int | None = Field(default=None, ge=1, le=30)
+    proficiency_bonus: int | None = Field(default=None, ge=0, le=20)
+    ability_scores: dict[str, int] = Field(default_factory=dict)
+    ability_modifiers: dict[str, int] = Field(default_factory=dict)
+    armor_class: int | None = Field(default=None, ge=0, le=100)
+    hit_points: int | None = Field(default=None, ge=0, le=1000)
+    temporary_hit_points: int = Field(default=0, ge=0, le=1000)
+    initiative: int | None = Field(default=None, ge=-100, le=100)
+    saving_throws: dict[str, int] = Field(default_factory=dict)
+    spell_attack_modifier: int | None = Field(default=None, ge=-100, le=100)
+    spell_save_dc: int | None = Field(default=None, ge=0, le=100)
+    spell_resources: dict[str, int] = Field(default_factory=dict)
+    equipped: dict[str, str] = Field(default_factory=dict)
+    observed_at: str = Field(min_length=1, max_length=64)
+    source_freshness: Literal["CURRENT", "STALE"] = "CURRENT"
 
 
 class TransitionRequest(BaseModel):
@@ -702,6 +738,34 @@ def register_character(
             action, actor_id=dm.id, name=request.name, discord_user_id=request.discord_user_id
         )
     )
+
+
+@router.post("/characters/dossier")
+def import_character_dossier(
+    state: State,
+    dm: CurrentDM,
+    action: Idempotency,
+    request: CharacterDossierRequest,
+) -> dict[str, Any]:
+    """Import one explicitly typed manual snapshot for a character.
+
+    The Activity only reads this data. The DM is the source boundary for this
+    first slice; the route never accepts a provider label or lets the snapshot
+    authorize a mechanic.
+    """
+
+    payload = request.model_dump()
+    payload["source"] = "MANUAL_IMPORT"
+    try:
+        result = _dossier_service(state.context).save_interaction(
+            action,
+            actor_id=dm.id,
+            character_id=request.character_id,
+            snapshot=payload,
+        )
+    except DossierError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return _committed(result)
 
 
 @router.post("/characters/transition")

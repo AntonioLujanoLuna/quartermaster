@@ -14,6 +14,7 @@ import itertools
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -238,6 +239,10 @@ class SurfaceTestCase(unittest.TestCase):
             database_path=self.root / "quartermaster.sqlite",
             backup_directory=self.root / "backups",
             soft_deadline_seconds=5.0,
+            # These tests exercise the pre-Activity component workflows. The
+            # active default is the retained surface; the old surface stays
+            # covered here while the migration is reversible.
+            discord_surface="legacy",
         )
         self.bot = create_bot(self.settings, self.services)
         self.context = self._context(self.settings)
@@ -438,6 +443,20 @@ class SurfaceTestCase(unittest.TestCase):
 
 
 class NavigationTests(SurfaceTestCase):
+    def test_the_default_entry_point_uses_only_the_retained_surface(self) -> None:
+        settings = replace(self.settings, discord_surface="retained")
+        bot = create_bot(settings, self.services)
+        interaction = FakeInteraction(user_id=PLAYER_ID)
+        run(self._command_from(bot, "quartermaster")(interaction))
+        labels = {getattr(item, "label", None) for item in interaction.view.children}
+        self.assertEqual(labels, {"Party Stash", "My Items", "Refresh"})
+
+    def _command_from(self, bot, name: str):
+        for command in bot.tree.get_commands(guild=discord.Object(id=GUILD_ID)):
+            if command.name == name:
+                return command.callback
+        raise AssertionError(f"no registered command named {name}")
+
     def test_the_entry_point_opens_the_home_panel(self) -> None:
         interaction = self.home("player")
         self.assertIn("**QUARTERMASTER**", interaction.text)

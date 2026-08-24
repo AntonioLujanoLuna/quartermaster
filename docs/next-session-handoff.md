@@ -1,6 +1,6 @@
 # Next-session handoff
 
-Updated: 2026-08-23 · Schema 12
+Updated: 2026-08-24 · Schema 13
 
 ## How to use this document
 
@@ -19,7 +19,7 @@ Two rules keep it useful:
 
 ## Current state
 
-Canonical state is SQLite at schema 12. Discord messages are disposable projections.
+Canonical state is SQLite at schema 13. Discord messages are disposable projections.
 
 **Runtime and durability.** Configuration is validated at startup. FAST interactions run
 their mutation and receipt in one transaction; DEFERRED interactions persist `PROCESSING`
@@ -143,8 +143,8 @@ tree-shaken away, both path forms, the page and its assets, the refusal of an
 unauthenticated read, and that `/api/live` upgrades and refuses a token this process did
 not sign.
 
-`activity/` is the frontend: the SDK handshake, six screens — Party Stash, My Items, Loot,
-Treasury, Dice, and a DM screen only a DM is shown — the instance roster beside them, a
+`activity/` is the frontend: the SDK handshake, seven screens — Party Stash, My Items,
+Character, Loot, Treasury, Dice, and a DM screen only a DM is shown — the instance roster beside them, a
 reconnecting socket that resumes from its cursor, a header that says whether it is live,
 and a re-handshake when a session token is refused. A player takes, gives, uses, claims,
 and moves coin from it.
@@ -160,7 +160,8 @@ one, because a form has no component budget to spend. Every one of those routes 
 by the API for a token that does not say DM, so a screen that renders none of them is a
 courtesy rather than the check.
 
-**Checks.** 406 tests pass under `uv run pytest -q`; `ruff check` is clean. The Activity
+**Checks.** The current test count and build gates are recorded after the Stage 2 slice is
+validated; Ruff and the Activity production build remain required gates. The Activity
 production build also passes with `npm run build`. Both run in CI
 on every pull request, and CI builds the Activity bundle — with `VITE_DISCORD_CLIENT_ID`
 set, which matters: without it the client id is statically undefined, `boot()` returns on
@@ -203,6 +204,15 @@ green. On 2026-08-23, after restarting the stale pre-Dice bot process, the live 
 verified public `d20+5` (17 + 5 = 22), public advantage (both attempts and the counted one),
 and DM-only `d20` (19, explicitly not added to the session log). The two public rolls appeared
 in the Session 3 Discord history thread. A second-client Dice propagation check remains open.
+
+On 2026-08-24 the Activity was launched again through a fresh Quick Tunnel after updating
+the Developer Portal root mapping. The live screen showed the current session, the bound
+`Activity Bound Character`, the DM tab, and the **Character** screen. With no imported
+snapshot in the campaign database, that screen correctly reported that no verified
+character snapshot was available rather than inventing values. The **Dice** screen also
+loaded live and kept the Avrae boundary visible. This accepts the dossier's unavailable
+state and the Activity wiring; it does not provide the real-play evidence needed to choose
+additional dossier fields or a provider freshness path.
 
 ## Fourteenth pass on 2026-08-21
 
@@ -1094,7 +1104,7 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
    comes back "not this" the whole of it deletes without touching anything that stores an
    item. The previous pass said the DM surface was where guessing starts to cost, and that
    is still true — but what it costs is layout, not correctness, and layout is answered by
-   item 35 of the checklist rather than by waiting. Stage 6, which deletes the panels, is
+   item 35 of the checklist rather than by waiting. Stage 6, which retires the duplicate panels, is
    the one that should wait: what the bot keeps forever is a judgement about what people
    reach for outside a session, and nobody has been outside one yet.
 

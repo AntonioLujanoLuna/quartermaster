@@ -13,7 +13,7 @@ from .naming import normalize_name
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 class MigrationError(RuntimeError):
@@ -295,6 +295,36 @@ MIGRATIONS: dict[int, str] = {
         ON combat_encounters(session_id) WHERE status = 'OPEN';
     CREATE INDEX combat_encounters_session_idx
         ON combat_encounters(session_id, status, opened_at);
+    """,
+    13: """
+    CREATE TABLE character_dossiers (
+        id TEXT PRIMARY KEY,
+        character_id TEXT NOT NULL UNIQUE REFERENCES characters(id),
+        snapshot_version INTEGER NOT NULL CHECK (snapshot_version > 0),
+        source TEXT NOT NULL,
+        source_reference TEXT,
+        system TEXT NOT NULL,
+        rules_version TEXT NOT NULL,
+        level INTEGER CHECK (level IS NULL OR (level >= 1 AND level <= 30)),
+        proficiency_bonus INTEGER CHECK (proficiency_bonus IS NULL OR (proficiency_bonus >= 0 AND proficiency_bonus <= 20)),
+        ability_scores TEXT NOT NULL,
+        ability_modifiers TEXT NOT NULL,
+        armor_class INTEGER CHECK (armor_class IS NULL OR armor_class >= 0),
+        hit_points INTEGER CHECK (hit_points IS NULL OR hit_points >= 0),
+        temporary_hit_points INTEGER NOT NULL DEFAULT 0 CHECK (temporary_hit_points >= 0),
+        initiative INTEGER,
+        saving_throws TEXT NOT NULL,
+        spell_attack_modifier INTEGER,
+        spell_save_dc INTEGER,
+        spell_resources TEXT NOT NULL,
+        equipped TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        source_freshness TEXT NOT NULL CHECK (source_freshness IN ('CURRENT', 'STALE')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX character_dossiers_freshness_idx
+        ON character_dossiers(source_freshness, observed_at);
     """,
 }
 

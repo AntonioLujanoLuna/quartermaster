@@ -238,6 +238,79 @@ class TokenExchangeTests(ApiTestCase):
         self.assertEqual(response.status_code, 401)
 
 
+class DossierTests(ApiTestCase):
+    def test_a_player_without_a_snapshot_gets_an_explicit_unavailable_state(self) -> None:
+        character_id = self.register("Tamsin", PLAYER_ID, interaction="dossier-character-1")
+        response = self.client.get("/api/me/dossier", headers=self.headers())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "UNAVAILABLE")
+        self.assertEqual(response.json()["character"]["id"], character_id)
+
+    def test_a_dm_can_import_a_typed_snapshot_and_the_player_can_read_it(self) -> None:
+        character_id = self.register("Tamsin", PLAYER_ID, interaction="dossier-character-2")
+        body = {
+            "character_id": character_id,
+            "source_reference": "manual-sheet-2026-08-24",
+            "system": "D&D 5e",
+            "rules_version": "2014",
+            "level": 5,
+            "proficiency_bonus": 3,
+            "ability_scores": {"STR": 16, "DEX": 12},
+            "ability_modifiers": {"STR": 3, "DEX": 1},
+            "armor_class": 17,
+            "hit_points": 42,
+            "temporary_hit_points": 4,
+            "initiative": 1,
+            "saving_throws": {"STR": 6, "CON": 3},
+            "spell_attack_modifier": 7,
+            "spell_save_dc": 15,
+            "spell_resources": {"level_1": 2},
+            "equipped": {"weapon": "Longsword", "armor": "Chain mail"},
+            "observed_at": "2026-08-24T12:00:00Z",
+        }
+        imported = self.post("/api/characters/dossier", body, code="dm-code", key="dossier-import-1")
+        self.assertEqual(imported.status_code, 200, imported.text)
+        self.assertEqual(imported.json()["result"]["snapshot_version"], 1)
+
+        response = self.client.get("/api/me/dossier", headers=self.headers())
+        self.assertEqual(response.status_code, 200)
+        dossier = response.json()
+        self.assertEqual(dossier["status"], "CURRENT")
+        self.assertEqual(dossier["snapshot"]["armor_class"], 17)
+        self.assertEqual(dossier["snapshot"]["ability_modifiers"]["STR"], 3)
+        self.assertEqual(dossier["snapshot"]["source"], "MANUAL_IMPORT")
+
+    def test_a_stale_snapshot_is_readable_but_named_stale(self) -> None:
+        character_id = self.register("Tamsin", PLAYER_ID, interaction="dossier-character-3")
+        body = {
+            "character_id": character_id,
+            "system": "D&D 5e",
+            "rules_version": "2014",
+            "armor_class": 12,
+            "hit_points": 8,
+            "observed_at": "2026-01-01T12:00:00Z",
+            "source_freshness": "STALE",
+        }
+        imported = self.post("/api/characters/dossier", body, code="dm-code", key="dossier-import-2")
+        self.assertEqual(imported.status_code, 200, imported.text)
+        response = self.client.get("/api/me/dossier", headers=self.headers())
+        self.assertEqual(response.json()["status"], "STALE")
+        self.assertIn("stale", response.json()["reason"])
+
+    def test_a_player_cannot_import_a_character_snapshot(self) -> None:
+        character_id = self.register("Tamsin", PLAYER_ID, interaction="dossier-character-4")
+        response = self.post(
+            "/api/characters/dossier",
+            {
+                "character_id": character_id,
+                "system": "D&D 5e",
+                "rules_version": "2014",
+                "observed_at": "2026-08-24T12:00:00Z",
+            },
+            key="dossier-import-3",
+        )
+        self.assertEqual(response.status_code, 403)
+
 class AuthorizationTests(ApiTestCase):
     def test_a_read_without_a_token_is_refused(self) -> None:
         self.assertEqual(self.client.get("/api/stash").status_code, 401)

@@ -48,6 +48,7 @@ class Settings:
     avrae_adapter_url: str | None = None
     avrae_adapter_secret: str | None = None
     avrae_adapter_timeout_seconds: float = 2.5
+    discord_surface: str = "retained"
 
     def __post_init__(self) -> None:
         adapter_url = self.avrae_adapter_url
@@ -62,6 +63,8 @@ class Settings:
             raise ConfigurationError("QM_AVRAE_ADAPTER_SECRET must not be empty")
         if self.avrae_adapter_timeout_seconds <= 0:
             raise ConfigurationError("QM_AVRAE_ADAPTER_TIMEOUT_SECONDS must be a positive number")
+        if self.discord_surface not in {"retained", "legacy"}:
+            raise ConfigurationError("QM_DISCORD_SURFACE must be retained or legacy")
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str]) -> Settings:
@@ -104,6 +107,7 @@ class Settings:
             avrae_adapter_timeout_seconds=_positive_float(
                 environment, "QM_AVRAE_ADAPTER_TIMEOUT_SECONDS", 2.5
             ),
+            discord_surface=environment.get("QM_DISCORD_SURFACE", "retained").strip().lower() or "retained",
         )
 
     def require_activity(self) -> tuple[str, str]:

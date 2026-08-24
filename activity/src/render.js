@@ -162,6 +162,7 @@ function renderContinuity(continuity) {
 const SCREENS = [
   { id: "stash", label: "Party Stash" },
   { id: "items", label: "My Items" },
+  { id: "dossier", label: "Character" },
   { id: "loot", label: "Loot" },
   { id: "treasury", label: "Treasury" },
   { id: "dice", label: "Dice" },
@@ -606,6 +607,84 @@ function renderItemsScreen(state, handlers) {
   screen.append(listing);
   screen.append(
     element("p", "count muted", `${holdings.character.name} · ${holdings.total_items} stacks`),
+  );
+  return screen;
+}
+
+function renderDossierScreen(state) {
+  const screen = element("section", "screen");
+  const dossier = state.dossier;
+  if (!dossier) {
+    screen.append(element("p", "muted", "Reading the character snapshot…"));
+    return screen;
+  }
+  if (dossier.status === "UNAVAILABLE" || !dossier.snapshot) {
+    screen.append(element("h2", null, "Character dossier"));
+    screen.append(element("p", "dossier-status dossier-unavailable", dossier.reason));
+    if (dossier.character) {
+      screen.append(element("p", "muted", `${dossier.character.name} has no imported sheet snapshot yet.`));
+    }
+    return screen;
+  }
+
+  const snapshot = dossier.snapshot;
+  const character = dossier.character;
+  screen.append(element("h2", null, `${character?.name || "Character"} dossier`));
+  screen.append(
+    element(
+      "p",
+      `dossier-status dossier-${dossier.status.toLowerCase()}`,
+      dossier.status === "CURRENT" ? "Current snapshot" : "Stale snapshot",
+    ),
+  );
+  screen.append(
+    element(
+      "p",
+      "muted",
+      `${snapshot.system} · rules ${snapshot.rules_version} · source ${snapshot.source} · observed ${snapshot.observed_at}`,
+    ),
+  );
+  if (snapshot.source_reference) screen.append(element("p", "muted", `Source reference: ${snapshot.source_reference}`));
+
+  const [listing, body] = table(["Value", "Reading", "Source"]);
+  const add = (label, value) => {
+    const row = element("tr");
+    row.append(element("td", "name", label));
+    row.append(element("td", "quantity", value === null || value === undefined ? "Not supplied" : value));
+    row.append(element("td", "muted", "Imported snapshot"));
+    body.append(row);
+  };
+  add("Level", snapshot.level);
+  add("Proficiency bonus", snapshot.proficiency_bonus);
+  add("Armor Class", snapshot.armor_class);
+  add("Hit points", snapshot.hit_points);
+  add("Temporary hit points", snapshot.temporary_hit_points);
+  add("Initiative", snapshot.initiative);
+  add("Spell attack modifier", snapshot.spell_attack_modifier);
+  add("Spell save DC", snapshot.spell_save_dc);
+  for (const [name, value] of Object.entries(snapshot.ability_modifiers || {})) add(`${name} modifier`, value);
+  for (const [name, value] of Object.entries(snapshot.saving_throws || {})) add(`${name} save`, value);
+  screen.append(listing);
+
+  const details = element("div", "dossier-details");
+  const detail = (title, values) => {
+    const block = element("div", "dossier-block");
+    block.append(element("h3", null, title));
+    const entries = Object.entries(values || {});
+    if (entries.length === 0) block.append(element("p", "muted", "Not supplied."));
+    for (const [name, value] of entries) block.append(element("p", null, `${name}: ${value}`));
+    details.append(block);
+  };
+  detail("Ability scores", snapshot.ability_scores);
+  detail("Spell resources", snapshot.spell_resources);
+  detail("Equipped", snapshot.equipped);
+  screen.append(details);
+  screen.append(
+    element(
+      "p",
+      "muted",
+      "This dossier explains a supplied snapshot. It does not authorize or calculate a mechanic.",
+    ),
   );
   return screen;
 }
@@ -1117,6 +1196,7 @@ function renderMaintenanceBlock(state, handlers) {
 const SCREEN_BODIES = {
   stash: renderStashScreen,
   items: renderItemsScreen,
+  dossier: renderDossierScreen,
   loot: renderLootScreen,
   treasury: renderTreasuryScreen,
   dice: renderDiceScreen,
