@@ -552,6 +552,60 @@ class InventoryService:
             "total_items": total,
         }
 
+    def held_by_character(self) -> dict[str, Any]:
+        """What every character is carrying, grouped by the character carrying it.
+
+        `browse` answers what the party shares and `holdings` answers what one
+        player carries, so the question the table actually asks between them —
+        who has the rope — could only be answered by reading the export, which
+        is a DM-only document and a wall of prose. This is that column of the
+        export as a read.
+
+        Characters holding nothing are omitted rather than listed empty: the
+        roster already says who exists, and a list of names with no items under
+        them is a longer way of not answering. Lifecycle travels with the name
+        because a stack still held by a character who has stopped playing is
+        exactly what estate resolution is for, and seeing it is how a DM knows
+        to resolve one.
+        """
+        with self.store.read() as connection:
+            rows = connection.execute(
+                """SELECT stack.owner_id AS character_id,
+                          character.name AS character_name,
+                          character.lifecycle AS lifecycle,
+                          stack.item_name AS item_name,
+                          stack.quantity AS quantity,
+                          stack.provenance AS provenance
+                     FROM inventory_stacks AS stack
+                     JOIN characters AS character ON character.id = stack.owner_id
+                    WHERE stack.owner_type = 'CHARACTER' AND stack.quantity > 0
+                 ORDER BY character.lifecycle, character.name, stack.item_name"""
+            ).fetchall()
+        holders: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            character_id = str(row["character_id"])
+            holder = holders.setdefault(
+                character_id,
+                {
+                    "character_id": character_id,
+                    "character_name": str(row["character_name"]),
+                    "lifecycle": str(row["lifecycle"]),
+                    "items": [],
+                },
+            )
+            holder["items"].append(
+                {
+                    "item_name": row["item_name"],
+                    "quantity": row["quantity"],
+                    "provenance": row["provenance"],
+                }
+            )
+        characters = list(holders.values())
+        return {
+            "characters": characters,
+            "total_stacks": sum(len(holder["items"]) for holder in characters),
+        }
+
     def create_give_handles(self, *, stack_id: str, actor_id: str | None) -> dict[str, Any]:
         """Mint the give controls for one held stack against what it holds now.
 

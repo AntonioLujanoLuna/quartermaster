@@ -32,6 +32,9 @@ const state = {
   home: null,
   stash: null,
   holdings: null,
+  // What every character is carrying. Read only by the screen that shows it,
+  // like every other list here.
+  party: null,
   loot: null,
   treasury: null,
   combat: null,
@@ -82,6 +85,9 @@ const READERS = {
   holdings: async () => {
     state.holdings = await api.myItems();
   },
+  party: async () => {
+    state.party = await api.partyHoldings();
+  },
   loot: async () => {
     state.loot = await api.loot();
   },
@@ -109,6 +115,7 @@ const READERS = {
 const SCREEN_READS = {
   stash: ["stash"],
   items: ["holdings"],
+  party: ["party"],
   dossier: ["dossier"],
   loot: ["loot"],
   treasury: ["treasury"],
@@ -130,14 +137,12 @@ function scheduleRefresh() {
     refreshTimer = null;
     // Serialized rather than overlapped: two reads in flight can land in
     // either order, and the older one would paint over the newer.
-    refreshing = (refreshing || Promise.resolve())
-      .then(refresh)
-      .catch((error) => {
-        // A failed refresh is not a dead screen. The socket is still open, so
-        // the next change is another chance, and what is rendered is still the
-        // last state that was actually read.
-        console.warn("Quartermaster could not refresh", error);
-      });
+    refreshing = (refreshing || Promise.resolve()).then(refresh).catch((error) => {
+      // A failed refresh is not a dead screen. The socket is still open, so
+      // the next change is another chance, and what is rendered is still the
+      // last state that was actually read.
+      console.warn("Quartermaster could not refresh", error);
+    });
   }, REFRESH_DEBOUNCE_MS);
 }
 
@@ -245,6 +250,21 @@ const handlers = {
   // rebuilding it under the caret is how a live screen becomes unusable.
   setInput(key, value) {
     state.inputs[key] = value;
+  },
+
+  /**
+   * The one typed value that does redraw.
+   *
+   * `setInput` deliberately does not, because rebuilding a form under the
+   * caret is how a live screen becomes unusable. A filter is the exception
+   * that proves it: the list underneath is the whole answer, so it has to
+   * change as the letters arrive. `draw` puts the caret back, which is the
+   * same mechanism that already lets the live feed redraw under somebody
+   * halfway through typing a quantity.
+   */
+  setFilter(key, value) {
+    state.inputs[key] = value;
+    draw();
   },
 
   setDicePreset(expression, mode) {
@@ -537,7 +557,9 @@ async function watchParticipants(sdk) {
 async function boot() {
   if (!CLIENT_ID) {
     app.replaceChildren(
-      renderError("VITE_DISCORD_CLIENT_ID is not set, so the Activity cannot identify itself to Discord."),
+      renderError(
+        "VITE_DISCORD_CLIENT_ID is not set, so the Activity cannot identify itself to Discord.",
+      ),
     );
     return;
   }
@@ -563,9 +585,10 @@ async function boot() {
     // gap between them. Connecting first can only cost a redundant refresh.
     openLiveFeed({
       token: sessionTokenValue,
-      renew: () => authenticate(sdk).then((actor) => {
-        state.actor = actor;
-      }),
+      renew: () =>
+        authenticate(sdk).then((actor) => {
+          state.actor = actor;
+        }),
       onChange: scheduleRefresh,
       onStatus: (status) => {
         state.live = status;

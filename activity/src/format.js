@@ -10,7 +10,9 @@ const VISIBLE = ["cp", "sp", "gp", "pp"];
 
 export function formatCoin(balance) {
   const denominations = Number(balance?.ep) ? ["cp", "sp", "ep", "gp", "pp"] : VISIBLE;
-  return denominations.map((denomination) => `${Number(balance?.[denomination]) || 0} ${denomination}`).join(" · ");
+  return denominations
+    .map((denomination) => `${Number(balance?.[denomination]) || 0} ${denomination}`)
+    .join(" · ");
 }
 
 export function hasCoin(balance) {

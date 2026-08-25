@@ -111,6 +111,18 @@ owner is not actually holding, and both write a ledger line naming who, how many
 You may use up what you carry; only a DM may remove what the party shares, and that is
 checked again in the transaction rather than only at the control.
 
+**Who Has What** is the question the table asks out loud. The Party Stash screen says what
+the party shares and My Items says what you are carrying; between them sat "who has the rope",
+and the only surface that named a holder was the export, which is a DM-only document. It is a
+read and nothing else — a give is made by the character holding the stack, so there is nothing
+on it to press — and it marks a holder who has stopped playing, because a stack still held by
+one is exactly what estate resolution is for.
+
+Each of the three item lists carries a filter, matching what something is called and where it
+came from, because half of what a table wants to find again it remembers by its origin. A
+filtered list says how many of the campaign's stacks it is showing rather than reporting the
+narrowed number as the total.
+
 Every message Quartermaster sends is rendered within Discord's 2000-character limit. List
 surfaces — the Party Stash projection and the stash, loot and character panels — drop whole
 entries from the end and say how many they dropped rather than letting Discord reject the
@@ -131,7 +143,7 @@ For managed Windows startup, backup/restore, health, maintenance, dead-lettered 
 
 That boundary is also what makes a different surface thinkable. [The Activity migration plan](docs/activity-migration-plan.md) proposes moving play into a Discord Activity — a web UI embedded in the client, where the party joins by launching it rather than by each holding a private panel — and keeping the bot for the pinned projection, the session log, and asynchronous use.
 
-Its first five stages are implemented, and the retained Stage 6 bot surface is now the default. Every read a panel performs and every mutation either a player or a DM makes is available over HTTP from `api_app`, and [the Activity itself](activity/README.md) is six screens a player acts on or reads — Party Stash, My Items, Character, Loot, Treasury, and Dice — with the instance roster Discord supplies rather than one Quartermaster builds, and a seventh only a DM is shown. Each DM control sits on the screen showing what it changes; the DM screen holds what has no such screen, which is the session, the fight, the roster's lifecycle, and the operator's controls. The API runs on the bot's own loop against the bot's own store, because SQLite has one writer and recovery assumes one runtime. It stays off until `QM_DISCORD_CLIENT_ID` and `QM_DISCORD_CLIENT_SECRET` are configured, and FastAPI is an optional extra, so a table that has not enabled it runs exactly as before.
+Its first five stages are implemented, and the retained Stage 6 bot surface is now the default. Every read a panel performs and every mutation either a player or a DM makes is available over HTTP from `api_app`, and [the Activity itself](activity/README.md) is seven screens a player acts on or reads — Party Stash, My Items, Who Has What, Character, Loot, Treasury, and Dice — with the instance roster Discord supplies rather than one Quartermaster builds, and an eighth only a DM is shown. Each DM control sits on the screen showing what it changes; the DM screen holds what has no such screen, which is the session, the fight, the roster's lifecycle, and the operator's controls. The API runs on the bot's own loop against the bot's own store, because SQLite has one writer and recovery assumes one runtime. It stays off until `QM_DISCORD_CLIENT_ID` and `QM_DISCORD_CLIENT_SECRET` are configured, and FastAPI is an optional extra, so a table that has not enabled it runs exactly as before.
 
 The first live Discord smoke acceptance completed on 2026-08-23 through a temporary
 Cloudflare Quick Tunnel. The Activity loaded from a voice channel, completed the OAuth

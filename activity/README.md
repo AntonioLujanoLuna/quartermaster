@@ -2,8 +2,8 @@
 
 The web surface Discord embeds in its own client. Stages 1 to 5 of
 [the migration plan](../docs/activity-migration-plan.md): the API, the OAuth
-handshake, the live feed that keeps the screen current, six screens a player
-can act on or read — Party Stash, My Items, Character, Loot, Treasury, and Dice, with the instance roster
+handshake, the live feed that keeps the screen current, seven screens a player
+can act on or read — Party Stash, My Items, Who Has What, Character, Loot, Treasury, and Dice, with the instance roster
 beside them — and everything a DM does, so that an evening needs no panel.
 
 The first live Discord smoke acceptance completed on 2026-08-23. The Activity
@@ -42,6 +42,7 @@ nothing.
 | `src/render.js` | The screens, built with `createElement` rather than `innerHTML` |
 | `src/format.js` | The few things the screens and the action results both have to say the same way |
 | `src/style.css` | A palette that follows the client's theme rather than choosing one |
+| `tests/render.test.js` | That every screen renders rather than throws, before anything has been read and after an evening |
 
 The API it talks to is `src/quartermaster/api_app.py`; the feed behind it is
 `src/quartermaster/api_live.py`.
@@ -190,6 +191,25 @@ dependency. The test suite does not need it — Starlette's test client runs a
 socket in-process — so a green suite is not evidence that the feed can be served.
 The API refuses to start rather than serve a feed nothing can connect to, and
 `preflight` checks for it first.
+
+## Check
+
+```powershell
+cd activity
+npm run lint           # eslint
+npm run format:check   # prettier, at width 100
+npm test               # vitest, in jsdom
+```
+
+All three run in CI beside the build, because a build proves the module graph
+parses and nothing else. The tests assert something deliberately weak: that
+every screen renders without throwing, first with nothing read yet and then
+against a played campaign. `renderApp` replaces the whole tree on every draw, so
+a screen that reaches into a read which has not landed does not show a wrong
+number — it throws inside `draw`, the tree is never replaced, and the table is
+left looking at a dead page with nothing to press, because the controls are what
+failed to render. Running `npm run format` writes the formatting the check
+enforces.
 
 ## Build and serve
 

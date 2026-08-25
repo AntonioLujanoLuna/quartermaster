@@ -108,6 +108,7 @@ export const api = {
   home: () => request("/home"),
   stash: () => request("/stash"),
   myItems: () => request("/me/items"),
+  partyHoldings: () => request("/holdings"),
   loot: () => request("/loot"),
   treasury: () => request("/treasury"),
   characters: () => request("/characters"),
@@ -159,8 +160,7 @@ export const api = {
   createDrop: (items, expiryHours, key) =>
     mutate("/loot/drops", { items, expiry_hours: expiryHours }, key),
   closeDrop: (dropId, key) => mutate("/loot/drops/close", { drop_id: dropId }, key),
-  adjustTreasury: (deltas, reason, key) =>
-    mutate("/treasury/adjust", { deltas, reason }, key),
+  adjustTreasury: (deltas, reason, key) => mutate("/treasury/adjust", { deltas, reason }, key),
   splitTreasury: (handleId, confirmCurrent, key) =>
     mutate("/treasury/split", { handle_id: handleId, confirm_current: confirmCurrent }, key),
   startSession: (key) => mutate("/session/start", {}, key),
