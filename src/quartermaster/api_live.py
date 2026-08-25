@@ -149,7 +149,11 @@ class Subscription:
             # run and will see the flag it was set for.
             pass
 
-    async def next(self, *, timeout: float) -> tuple[str, tuple[Change, ...]]:
+    # ASYNC109 asks for the caller's `asyncio.timeout` instead of this
+    # parameter. That rule is about a timeout the caller wants to raise
+    # through; this one is an answer. Running out of time here means IDLE —
+    # send a keepalive — which is a thing to return, not to raise.
+    async def next(self, *, timeout: float) -> tuple[str, tuple[Change, ...]]:  # noqa: ASYNC109
         """What the socket should send next, or why it should not wait longer."""
         if self._closed:
             return CLOSED, ()

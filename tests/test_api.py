@@ -1535,7 +1535,7 @@ def _next_message(socket, *, timeout: float = 5.0) -> dict:
     def pull() -> None:
         try:
             box.put(("message", socket.receive_json()))
-        except BaseException as error:  # noqa: BLE001 - reported on the calling thread
+        except BaseException as error:
             box.put(("error", error))
 
     threading.Thread(target=pull, daemon=True).start()

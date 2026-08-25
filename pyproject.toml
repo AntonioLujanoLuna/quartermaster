@@ -32,6 +32,7 @@ dev = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "httpx>=0.27",
+    "mypy>=1.13",
 ]
 
 [tool.uv]
@@ -48,8 +49,70 @@ line-length = 140
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "W"]
-ignore = ["E501"]
+# ASYNC earns its place here: the runtime's central invariant is that no
+# database call happens on the event loop, and until now that was enforced by
+# review alone. RUF and SIM are cheap; the two exceptions below are the rules
+# that argue with a style this codebase applies on purpose.
+select = ["E", "F", "I", "UP", "B", "W", "ASYNC", "RUF", "SIM"]
+ignore = [
+    "E501",
+    # `except X: pass` is written here with a comment inside the handler saying
+    # why the failure is not one. `contextlib.suppress` has nowhere to put that
+    # sentence except above the block, where it reads as a note about the call.
+    "SIM105",
+    # A `with self.subTest(...)` wrapping a `with self.assertRaises(...)` says
+    # which case failed. Collapsed onto one line it says it less clearly, and
+    # the suite uses that pairing 121 times.
+    "SIM117",
+]
+
+# The annotations were already here; nothing was checking them. This makes the
+# core packages — the ones holding the domain, the store, and the API — answer
+# for theirs, and exempts the Discord adapter from the four codes discord.py's
+# own idiom produces: a component is built, its `callback` attribute assigned,
+# and the library's generic `Interaction[ClientT]` never matches a handler
+# annotated for the concrete client. That is the library's shape, not a defect,
+# and silencing it per module keeps the rest of the tree honest rather than
+# turning the whole check off.
+[tool.mypy]
+python_version = "3.11"
+files = ["src/quartermaster"]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "quartermaster.discord_common",
+    "quartermaster.discord_panels",
+    "quartermaster.discord_projection",
+    "quartermaster.discord_retained",
+    "quartermaster.discord_views",
+]
+# The rest of this list is the same friction seen from further in: `**kwargs`
+# unpacked into discord.py's overloaded `send`, a channel union the code has
+# already narrowed by hand, and the deliberately sync-typed transport seam that
+# the real adapter implements with coroutines. None of it is checkable without
+# changing the design, so it is named here rather than fixed badly.
+disable_error_code = [
+    "method-assign",
+    "var-annotated",
+    "assignment",
+    "call-arg",
+    "override",
+    "call-overload",
+    "arg-type",
+    "union-attr",
+]
+
+# `websockets` ships in the `activity` extra and is imported inside a function
+# that reports its absence as a check result. A machine without the extra is a
+# supported configuration, so the missing stub is not a finding.
+[[tool.mypy.overrides]]
+module = ["websockets.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

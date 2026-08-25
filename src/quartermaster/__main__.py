@@ -117,12 +117,16 @@ def main() -> int:
     # ignored. Every other command uses the path resolved here, which is why
     # the runbook can legitimately restore and inspect a copy at --db while the
     # live campaign stays configured in the environment.
-    if args.command == "run" and configured_path and args.db is not None:
-        if Path(configured_path).expanduser().resolve() != args.db.expanduser().resolve():
-            parser.error(
-                f"--db {args.db} disagrees with QM_DATABASE_PATH {configured_path}; "
-                "the adapter reads the configured value, so pass one or make them match"
-            )
+    if (
+        args.command == "run"
+        and configured_path
+        and args.db is not None
+        and Path(configured_path).expanduser().resolve() != args.db.expanduser().resolve()
+    ):
+        parser.error(
+            f"--db {args.db} disagrees with QM_DATABASE_PATH {configured_path}; "
+            "the adapter reads the configured value, so pass one or make them match"
+        )
     if (
         args.command not in _COMMANDS_THAT_MAY_CREATE_THE_DATABASE
         and args.command not in _COMMANDS_THAT_NEED_NO_DATABASE

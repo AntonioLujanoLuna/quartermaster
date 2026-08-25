@@ -163,6 +163,7 @@ class InventoryService:
             row = connection.execute("SELECT id, item_name, quantity, version FROM inventory_stacks WHERE id = ? AND owner_type = 'PARTY'", (stack_id,)).fetchone()
             if row is None:
                 raise InventoryError("item stack not found")
+            action_amount: int | str
             if amount == "all":
                 action_amount = "all"
                 mode = "RELATIVE"

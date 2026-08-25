@@ -33,7 +33,7 @@ def currency_from_row(row: Any) -> dict[str, int]:
 
 
 def format_currency(balance: Mapping[str, int], *, include_electrum: bool = False) -> str:
-    denominations = VISIBLE_DENOMINATIONS
+    denominations: tuple[str, ...] = VISIBLE_DENOMINATIONS
     if include_electrum or int(balance.get("ep", 0)) != 0:
         denominations = ("cp", "sp", "ep", "gp", "pp")
     return " · ".join(f"{int(balance.get(denomination, 0))} {denomination}" for denomination in denominations)

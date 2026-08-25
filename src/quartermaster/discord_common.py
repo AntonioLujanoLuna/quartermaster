@@ -417,7 +417,7 @@ def _render_loot(drops: list[dict], handles: dict[str, str] | None = None) -> st
     """
     lines = ["**OPEN LOOT**", ""]
     if not drops:
-        return "\n".join(lines + ["There are no open Loot Drops."])
+        return "\n".join([*lines, "There are no open Loot Drops."])
     unclaimable = 0
     for drop in drops:
         lines.append(f"Drop `{drop['drop_id'][:8]}`")

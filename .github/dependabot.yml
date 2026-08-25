@@ -1,0 +1,33 @@
+# Both lockfiles are checked in and both are gates: `uv.lock` decides what the
+# suite runs against, and `package-lock.json` decides what the Activity bundle
+# is built from. An update either passes CI or does not, which is the whole
+# reason to see it as a pull request rather than as a surprise during a release.
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      python:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: npm
+    directory: /activity
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      activity:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # The workflow pins actions by major tag; this is what notices when one of
+  # those majors stops being the current one.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
