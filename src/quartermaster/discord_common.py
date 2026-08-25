@@ -417,7 +417,7 @@ def _render_loot(drops: list[dict], handles: dict[str, str] | None = None) -> st
     """
     lines = ["**OPEN LOOT**", ""]
     if not drops:
-        return "\n".join(lines + ["There are no open Loot Drops."])
+        return "\n".join([*lines, "There are no open Loot Drops."])
     unclaimable = 0
     for drop in drops:
         lines.append(f"Drop `{drop['drop_id'][:8]}`")
@@ -591,6 +591,11 @@ def _render_last_time(continuity: dict) -> str:
     ended = str(previous["ended_at"] or "")[:10]
     lines.append(f"Session {previous['session_number']}" + (f" · ended {ended}" if ended else ""))
     lines.extend(["", "You ended:", previous["where_ended"] or "Nothing was recorded."])
+    # The recording is where the table goes for what a one-line endpoint could
+    # not hold. It belongs beside the endpoint rather than in the recap: it is
+    # the same answer to "what happened", at a different resolution.
+    if previous.get("recording_url"):
+        lines.extend(["", f"Recording: {previous['recording_url']}"])
     recap = continuity["recap"]
     if recap:
         lines.extend(["", "What happened:"])

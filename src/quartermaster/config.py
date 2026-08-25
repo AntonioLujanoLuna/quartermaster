@@ -50,6 +50,9 @@ class Settings:
     avrae_adapter_secret: str | None = None
     avrae_adapter_timeout_seconds: float = 2.5
     discord_surface: str = "retained"
+    webhook_url: str | None = None
+    webhook_secret: str | None = None
+    webhook_timeout_seconds: float = 5.0
 
     def __post_init__(self) -> None:
         adapter_url = self.avrae_adapter_url
@@ -72,6 +75,14 @@ class Settings:
             raise ConfigurationError("QM_AVRAE_ADAPTER_TIMEOUT_SECONDS must be a positive number")
         if self.discord_surface not in {"retained", "legacy"}:
             raise ConfigurationError("QM_DISCORD_SURFACE must be retained or legacy")
+        if self.webhook_url is not None:
+            _validate_outbound_url(self.webhook_url, "QM_WEBHOOK_URL")
+        if self.webhook_secret is not None and not self.webhook_secret.strip():
+            raise ConfigurationError("QM_WEBHOOK_SECRET must not be empty")
+        if self.webhook_secret is not None and self.webhook_url is None:
+            raise ConfigurationError("QM_WEBHOOK_SECRET requires QM_WEBHOOK_URL")
+        if self.webhook_timeout_seconds <= 0:
+            raise ConfigurationError("QM_WEBHOOK_TIMEOUT_SECONDS must be a positive number")
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str]) -> Settings:
@@ -116,6 +127,9 @@ class Settings:
                 environment, "QM_AVRAE_ADAPTER_TIMEOUT_SECONDS", 2.5
             ),
             discord_surface=environment.get("QM_DISCORD_SURFACE", "retained").strip().lower() or "retained",
+            webhook_url=_optional_outbound_url(environment.get("QM_WEBHOOK_URL", ""), "QM_WEBHOOK_URL"),
+            webhook_secret=environment.get("QM_WEBHOOK_SECRET", "").strip() or None,
+            webhook_timeout_seconds=_positive_float(environment, "QM_WEBHOOK_TIMEOUT_SECONDS", 5.0),
         )
 
     def require_activity(self) -> tuple[str, str]:
@@ -241,6 +255,28 @@ def _optional_avrae_url(raw: str) -> str | None:
         return None
     _validate_avrae_url(value)
     return value
+
+
+def _optional_outbound_url(raw: str, name: str) -> str | None:
+    value = raw.strip()
+    if not value:
+        return None
+    _validate_outbound_url(value, name)
+    return value
+
+
+def _validate_outbound_url(value: str, name: str) -> None:
+    """Check somewhere this process will post the campaign's history to.
+
+    Credentials in the URL are refused for the same reason the Avrae adapter
+    refuses them: this value is logged when a delivery fails, and a password in
+    a log is a password.
+    """
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ConfigurationError(f"{name} must be an http:// or https:// URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ConfigurationError(f"{name} must not contain credentials")
 
 
 def _validate_avrae_url(value: str) -> None:

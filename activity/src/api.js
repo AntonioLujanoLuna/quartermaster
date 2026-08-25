@@ -113,6 +113,7 @@ export const api = {
   treasury: () => request("/treasury"),
   characters: () => request("/characters"),
   dossier: () => request("/me/dossier"),
+  importDossier: (snapshot, key) => mutate("/characters/dossier", snapshot, key),
   combat: () => request("/combat"),
   continuity: () => request("/session/continuity"),
   diceRolls: () => request("/dice/rolls"),
@@ -164,7 +165,8 @@ export const api = {
   splitTreasury: (handleId, confirmCurrent, key) =>
     mutate("/treasury/split", { handle_id: handleId, confirm_current: confirmCurrent }, key),
   startSession: (key) => mutate("/session/start", {}, key),
-  endSession: (whereEnded, key) => mutate("/session/end", { where_ended: whereEnded }, key),
+  endSession: (whereEnded, recordingUrl, key) =>
+    mutate("/session/end", { where_ended: whereEnded, recording_url: recordingUrl || null }, key),
   openCombat: (channelId, key) => mutate("/combat/open", { channel_id: channelId }, key),
   closeCombat: (outcome, key) => mutate("/combat/close", { outcome }, key),
   transitionCharacter: (characterId, lifecycle, key) =>

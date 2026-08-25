@@ -355,7 +355,7 @@ def _socket_check(base: str) -> Check:
         with connect(url, open_timeout=REQUEST_TIMEOUT_SECONDS) as socket_:
             socket_.send(json.dumps({"token": "preflight-is-not-a-token"}))
             socket_.recv(timeout=REQUEST_TIMEOUT_SECONDS)
-    except Exception as error:  # noqa: BLE001 - every failure here is reported, not raised
+    except Exception as error:
         if getattr(error, "code", None) == UNAUTHORIZED:
             return Check("socket", True, "/api/live upgrades, and refuses a token it did not sign")
         return Check(
@@ -409,7 +409,7 @@ def run_preflight(settings: Settings, *, bind: str | None = None) -> tuple[list[
             with _served(settings, address) as base:
                 checks.extend(_serving_checks(base, settings))
                 checks.append(_socket_check(base))
-        except Exception as error:  # noqa: BLE001 - a failure to serve is a result, not a crash
+        except Exception as error:
             checks.append(
                 Check("origin", False, f"the API could not be served on {address}: {error}", "")
             )

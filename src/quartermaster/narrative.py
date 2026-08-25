@@ -59,6 +59,19 @@ def _combat_closed_line(payload: Mapping[str, Any]) -> str:
     return sentence + (f": {payload['outcome']}." if payload.get("outcome") else ".")
 
 
+def _session_closed_line(payload: Mapping[str, Any]) -> str:
+    """What closing an evening says.
+
+    The endpoint sentence is not repeated here: the continuity surfaces read it
+    out of the session row, and the recap would otherwise end with the same
+    sentence twice. The recording is named because nothing else in the log says
+    it exists.
+    """
+    line = f"Session {payload['session_number']} closed."
+    recording = payload.get("recording_url")
+    return f"{line} Recording: {recording}" if recording else line
+
+
 def _dice_rolled_line(payload: Mapping[str, Any]) -> str:
     expression = payload.get("expression", "dice")
     label = payload.get("label") or expression
@@ -83,7 +96,7 @@ EVENT_RENDERERS: dict[str, Callable[[Mapping[str, Any]], str]] = {
         f"to {payload['destination_name']}."
     ),
     "SESSION_STARTED": lambda payload: f"Session {payload['session_number']} started.",
-    "SESSION_CLOSED": lambda payload: f"Session {payload['session_number']} closed.",
+    "SESSION_CLOSED": lambda payload: _session_closed_line(payload),
     "LOOT_DROP_CREATED": lambda payload: f"New Loot Drop created ({len(payload['items'])} item entries).",
     "LOOT_CLAIMED": lambda payload: (
         f"A player claimed {payload['quantity']} {payload['item_name']} from a Loot Drop."

@@ -870,6 +870,11 @@ class LifecycleView(PanelView):
         if self.character_id is None or self.lifecycle is None:
             await _send_error(interaction, "Choose a character and the state to move them to first.")
             return
+        # Read once, here. The lambda below runs later, and reading through
+        # `self` inside it would let a select changed in between hand the
+        # transaction a character this guard never approved.
+        character_id = self.character_id
+        lifecycle = self.lifecycle
         try:
             execution = await _run_fast(
                 interaction,
@@ -877,8 +882,8 @@ class LifecycleView(PanelView):
                 lambda: self.context.characters.transition_interaction(
                     str(interaction.id),
                     actor_id=_actor_id(interaction),
-                    character_id=self.character_id,
-                    lifecycle=self.lifecycle,
+                    character_id=character_id,
+                    lifecycle=lifecycle,
                 ),
                 ephemeral=True,
             )
@@ -1004,6 +1009,8 @@ class EstateView(PanelView):
         if self.character_id is None:
             await _send_error(interaction, "Choose whose belongings to resolve first.")
             return
+        # Read once, for the same reason the lifecycle panel does.
+        character_id = self.character_id
         try:
             execution = await _run_fast(
                 interaction,
@@ -1011,7 +1018,7 @@ class EstateView(PanelView):
                 lambda: self.context.characters.resolve_belongings_interaction(
                     str(interaction.id),
                     actor_id=_actor_id(interaction),
-                    character_id=self.character_id,
+                    character_id=character_id,
                     destination=self.destination,
                 ),
                 ephemeral=True,

@@ -13,7 +13,7 @@ from .naming import normalize_name
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 15
 
 
 class MigrationError(RuntimeError):
@@ -325,6 +325,27 @@ MIGRATIONS: dict[int, str] = {
     );
     CREATE INDEX character_dossiers_freshness_idx
         ON character_dossiers(source_freshness, observed_at);
+    """,
+    14: """
+    -- Where the table stopped is one sentence a DM types. The other half of
+    -- "where we stopped" is the recording, when the table makes one, and it
+    -- was going in a channel message that scrolls away. Nullable and with no
+    -- default: a table that records nothing is the normal case.
+    ALTER TABLE sessions ADD COLUMN recording_url TEXT;
+    """,
+    15: """
+    -- How far the outbound relay has got. One row, because there is one
+    -- ledger and one place it is being copied to.
+    --
+    -- Deliberately not an outbox: `domain_events` already is one, with a
+    -- monotonic cursor assigned inside the transaction that made the change.
+    -- A second queue would be a second copy of the same history, and a table
+    -- that has configured no webhook would accumulate rows nothing consumes.
+    CREATE TABLE webhook_cursor (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        delivered_sequence INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+    );
     """,
 }
 

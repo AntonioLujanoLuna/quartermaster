@@ -205,8 +205,59 @@ table.listing td.controls {
 /* Disabled is the state of every control while an action is in flight, so it
    has to read as "wait", not as "you may not". */
 .press:disabled {
-  opacity: 0.45;
+  opacity: 0.55;
   cursor: default;
+}
+
+/* The one that is actually working. Everything is disabled during a round trip
+   because a second press is a second action, but only one of them is the thing
+   the player just did, and a screen that dims all of it equally reads as
+   frozen rather than as busy. */
+.press-pending,
+.press-pending:disabled {
+  opacity: 1;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.press-pending::after {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-left: 6px;
+  vertical-align: middle;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pending 1s ease-in-out infinite;
+}
+
+@keyframes pending {
+  50% {
+    opacity: 0.2;
+  }
+}
+
+/* Somebody playing on a keyboard could not see where they were: there was no
+   focus rule in this stylesheet at all. `:focus-visible` rather than `:focus`
+   so a pressed button does not keep a ring the mouse user never asked for. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* A screen reader landing on the panel should not draw a box around it. */
+main:focus,
+main:focus-visible {
+  outline: none;
+}
+
+/* Honour a player who has asked their system for less movement. */
+@media (prefers-reduced-motion: reduce) {
+  .press-pending::after {
+    animation: none;
+  }
 }
 
 .press.primary {
@@ -222,6 +273,21 @@ table.listing td.controls {
 .press.quiet {
   border-color: transparent;
   color: var(--muted);
+}
+
+.text-area {
+  font: inherit;
+  font-size: 13px;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--ground);
+  color: var(--ink);
+  /* The lines are `name: value` pairs, and a horizontal scroll on a field
+     somebody is copying a sheet into is a field they cannot read back. */
+  resize: vertical;
+  min-width: 14em;
+  flex: 1 1 16em;
 }
 
 .quantity-field,
@@ -670,5 +736,79 @@ table.listing td.controls {
 
   .dice-presets .press {
     flex: 1 1 8em;
+  }
+
+  /* Six columns do not fit on a phone, and a table that does not fit scrolls
+     sideways under a heading row the reader can no longer see. Each row
+     becomes a card instead, with the column name printed in front of the
+     value — `labelCells` in render.js puts those names on the cells, read back
+     out of the table's own headings so the two cannot disagree. */
+  table.listing thead {
+    /* Hidden from the eye and from a reader both: the labels below say the
+       same thing, so announcing the headings again would say it twice. */
+    display: none;
+  }
+
+  table.listing,
+  table.listing tbody,
+  table.listing tr,
+  table.listing td {
+    display: block;
+    width: auto;
+  }
+
+  table.listing tr {
+    margin-bottom: 10px;
+    padding: 4px 0;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--raised);
+  }
+
+  table.listing td {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    border-bottom: none;
+    padding: 6px 10px;
+  }
+
+  table.listing td[data-label]::before {
+    content: attr(data-label);
+    flex: 0 0 auto;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    font-weight: 600;
+  }
+
+  /* An empty-list sentence spans the table and has no column name in front of
+     it, so it reads as the sentence it is rather than as a one-field card. */
+  table.listing td[colspan] {
+    justify-content: flex-start;
+    border: none;
+  }
+
+  /* The controls are the point of the row on a phone, so they get the full
+     width rather than being squeezed against the right edge. */
+  table.listing td.controls {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    border-top: 1px solid var(--line);
+    margin-top: 2px;
+  }
+
+  table.listing td.controls .press {
+    margin-left: 0;
+    margin-right: 6px;
+    /* A finger is not a mouse pointer. */
+    min-height: 32px;
+  }
+
+  table.listing td.field .quantity-field,
+  table.listing td.field .text-field {
+    width: 100%;
   }
 }

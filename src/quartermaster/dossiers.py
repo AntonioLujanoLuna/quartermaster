@@ -324,9 +324,12 @@ class CharacterDossierService:
             "spell_resources",
             "equipped",
         )
+        # `row.keys()` rather than iterating the row: `in` on a sqlite3.Row
+        # tests its values, not its column names, so SIM118's rewrite would
+        # quietly stop stripping the columns this exists to strip.
         result = {
             key: row[key]
-            for key in row.keys()
+            for key in row.keys()  # noqa: SIM118
             if key not in {"id", "character_id", "created_at", "updated_at"}
         }
         for field in json_fields:

@@ -5,6 +5,13 @@ on:
     branches: ["main"]
   pull_request:
 
+# A pull request that is pushed to twice does not need the first run's answer:
+# it is about a tree that no longer exists. `main` is excluded by the ref in the
+# group, so a merge is never cancelled by the push that follows it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -21,6 +28,13 @@ jobs:
 
       - name: Lint
         run: uv run ruff check .
+
+      # The annotations were always here. This is the first thing that reads
+      # them: the domain, the store, and the API answer for theirs in full,
+      # and the Discord adapter is exempted per module in pyproject.toml
+      # rather than by turning the check off.
+      - name: Check types
+        run: uv run mypy
 
       - name: Test
         run: uv run pytest -q

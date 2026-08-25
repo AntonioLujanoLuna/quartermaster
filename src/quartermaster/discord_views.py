@@ -33,7 +33,7 @@ from .handles import HandleError
 from .inventory import InventoryError, SemanticStaleness
 from .loot import LootDropError
 from .rendering import DISCORD_VIEW_COMPONENT_LIMIT
-from .sessions import SessionError
+from .sessions import RECORDING_URL_LIMIT, SessionError
 
 logger = logging.getLogger(__name__)
 
@@ -984,6 +984,15 @@ class LootDropModal(QuartermasterModal, title="Open a Loot Drop"):
 
 class SessionEndModal(QuartermasterModal, title="End the session"):
     where_ended = discord.ui.TextInput(label="Where did it end?", placeholder="The Sunken Tomb", max_length=200)
+    # The other half of "where we stopped", for a table that records. Optional,
+    # because most evenings are not recorded and a required field somebody has
+    # to put a space in is a required field they have already worked around.
+    recording_url = discord.ui.TextInput(
+        label="Recording link (optional)",
+        placeholder="https://…",
+        required=False,
+        max_length=RECORDING_URL_LIMIT,
+    )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not await _require_dm(interaction, self.settings):
@@ -996,6 +1005,7 @@ class SessionEndModal(QuartermasterModal, title="End the session"):
                     str(interaction.id),
                     actor_id=_actor_id(interaction),
                     where_ended=str(self.where_ended.value),
+                    recording_url=str(self.recording_url.value or "") or None,
                 ),
                 ephemeral=True,
             )

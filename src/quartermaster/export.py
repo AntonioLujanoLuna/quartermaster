@@ -15,8 +15,25 @@ _UNSCOPED_HISTORY_LIMIT = 25
 
 
 def render_export(store: SQLiteStore) -> str:
+    """The document, as the table reads it."""
+    return _render(collect_export(store))
+
+
+def export_document(store: SQLiteStore) -> dict[str, Any]:
+    """The same document, as a machine reads it.
+
+    The reason this is a second rendering of one collection rather than a
+    second read: the export is what every truncated surface points at, and two
+    queries answering the same question are two chances to disagree about what
+    the campaign holds. `_collect` is the read; the Markdown below and the JSON
+    the API serves are both views of what it returned.
+    """
+    return collect_export(store)
+
+
+def collect_export(store: SQLiteStore) -> dict[str, Any]:
     with store.read() as connection:
-        return _render_export(connection)
+        return _collect(connection)
 
 
 def _owner_label(row: Any, character_names: dict[str, str]) -> str:
@@ -82,12 +99,17 @@ def _history_line(row: Any) -> str:
     return render_entry(row["event_type"], row["payload"])
 
 
-def _render_export(connection: Any) -> str:
+def _collect(connection: Any) -> dict[str, Any]:
+    """Read the whole campaign once.
+
+    Everything below this line is a view of what this returned. Nothing else in
+    the export path touches the database.
+    """
     active = connection.execute(
         "SELECT id, session_number, started_at FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
     ).fetchone()
     previous = connection.execute(
-        "SELECT id, session_number, ended_at, where_ended FROM sessions WHERE status = 'CLOSED' ORDER BY session_number DESC LIMIT 1"
+        "SELECT id, session_number, ended_at, where_ended, recording_url FROM sessions WHERE status = 'CLOSED' ORDER BY session_number DESC LIMIT 1"
     ).fetchone()
     stacks = connection.execute(
         "SELECT item_name, quantity, provenance, owner_type, owner_id FROM inventory_stacks ORDER BY item_name, id"
@@ -133,20 +155,129 @@ def _render_export(connection: Any) -> str:
         "SELECT status, COUNT(*) AS count FROM interaction_receipts GROUP BY status ORDER BY status"
     ).fetchall()
     history, history_scope = _history(connection, active, previous)
-    generated = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    drops: list[dict[str, Any]] = []
+    for row in open_drops:
+        drop_id = str(row["id"])
+        if not drops or drops[-1]["drop_id"] != drop_id:
+            drops.append({"drop_id": drop_id, "expires_at": row["expires_at"], "items": []})
+        if row["item_name"] is not None:
+            drops[-1]["items"].append(
+                {
+                    "item_name": row["item_name"],
+                    "quantity": row["quantity"],
+                    "remaining_quantity": row["remaining_quantity"],
+                }
+            )
+
+    return {
+        "generated_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "schema_version": SCHEMA_VERSION,
+        "party_stash": [
+            {
+                "item_name": row["item_name"],
+                "quantity": row["quantity"],
+                "provenance": row["provenance"],
+                "owner_type": row["owner_type"],
+                "owner_id": str(row["owner_id"]),
+                "holder": _owner_label(row, character_names),
+            }
+            for row in stacks
+        ],
+        "open_loot_drops": drops,
+        "characters": [
+            {
+                "id": str(row["id"]),
+                "name": row["name"],
+                "discord_user_id": row["discord_user_id"],
+                "lifecycle": row["lifecycle"],
+            }
+            for row in characters
+        ],
+        "treasury": currency_from_row(treasury) if treasury else None,
+        "character_currency": [
+            {
+                "name": row["name"],
+                "lifecycle": row["lifecycle"],
+                "balance": currency_from_row(row),
+            }
+            for row in character_currency
+        ],
+        "active_session": (
+            {
+                "session_number": active["session_number"],
+                "started_at": active["started_at"],
+            }
+            if active
+            else None
+        ),
+        "previous_session": (
+            {
+                "session_number": previous["session_number"],
+                "ended_at": previous["ended_at"],
+                "where_ended": previous["where_ended"],
+                "recording_url": previous["recording_url"],
+            }
+            if previous
+            else None
+        ),
+        "combat": (
+            {
+                "session_number": encounter_session["session_number"],
+                "encounters": [
+                    {
+                        "status": row["status"],
+                        "channel_id": row["channel_id"],
+                        "opened_at": row["opened_at"],
+                        "closed_at": row["closed_at"],
+                        "closed_reason": row["closed_reason"],
+                        "outcome": row["outcome"],
+                    }
+                    for row in encounters
+                ],
+            }
+            if encounters
+            else None
+        ),
+        "interaction_receipts": {row["status"]: row["count"] for row in receipt_counts},
+        "history": {
+            "scope": history_scope,
+            "entries": [
+                {
+                    "created_at": row["created_at"],
+                    "event_type": row["event_type"],
+                    "line": _history_line(row),
+                }
+                for row in history
+            ],
+        },
+    }
+
+
+def _render(document: dict[str, Any]) -> str:
+    stacks = document["party_stash"]
+    drops = document["open_loot_drops"]
+    characters = document["characters"]
+    treasury = document["treasury"]
+    character_currency = document["character_currency"]
+    active = document["active_session"]
+    previous = document["previous_session"]
+    combat = document["combat"]
+    receipt_counts = document["interaction_receipts"]
+    history = document["history"]["entries"]
 
     lines = [
         "# Quartermaster Export",
         "",
-        f"Export timestamp: {generated}",
-        f"Schema version: {SCHEMA_VERSION}",
+        f"Export timestamp: {document['generated_at']}",
+        f"Schema version: {document['schema_version']}",
         "",
         "## Party Stash",
         "",
     ]
     if stacks:
         lines.extend(
-            f"- {row['item_name']} x{row['quantity']} ({_owner_label(row, character_names)})"
+            f"- {row['item_name']} x{row['quantity']} ({row['holder']})"
             + (f" — {row['provenance']}" if row["provenance"] else "")
             for row in stacks
         )
@@ -157,18 +288,15 @@ def _render_export(connection: Any) -> str:
     # while a drop is open its items exist nowhere else, and the only reason
     # the Open Loot panel truncates is that there are enough of them to matter.
     lines.extend(["", "## Open Loot Drops", ""])
-    if open_drops:
-        current_drop: str | None = None
-        for row in open_drops:
-            drop_id = str(row["id"])
-            if drop_id != current_drop:
-                current_drop = drop_id
-                lines.append(f"- Drop {drop_id} (expires {row['expires_at']})")
-            if row["item_name"] is None:
+    if drops:
+        for drop in drops:
+            lines.append(f"- Drop {drop['drop_id']} (expires {drop['expires_at']})")
+            if not drop["items"]:
                 lines.append("  - No items recorded on this drop.")
                 continue
-            lines.append(
-                f"  - {row['item_name']}: {row['remaining_quantity']} unclaimed of {row['quantity']}"
+            lines.extend(
+                f"  - {item['item_name']}: {item['remaining_quantity']} unclaimed of {item['quantity']}"
+                for item in drop["items"]
             )
     else:
         lines.append("- No open Loot Drops.")
@@ -182,11 +310,11 @@ def _render_export(connection: Any) -> str:
     else:
         lines.append("- No characters registered.")
     lines.extend(["", "## Treasury", ""])
-    lines.append(f"- {format_currency(currency_from_row(treasury), include_electrum=True)}" if treasury else "- Treasury is not initialized.")
+    lines.append(f"- {format_currency(treasury, include_electrum=True)}" if treasury else "- Treasury is not initialized.")
     if character_currency:
         lines.extend(["", "### Character currency", ""])
         lines.extend(
-            f"- {row['name']} [{row['lifecycle']}]: {format_currency(currency_from_row(row), include_electrum=True)}"
+            f"- {row['name']} [{row['lifecycle']}]: {format_currency(row['balance'], include_electrum=True)}"
             for row in character_currency
         )
     lines.extend(["", "## Session", ""])
@@ -197,12 +325,16 @@ def _render_export(connection: Any) -> str:
     if previous:
         endpoint = f"; where ended: {previous['where_ended']}" if previous["where_ended"] else ""
         lines.append(f"- Previous session: {previous['session_number']} (ended {previous['ended_at']}{endpoint}).")
-    if encounters:
+        # The recording is the other half of "where we stopped", and the export
+        # is the document somebody writing the evening up is already reading.
+        if previous["recording_url"]:
+            lines.append(f"- Recording: {previous['recording_url']}")
+    if combat:
         # Combat encounters are continuity, not mechanics: when the table was in
         # a fight and how it resolved. Avrae keeps everything that happened
         # inside it.
-        lines.extend(["", f"### Combat encounters in session {encounter_session['session_number']}", ""])
-        for row in encounters:
+        lines.extend(["", f"### Combat encounters in session {combat['session_number']}", ""])
+        for row in combat["encounters"]:
             if row["status"] == "OPEN":
                 lines.append(f"- Open since {row['opened_at']} in channel {row['channel_id']}.")
                 continue
@@ -213,12 +345,12 @@ def _render_export(connection: Any) -> str:
             )
     lines.extend(["", "## Interaction receipts", ""])
     if receipt_counts:
-        lines.extend(f"- {row['status']}: {row['count']}" for row in receipt_counts)
+        lines.extend(f"- {status}: {count}" for status, count in receipt_counts.items())
     else:
         lines.append("- No interaction receipts.")
-    lines.extend(["", f"## Recent relevant history ({history_scope})", ""])
+    lines.extend(["", f"## Recent relevant history ({document['history']['scope']})", ""])
     if history:
-        lines.extend(f"- {row['created_at']} — {_history_line(row)}" for row in history)
+        lines.extend(f"- {row['created_at']} — {row['line']}" for row in history)
     else:
         lines.append("- No ledger events.")
     lines.extend(["", "This export is generated from SQLite canonical state; Discord messages are disposable projections.", ""])

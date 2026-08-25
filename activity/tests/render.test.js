@@ -254,3 +254,151 @@ describe("my items", () => {
     expect(renderApp(state, handlers).textContent).toContain("no active character");
   });
 });
+
+describe("a screen somebody cannot see, and a screen too narrow for a table", () => {
+  it("says which screen is current, as a tablist rather than as a row of buttons", () => {
+    const node = renderApp(populatedState({ screen: "loot" }), handlers);
+    const tabs = [...node.querySelectorAll('[role="tab"]')];
+    expect(tabs.length).toBeGreaterThan(1);
+    const current = tabs.filter((tab) => tab.getAttribute("aria-selected") === "true");
+    expect(current).toHaveLength(1);
+    expect(current[0].textContent).toContain("Loot");
+    // One tab stop for the whole strip; the arrows move within it.
+    expect(tabs.filter((tab) => tab.tabIndex === 0)).toHaveLength(1);
+  });
+
+  it("points the panel at the tab that named it", () => {
+    const node = renderApp(populatedState({ screen: "treasury" }), handlers);
+    const panel = node.querySelector('[role="tabpanel"]');
+    expect(panel.getAttribute("aria-labelledby")).toBe("tab-treasury");
+    expect(node.querySelector("#tab-treasury")).not.toBeNull();
+  });
+
+  it("announces a refusal over what is being read and a receipt after it", () => {
+    const bad = renderApp(
+      populatedState({ notice: { tone: "bad", text: "That was refused." } }),
+      handlers,
+    );
+    expect(bad.querySelector(".notice").getAttribute("aria-live")).toBe("assertive");
+
+    const ok = renderApp(
+      populatedState({ notice: { tone: "ok", text: "Took 1 Rope." } }),
+      handlers,
+    );
+    expect(ok.querySelector(".notice").getAttribute("aria-live")).toBe("polite");
+  });
+
+  it("asks its one irreversible question as a dialog, named by the question", () => {
+    const node = renderApp(
+      populatedState({
+        prompt: { text: "Use 1 Rope?", confirmLabel: "Use it", fields: [], run: () => {} },
+      }),
+      handlers,
+    );
+    const box = node.querySelector('[role="dialog"]');
+    expect(box.getAttribute("aria-modal")).toBe("true");
+    expect(node.querySelector(`#${box.getAttribute("aria-labelledby")}`).textContent).toContain(
+      "Use 1 Rope?",
+    );
+  });
+
+  it("gives every named cell the heading it sits under, for the phone layout", () => {
+    const node = renderApp(populatedState({ screen: "stash" }), handlers);
+    const row = node.querySelector(".listing tbody tr");
+    const labels = [...row.children].map((cell) => cell.dataset.label);
+    expect(labels[0]).toBe("Item");
+    expect(labels[2]).toBe("Where it came from");
+    // The controls column is deliberately headed with nothing, and a card that
+    // printed a blank label in front of two buttons would be printing the
+    // absence of a heading rather than a heading.
+    expect(row.querySelector("td.controls").dataset.label).toBeUndefined();
+  });
+
+  it("does not put a column name in front of a sentence about the whole list", () => {
+    const node = renderApp(
+      populatedState({ screen: "stash", stash: { items: [], total: 0 } }),
+      handlers,
+    );
+    const cell = node.querySelector(".listing tbody td[colspan]");
+    expect(cell.dataset.label).toBeUndefined();
+  });
+});
+
+describe("a dossier has somewhere to come from", () => {
+  const dmWithRoster = (overrides = {}) =>
+    populatedState({
+      screen: "dossier",
+      actor: { id: "1", isDm: true },
+      dossier: {
+        status: "UNAVAILABLE",
+        reason: "No verified snapshot is available.",
+        character: null,
+      },
+      ...overrides,
+    });
+
+  it("offers the DM an import form on the screen that reads it back", () => {
+    const node = renderApp(dmWithRoster(), handlers);
+    expect(node.textContent).toContain("Import a sheet snapshot");
+    expect(node.querySelector('[data-input-key="dossier:scores"]')).not.toBeNull();
+    expect(node.querySelector('[data-input-key="dossier:character"]')).not.toBeNull();
+  });
+
+  it("offers it beside a snapshot that already exists, because sheets change", () => {
+    const node = renderApp(
+      dmWithRoster({
+        dossier: {
+          status: "CURRENT",
+          character: { id: "c1", name: "Vex" },
+          snapshot: {
+            system: "D&D 5e",
+            rules_version: "2014",
+            source: "MANUAL_IMPORT",
+            observed_at: "2026-08-25T10:00:00Z",
+            level: 4,
+            ability_modifiers: { STR: 3 },
+            ability_scores: { STR: 16 },
+            saving_throws: {},
+            spell_resources: {},
+            equipped: {},
+          },
+        },
+      }),
+      handlers,
+    );
+    expect(node.textContent).toContain("Vex dossier");
+    expect(node.textContent).toContain("Import a sheet snapshot");
+  });
+
+  it("shows a player neither the form nor a reason to want one", () => {
+    const node = renderApp(dmWithRoster({ actor: { id: "1", isDm: false } }), handlers);
+    expect(node.textContent).not.toContain("Import a sheet snapshot");
+  });
+
+  it("says so rather than offering a form with nobody to import for", () => {
+    const node = renderApp(dmWithRoster({ roster: [] }), handlers);
+    expect(node.textContent).toContain("No active character is registered");
+  });
+
+  it("keeps the recording beside where the table stopped", () => {
+    const node = renderApp(
+      populatedState({
+        home: { ...populatedState().home, active_session_number: null },
+        continuity: {
+          active_session_number: null,
+          previous: {
+            session_number: 2,
+            where_ended: "At the gates",
+            recording_url: "https://rec/2",
+          },
+          recap: [],
+          recap_total: 0,
+        },
+      }),
+      handlers,
+    );
+    const link = node.querySelector("a.recording");
+    expect(link.href).toBe("https://rec/2");
+    expect(link.rel).toContain("noopener");
+  });
+});

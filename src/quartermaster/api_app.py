@@ -68,7 +68,7 @@ from .db import SCHEMA_VERSION
 from .dice import DiceRollError, DiceService
 from .discord_common import Quartermaster
 from .dossiers import CharacterDossierService, DossierError
-from .export import render_export
+from .export import export_document, render_export
 from .handles import HandleError
 from .integration import (
     ProviderIntegrationError,
@@ -423,7 +423,18 @@ def dice_rolls(state: State, _: CurrentActor, limit: int = 20) -> dict[str, Any]
 
 
 @router.get("/export")
-def export(state: State, _: CurrentDM) -> dict[str, Any]:
+def export(state: State, _: CurrentDM, format: str = "text") -> dict[str, Any]:
+    """The full record, in one of its two renderings.
+
+    Both come from one read. `text` is the document the table reads during an
+    outage; `json` is the same collection unrendered, for a table that wants to
+    do something with its own campaign that Quartermaster does not do — an
+    Obsidian vault, a wiki page, a spreadsheet of who owes whom what.
+    """
+    if format == "json":
+        return {"export": export_document(state.context.store)}
+    if format != "text":
+        raise HTTPException(status_code=422, detail="format must be text or json")
     return {"export": render_export(state.context.store)}
 
 
@@ -876,6 +887,11 @@ class SessionEndRequest(BaseModel):
     #: panel's modal cannot make that distinction and this can, and the
     #: sentence is the whole of what the next evening opens on.
     where_ended: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+    #: Where the recording ended up, when the table made one. Optional because
+    #: most tables do not, and unvalidated here beyond its length: what a link
+    #: has to be is `normalize_recording_url`'s answer, and it refuses as a
+    #: domain refusal so the panel and this route give the same one.
+    recording_url: str | None = Field(default=None, max_length=500)
 
 
 class CombatOpenRequest(BaseModel):
@@ -1058,7 +1074,12 @@ def end_session(
     leaves the table with nothing to pick up.
     """
     return _committed(
-        state.context.sessions.end_interaction(action, actor_id=dm.id, where_ended=request.where_ended)
+        state.context.sessions.end_interaction(
+            action,
+            actor_id=dm.id,
+            where_ended=request.where_ended,
+            recording_url=request.recording_url,
+        )
     )
 
 
