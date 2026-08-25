@@ -206,6 +206,79 @@ WARNING quartermaster.discord_projection: could not pin the Party Stash projecti
 
 Grant the permission or free a pin slot; the surface pins itself on the next delivery, with no operator action and no lost updates in between. `health` will not report this — the projection is current, it is just scrolling with the channel.
 
+## Relaying the ledger onwards
+
+`QM_WEBHOOK_URL` posts the campaign's history to somewhere the table chooses — an
+Obsidian vault, a wiki, a spreadsheet, anything that accepts an HTTP POST. It is off
+unless configured, and a table that has not configured it pays nothing: no queue rows
+are written and no task is started.
+
+```powershell
+$env:QM_WEBHOOK_URL = "https://example.test/quartermaster"
+$env:QM_WEBHOOK_SECRET = "a-long-random-string"   # optional but recommended
+$env:QM_WEBHOOK_TIMEOUT_SECONDS = "5"             # optional, default 5
+```
+
+What arrives is one JSON document per batch:
+
+```json
+{
+  "source": "quartermaster",
+  "delivered_at": "2026-08-25T20:14:03Z",
+  "first_sequence": 412,
+  "last_sequence": 414,
+  "changes": [
+    {
+      "sequence": 412,
+      "event_type": "SESSION_CLOSED",
+      "occurred_at": "2026-08-25T20:14:01Z",
+      "line": "Session 4 closed.",
+      "payload": {"session_number": 4, "session_id": "…"}
+    }
+  ]
+}
+```
+
+`line` is rendered by the same table the session log and the export go through, so a
+relayed evening cannot describe itself differently from the evening the table watched.
+The payload goes as well, because handing the campaign to something else is the point.
+
+Three operational properties are worth knowing before pointing this anywhere:
+
+- **It is at-least-once.** The cursor advances only after a receiver answers 2xx, so a
+  receiver that was down for an evening gets the evening when it comes back rather than
+  a hole. The cost is the one every at-least-once delivery has: a receiver may see the
+  same sequence twice. Every change names its sequence, so a receiver that stores by
+  sequence is idempotent for free.
+- **A webhook configured mid-campaign replays from the beginning.** The cursor starts at
+  zero, which is what a wiki being populated for the first time wants. To start from
+  now instead, set the cursor to the head of the ledger before starting the bot:
+  `UPDATE webhook_cursor SET delivered_sequence = (SELECT MAX(sequence) FROM domain_events)`
+  — inserting the row first if it does not exist.
+- **A receiver that is down never takes the bot with it.** Delivery failures back off to
+  a two-minute ceiling and log a warning naming the error; nothing else in the runtime
+  waits on them.
+
+If `QM_WEBHOOK_SECRET` is set, each request carries
+`X-Quartermaster-Signature: sha256=<hex>`, an HMAC-SHA256 of the exact request body.
+Verify against the raw bytes rather than a re-serialized copy — the body is written with
+sorted keys and no whitespace so that a receiver which does re-serialize can still
+arrive at the same bytes. A URL containing credentials is refused at startup, because a
+delivery failure logs the URL.
+
+## Upgrading to schema 15
+
+Schema 15 adds the one-row `webhook_cursor` table used by the outbound relay above. The
+migration needs no operator action, and the table stays empty until a webhook is
+configured and a first batch is accepted.
+
+## Upgrading to schema 14
+
+Schema 14 adds a nullable `sessions.recording_url`. Ending a session can now carry the
+link to the table's recording beside the endpoint sentence; it appears on the continuity
+surfaces and in the export. Only `http://` and `https://` links are accepted, because
+every surface renders it as a link. The migration needs no operator action.
+
 ## Upgrading to schema 13
 
 Schema 13 adds versioned `character_dossiers` snapshots. The first source is a DM-only

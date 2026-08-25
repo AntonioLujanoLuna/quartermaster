@@ -139,6 +139,16 @@ because two copies of it are two chances to disagree about what an event means.
 
 The Discord transport is intentionally an adapter boundary at this stage. No network calls occur in the core package or in a database transaction. The adapter is split into `discord_common` (services, authorization, response helpers), `discord_views` (the leaf controls that act, and the modals they open), `discord_panels` (the panels those controls sit on, and the navigation between them), `discord_commands` (the one entry point), and `discord_adapter` (bot assembly and the runtime loop).
 
+The ledger can also be relayed onwards. `QM_WEBHOOK_URL` posts each batch of changes —
+the sequence, the event, and the line the session log would have printed, rendered by the
+same table so a relayed evening cannot describe itself differently — to somewhere the
+table chooses, and Quartermaster never learns what is at the other end. It is a second
+reader of `domain_events` rather than a second queue, for the same reason the live feed
+is; its cursor moves only once a receiver has accepted a batch, so a wiki that was down
+for an evening gets the evening rather than a hole. Off unless configured, signed with
+`QM_WEBHOOK_SECRET` when one is set, and never able to delay anything else in the
+runtime. See [the runbook](docs/runbook.md#relaying-the-ledger-onwards).
+
 For managed Windows startup, backup/restore, health, maintenance, dead-lettered events, and degraded operation, see [the operator runbook](docs/runbook.md).
 
 That boundary is also what makes a different surface thinkable. [The Activity migration plan](docs/activity-migration-plan.md) proposes moving play into a Discord Activity — a web UI embedded in the client, where the party joins by launching it rather than by each holding a private panel — and keeping the bot for the pinned projection, the session log, and asynchronous use.

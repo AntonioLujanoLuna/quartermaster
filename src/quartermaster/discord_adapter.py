@@ -32,6 +32,7 @@ from .operations import run_maintenance
 from .receipts import ReceiptRepository
 from .recovery import recover_startup
 from .sessions import SessionService
+from .webhook import WebhookRelay, aiohttp_delivery
 
 logger = logging.getLogger(__name__)
 
@@ -96,13 +97,15 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
     guild = discord.Object(id=int(settings.guild_id))
     projection_task: asyncio.Task | None = None
     api_task: asyncio.Task | None = None
+    webhook_task: asyncio.Task | None = None
+    relay: WebhookRelay | None = None
     stop_event = asyncio.Event()
 
     context = context_for(settings, services)
     register_commands(bot, guild, context)
 
     async def setup_hook() -> None:
-        nonlocal projection_task, api_task
+        nonlocal projection_task, api_task, webhook_task, relay
         await bot.tree.sync(guild=guild)
         logger.info("synced Quartermaster commands to guild %s", settings.guild_id)
         if settings.party_inventory_channel_id and settings.session_log_channel_id:
@@ -124,6 +127,20 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
             projection_task = asyncio.create_task(runner.run(stop_event))
         else:
             logger.warning("projection delivery disabled: configure QM_PARTY_INVENTORY_CHANNEL_ID and QM_SESSION_LOG_CHANNEL_ID")
+        if settings.webhook_url is not None:
+            # The one integration Quartermaster can offer without learning about
+            # anything: the table's own tools read the ledger, and Quartermaster
+            # never learns which they are. It reads `domain_events` the way the
+            # live feed does — woken by a commit rather than polled — and its
+            # cursor moves only after a receiver accepts a batch.
+            relay = WebhookRelay(
+                services.store,
+                aiohttp_delivery(settings.webhook_url, settings.webhook_timeout_seconds),
+                secret=settings.webhook_secret,
+            )
+            services.store.add_commit_listener(relay.wake)
+            webhook_task = asyncio.create_task(relay.run())
+            logger.info("relaying the ledger onwards to a configured webhook")
         if settings.activity_enabled:
             # Imported here rather than at module scope: FastAPI and uvicorn
             # are an optional extra, and the bot has to keep starting without
@@ -169,6 +186,13 @@ def create_bot(settings: Settings, services: BotServices) -> commands.Bot:
 
     async def close() -> None:
         stop_event.set()
+        if relay is not None:
+            relay.close()
+        if webhook_task is not None:
+            # Awaited rather than cancelled: a delivery in flight either lands
+            # and moves the cursor or does not and will be redelivered, and
+            # cancelling it mid-POST leaves which of those happened unknown.
+            await webhook_task
         if projection_task is not None:
             await projection_task
         if api_task is not None:
