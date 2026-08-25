@@ -304,6 +304,45 @@ async function run(work) {
   }
 }
 
+/** The characters a sheet can be imported for. */
+function activeRoster() {
+  return state.roster.filter((character) => character.lifecycle === "ACTIVE");
+}
+
+/** A number somebody typed, or nothing, which is not the same as a zero. */
+function typedOrNull(key) {
+  const typed = Number.parseInt(state.inputs[key] ?? "", 10);
+  return Number.isFinite(typed) ? typed : null;
+}
+
+/**
+ * `name: value` per line, as an object.
+ *
+ * A line it cannot read is refused rather than skipped. Dropping it would
+ * store a sheet missing whichever ability the DM typed a colon wrong on, and
+ * a dossier is read as a complete reading of a character.
+ */
+function typedMap(key, values) {
+  const result = {};
+  for (const raw of (state.inputs[key] ?? "").split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    const at = line.indexOf(":");
+    if (at < 1) throw new Error(`"${line}" is not a name and a value separated by a colon.`);
+    const name = line.slice(0, at).trim();
+    const value = line.slice(at + 1).trim();
+    if (!name || !value) throw new Error(`"${line}" is missing a name or a value.`);
+    if (values === "number") {
+      const number = Number.parseInt(value, 10);
+      if (!Number.isFinite(number)) throw new Error(`"${line}" needs a whole number.`);
+      result[name] = number;
+    } else {
+      result[name] = value;
+    }
+  }
+  return result;
+}
+
 /** A number somebody typed, or the default if they typed nothing usable. */
 function typedNumber(key, fallback) {
   const typed = Number.parseInt(state.inputs[key] ?? "", 10);
@@ -510,7 +549,7 @@ const handlers = {
 
   startSession: () => run(() => actions.startSession()),
 
-  endSession(whereEnded) {
+  endSession(whereEnded, recordingUrl) {
     const where = (whereEnded || "").trim();
     if (!where) {
       // Required, and this is where it is worth saying why: it is the sentence
@@ -518,8 +557,16 @@ const handlers = {
       notify("bad", "Say where it ended. That is what the table picks up from next time.");
       return;
     }
+    const recording = (recordingUrl || "").trim();
+    // Answered here so a mistyped link does not cost the whole end-of-session
+    // press. What a link has to be is the domain's answer, and it refuses this
+    // too — this is the same refusal, one round trip earlier.
+    if (recording && !/^https?:\/\/\S+$/i.test(recording)) {
+      notify("bad", "A recording link has to start with http:// or https:// and hold no spaces.");
+      return;
+    }
     run(async () => {
-      if (await actions.endSession(where)) clearInputs("end:");
+      if (await actions.endSession(where, recording)) clearInputs("end:");
     });
   },
 
@@ -553,6 +600,70 @@ const handlers = {
         state.dice.last = result;
         clearInputs("dice:");
         draw();
+      }
+    });
+  },
+
+  /**
+   * Turn a typed sheet into the snapshot the API stores.
+   *
+   * Every value is passed through as given. Nothing here derives a modifier
+   * from a score or a bonus from a level: the dossier explains a reading
+   * somebody took, and a number Quartermaster worked out for itself would be
+   * a rules engine wearing a snapshot's clothes.
+   */
+  importDossier() {
+    const characterId = state.inputs["dossier:character"] || activeRoster()[0]?.id;
+    if (!characterId) {
+      notify("bad", "No active character is registered to import a sheet for.");
+      return;
+    }
+    const character = state.roster.find((row) => row.id === characterId);
+    const system = (state.inputs["dossier:system"] || "").trim();
+    const rules = (state.inputs["dossier:rules"] || "").trim();
+    if (!system || !rules) {
+      notify("bad", "Name the system and the rules version the sheet is for.");
+      return;
+    }
+
+    let maps;
+    try {
+      maps = {
+        ability_scores: typedMap("dossier:scores", "number"),
+        ability_modifiers: typedMap("dossier:modifiers", "number"),
+        saving_throws: typedMap("dossier:saves", "number"),
+        spell_resources: typedMap("dossier:resources", "number"),
+        equipped: typedMap("dossier:equipped", "text"),
+      };
+    } catch (error) {
+      notify("bad", error.message);
+      return;
+    }
+
+    const snapshot = {
+      character_id: characterId,
+      system,
+      rules_version: rules,
+      source_reference: (state.inputs["dossier:reference"] || "").trim() || null,
+      source_freshness: state.inputs["dossier:freshness"] || "CURRENT",
+      level: typedOrNull("dossier:level"),
+      proficiency_bonus: typedOrNull("dossier:proficiency"),
+      armor_class: typedOrNull("dossier:ac"),
+      hit_points: typedOrNull("dossier:hp"),
+      temporary_hit_points: typedOrNull("dossier:temp") ?? 0,
+      initiative: typedOrNull("dossier:initiative"),
+      spell_attack_modifier: typedOrNull("dossier:spellattack"),
+      spell_save_dc: typedOrNull("dossier:spelldc"),
+      // When the reading was taken, which for a form is when it was typed in.
+      // A DM copying from a sheet they read yesterday says so with STALE
+      // rather than by backdating this.
+      observed_at: new Date().toISOString(),
+      ...maps,
+    };
+
+    run(async () => {
+      if (await actions.importDossier(snapshot, character?.name || "that character")) {
+        clearInputs("dossier:");
       }
     });
   },
@@ -591,6 +702,30 @@ const handlers = {
   dismissReport() {
     state.report = null;
     draw();
+  },
+
+  /**
+   * Take the export out of the frame.
+   *
+   * The runbook calls it the document to read during an outage, and during an
+   * outage it is wanted anywhere but inside a Discord iframe. A download the
+   * page starts itself is not reliable there; the clipboard is.
+   */
+  copyReport(text) {
+    run(async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+        notify("ok", "The export is on your clipboard.");
+      } catch {
+        // A clipboard write needs a permission the embed may not have, and
+        // failing silently would leave somebody pressing a button that does
+        // nothing during the one hour they need it most.
+        notify(
+          "bad",
+          "Discord would not let the page write to the clipboard. Select the text and copy it.",
+        );
+      }
+    });
   },
 
   register(discordUserId, personName) {

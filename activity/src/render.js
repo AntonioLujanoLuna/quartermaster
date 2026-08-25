@@ -54,6 +54,26 @@ function textField(state, key, placeholder, handlers) {
 }
 
 /**
+ * A field for the parts of a character sheet that are a list rather than a
+ * number: the ability scores, the saves, what is prepared, what is worn.
+ *
+ * One `name: value` per line, because that is how they are written on the
+ * sheet the DM is copying from. The API takes an object; turning these lines
+ * into one is `main.js`'s job, and it refuses a line it cannot read rather
+ * than dropping it.
+ */
+function textArea(state, key, placeholder, handlers, rows = 3) {
+  const node = element("textarea", "text-area");
+  node.rows = rows;
+  node.placeholder = placeholder;
+  node.value = state.inputs[key] ?? "";
+  node.dataset.inputKey = key;
+  node.setAttribute("aria-label", placeholder);
+  node.addEventListener("input", () => handlers.setInput(key, node.value));
+  return node;
+}
+
+/**
  * How many item rows the drop form is showing.
  *
  * Held in `state.inputs` with everything else that has been typed but not
@@ -198,6 +218,18 @@ function renderContinuity(continuity) {
     ? `Ended at: ${continuity.previous.where_ended}`
     : "No endpoint was recorded.";
   section.append(element("p", null, endpoint));
+
+  if (continuity.previous.recording_url) {
+    const line = element("p", null, "Recording: ");
+    const link = element("a", "recording", continuity.previous.recording_url);
+    link.href = continuity.previous.recording_url;
+    link.target = "_blank";
+    // The Activity runs framed inside another origin, so a link out of it says
+    // nothing to the page it opens about where it came from.
+    link.rel = "noreferrer noopener";
+    line.append(link);
+    section.append(line);
+  }
 
   const recap = Array.isArray(continuity.recap) ? continuity.recap : [];
   if (recap.length > 0) {
@@ -819,7 +851,127 @@ function renderPartyScreen(state, handlers) {
   return screen;
 }
 
-function renderDossierScreen(state) {
+/**
+ * Where a dossier comes from.
+ *
+ * `POST /api/characters/dossier` has existed since the dossier did, and until
+ * now nothing pressed it: the store, the validation, the receipt, and the read
+ * were all built, and the only way to put a snapshot in was to call the API by
+ * hand. So the Character screen could report nothing but "no verified snapshot
+ * is available" — correctly, and for good.
+ *
+ * The DM is the source boundary for this first slice, which is what makes this
+ * a form rather than a fetch. It is on the Character screen for the same reason
+ * Grant is on the Party Stash: a control belongs where what it changes is shown.
+ */
+function renderDossierImport(state, handlers) {
+  const block = element("div", "dm-block");
+  block.append(element("h2", null, "Import a sheet snapshot"));
+  block.append(
+    element(
+      "p",
+      "muted",
+      "Quartermaster stores this to explain a character, and reads it back exactly as given. " +
+        "It calculates nothing from it and authorizes no mechanic with it — Avrae remains the " +
+        "authority for the rules.",
+    ),
+  );
+
+  const form = element("div", "form");
+  const select = element("select", "select");
+  select.dataset.inputKey = "dossier:character";
+  select.setAttribute("aria-label", "Whose sheet this is");
+  const registered = state.roster.filter((character) => character.lifecycle === "ACTIVE");
+  if (registered.length === 0) {
+    block.append(element("p", "muted", "No active character is registered to import a sheet for."));
+    return block;
+  }
+  for (const character of registered) {
+    const option = element("option", null, character.name);
+    option.value = character.id;
+    option.selected = state.inputs["dossier:character"] === character.id;
+    select.append(option);
+  }
+  select.addEventListener("change", () => handlers.setInput("dossier:character", select.value));
+  form.append(labelled("Whose sheet", select));
+
+  form.append(labelled("System", textField(state, "dossier:system", "D&D 5e", handlers)));
+  form.append(labelled("Rules version", textField(state, "dossier:rules", "2014", handlers)));
+  form.append(
+    labelled(
+      "Where it came from",
+      textField(state, "dossier:reference", "Avrae sheet, D&D Beyond URL…", handlers),
+    ),
+  );
+
+  const freshness = element("select", "select");
+  freshness.dataset.inputKey = "dossier:freshness";
+  freshness.setAttribute("aria-label", "How current this reading is");
+  for (const [value, label] of [
+    ["CURRENT", "Current — read from the sheet just now"],
+    ["STALE", "Stale — read a while ago, may have moved"],
+  ]) {
+    const option = element("option", null, label);
+    option.value = value;
+    option.selected = (state.inputs["dossier:freshness"] || "CURRENT") === value;
+    freshness.append(option);
+  }
+  freshness.addEventListener("change", () =>
+    handlers.setInput("dossier:freshness", freshness.value),
+  );
+  form.append(labelled("How current", freshness));
+
+  const numbers = element("div", "form");
+  for (const [key, label] of [
+    ["level", "Level"],
+    ["proficiency", "Proficiency bonus"],
+    ["ac", "Armor Class"],
+    ["hp", "Hit points"],
+    ["temp", "Temporary hit points"],
+    ["initiative", "Initiative"],
+    ["spellattack", "Spell attack modifier"],
+    ["spelldc", "Spell save DC"],
+  ]) {
+    const field = quantityField(state, `dossier:${key}`, { handlers, initial: "" });
+    // Left blank rather than defaulted: the screen says "Not supplied" for a
+    // value that was not, and a zero typed in by the form would be a reading
+    // nobody took.
+    field.removeAttribute("min");
+    field.setAttribute("aria-label", label);
+    numbers.append(labelled(label, field));
+  }
+  form.append(numbers);
+
+  for (const [key, label, placeholder] of [
+    ["scores", "Ability scores", "STR: 16\nDEX: 12"],
+    ["modifiers", "Ability modifiers", "STR: 3\nDEX: 1"],
+    ["saves", "Saving throws", "STR: 5\nCON: 3"],
+    ["resources", "Spell resources", "1st: 4\n2nd: 3"],
+    ["equipped", "Equipped", "Weapon: Longsword\nArmour: Chain mail"],
+  ]) {
+    form.append(labelled(label, textArea(state, `dossier:${key}`, placeholder, handlers)));
+  }
+
+  form.append(
+    button("Import the snapshot", {
+      style: "primary",
+      busy: state.busy,
+      onPress: () => handlers.importDossier(),
+    }),
+  );
+  block.append(form);
+  block.append(
+    element(
+      "p",
+      "muted",
+      "One name and value per line. Importing replaces the character's previous snapshot and " +
+        "records it as a new version.",
+    ),
+  );
+  return block;
+}
+
+function renderDossierScreen(state, handlers) {
   const screen = element("section", "screen");
   const dossier = state.dossier;
   if (!dossier) {
@@ -834,6 +986,7 @@ function renderDossierScreen(state) {
         element("p", "muted", `${dossier.character.name} has no imported sheet snapshot yet.`),
       );
     }
+    if (state.actor?.isDm) screen.append(renderDossierImport(state, handlers));
     return screen;
   }
 
@@ -901,6 +1054,7 @@ function renderDossierScreen(state) {
       "This dossier explains a supplied snapshot. It does not authorize or calculate a mechanic.",
     ),
   );
+  if (state.actor?.isDm) screen.append(renderDossierImport(state, handlers));
   return screen;
 }
 
@@ -1251,12 +1405,19 @@ function renderSessionBlock(state, handlers) {
   form.append(
     labelled("Where did it end?", textField(state, "end:where", "The Sunken Tomb", handlers)),
   );
+  // The other half of where the table stopped, for a table that records. It is
+  // optional and says so, because most evenings are not recorded and the
+  // endpoint sentence is the field that must not be skipped.
+  form.append(
+    labelled("Recording link (optional)", textField(state, "end:recording", "https://…", handlers)),
+  );
   form.append(
     button("End the session", {
       style: "danger",
       busy: state.busy,
       title: "Closes any open Loot Drops and any open fight.",
-      onPress: () => handlers.endSession(state.inputs["end:where"] ?? ""),
+      onPress: () =>
+        handlers.endSession(state.inputs["end:where"] ?? "", state.inputs["end:recording"] ?? ""),
     }),
   );
   block.append(form);
@@ -1430,7 +1591,17 @@ function renderMaintenanceBlock(state, handlers) {
     // A pre rather than a paragraph: this is the operator's text, and it is
     // laid out in columns that a reflow would take apart.
     block.append(element("pre", "report", state.report));
-    block.append(button("Close", { style: "quiet", onPress: handlers.dismissReport }));
+    const after = element("div", "form");
+    // The runbook calls the export the document to read during an outage, and
+    // during an outage the useful place for it is anywhere but this frame.
+    // Copying is the way out that works here: the Activity runs in Discord's
+    // iframe, where a download the page starts itself is not guaranteed to go
+    // anywhere.
+    after.append(
+      button("Copy", { style: "primary", onPress: () => handlers.copyReport(state.report) }),
+    );
+    after.append(button("Close", { style: "quiet", onPress: handlers.dismissReport }));
+    block.append(after);
   }
   return block;
 }

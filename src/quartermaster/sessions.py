@@ -20,8 +20,44 @@ from .receipts import ReceiptRepository, ReceiptResult
 CONTINUITY_RECAP_LINES = 8
 
 
+#: A recording link is somebody pasting a URL, so it is bounded like every other
+#: typed field here rather than trusted for being a URL.
+RECORDING_URL_LIMIT = 500
+
+
 class SessionError(RuntimeError):
     """Raised when a session lifecycle precondition fails."""
+
+
+def normalize_recording_url(value: str | None) -> str | None:
+    """Check a pasted recording link, or refuse it.
+
+    The table already uses a recorder; where the recording ended up was going
+    into a channel message that scrolls away, while the one thing that does not
+    scroll away — where the evening stopped — is written down. This is the other
+    half of that sentence.
+
+    Only http and https. Every surface that shows this renders it as a link, and
+    a `javascript:` URL rendered as a link is a script the next person to open
+    the continuity panel runs. Whether the link resolves is not checked and
+    cannot be: Quartermaster makes no network calls outside the adapter, and a
+    recording that has not finished uploading yet is still the right answer.
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) > RECORDING_URL_LIMIT:
+        raise SessionError(f"the recording link must be at most {RECORDING_URL_LIMIT} characters")
+    lowered = text.lower()
+    if not (lowered.startswith("http://") or lowered.startswith("https://")):
+        raise SessionError("the recording link must start with http:// or https://")
+    # A link is rendered into Discord messages and into a web page. Neither
+    # should have to guess where one ends.
+    if any(character.isspace() for character in text):
+        raise SessionError("the recording link must not contain spaces")
+    return text
 
 
 class SessionService:
@@ -68,10 +104,17 @@ class SessionService:
             mark_projection_dirty(connection, target_id="session-surface", target_type="STATE", destination=f"session:{session_id}")
             return {"status": "STARTED", "session_id": session_id, "session_number": session_number}
 
-    def end_session(self, session_id: str, *, where_ended: str | None = None, operation_id: str | None = None) -> dict[str, Any]:
+    def end_session(
+        self,
+        session_id: str,
+        *,
+        where_ended: str | None = None,
+        recording_url: str | None = None,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
         operation_id = operation_id or str(uuid.uuid4())
         with self.store.transaction() as connection:
-            return self._end_in_transaction(connection, operation_id, session_id, where_ended)
+            return self._end_in_transaction(connection, operation_id, session_id, where_ended, recording_url)
 
     def continuity(self, *, limit: int = CONTINUITY_RECAP_LINES) -> dict[str, Any]:
         """What the table needs to pick up where it left off.
@@ -94,7 +137,7 @@ class SessionService:
                 "SELECT session_number, started_at FROM sessions WHERE status = 'ACTIVE' ORDER BY session_number DESC LIMIT 1"
             ).fetchone()
             previous = connection.execute(
-                """SELECT session_number, started_at, ended_at, where_ended
+                """SELECT session_number, started_at, ended_at, where_ended, recording_url
                      FROM sessions WHERE status = 'CLOSED'
                     ORDER BY session_number DESC LIMIT 1"""
             ).fetchone()
@@ -139,14 +182,22 @@ class SessionService:
             mutation=lambda connection, operation_id: self._start_in_transaction(connection, operation_id),
         )
 
-    def end_interaction(self, interaction_id: str, *, actor_id: str | None, where_ended: str) -> ReceiptResult:
+    def end_interaction(
+        self,
+        interaction_id: str,
+        *,
+        actor_id: str | None,
+        where_ended: str,
+        recording_url: str | None = None,
+    ) -> ReceiptResult:
         if self.receipts is None:
             raise SessionError("receipt repository is required for interaction operations")
+        recording = normalize_recording_url(recording_url)
         return self.receipts.execute_fast(
             interaction_id,
             actor_id=actor_id,
             response_kind="session",
-            mutation=lambda connection, operation_id: self._end_active_in_transaction(connection, operation_id, where_ended),
+            mutation=lambda connection, operation_id: self._end_active_in_transaction(connection, operation_id, where_ended, recording),
         )
 
     def _start_in_transaction(self, connection: Any, operation_id: str) -> dict[str, Any]:
@@ -161,20 +212,30 @@ class SessionService:
         mark_projection_dirty(connection, target_id="session-surface", target_type="STATE", destination=f"session:{session_id}")
         return {"status": "STARTED", "session_id": session_id, "session_number": session_number}
 
-    def _end_active_in_transaction(self, connection: Any, operation_id: str, where_ended: str) -> dict[str, Any]:
+    def _end_active_in_transaction(
+        self, connection: Any, operation_id: str, where_ended: str, recording_url: str | None = None
+    ) -> dict[str, Any]:
         active = connection.execute("SELECT id FROM sessions WHERE status = 'ACTIVE'").fetchone()
         if active is None:
             return {"status": "NO_ACTIVE_SESSION"}
-        return self._end_in_transaction(connection, operation_id, active["id"], where_ended)
+        return self._end_in_transaction(connection, operation_id, active["id"], where_ended, recording_url)
 
-    def _end_in_transaction(self, connection: Any, operation_id: str, session_id: str, where_ended: str | None) -> dict[str, Any]:
+    def _end_in_transaction(
+        self,
+        connection: Any,
+        operation_id: str,
+        session_id: str,
+        where_ended: str | None,
+        recording_url: str | None = None,
+    ) -> dict[str, Any]:
         session = connection.execute("SELECT * FROM sessions WHERE id = ? AND status = 'ACTIVE'", (session_id,)).fetchone()
         if session is None:
             raise SessionError("active session not found")
         now = iso_now()
+        recording = normalize_recording_url(recording_url)
         connection.execute(
-            "UPDATE sessions SET status = 'CLOSED', ended_at = ?, where_ended = ? WHERE id = ? AND status = 'ACTIVE'",
-            (now, where_ended, session_id),
+            "UPDATE sessions SET status = 'CLOSED', ended_at = ?, where_ended = ?, recording_url = ? WHERE id = ? AND status = 'ACTIVE'",
+            (now, where_ended, recording, session_id),
         )
         closed_combats = self.combat.close_session_encounters(
             connection, session_id=session_id, operation_id=operation_id
@@ -185,7 +246,12 @@ class SessionService:
             operation_id=operation_id,
             actor_id=None,
             event_type="SESSION_CLOSED",
-            payload={"session_id": session_id, "session_number": session["session_number"], "where_ended": where_ended},
+            payload={
+                "session_id": session_id,
+                "session_number": session["session_number"],
+                "where_ended": where_ended,
+                "recording_url": recording,
+            },
             destination=f"session:{session_id}",
         )
         mark_projection_dirty(connection, target_id="session-surface", target_type="STATE", destination=f"session:{session_id}")
@@ -194,6 +260,7 @@ class SessionService:
             "status": "CLOSED",
             "session_id": session_id,
             "session_number": session["session_number"],
+            "recording_url": recording,
             "closed_drops": closed_drops,
             "closed_combats": closed_combats,
         }

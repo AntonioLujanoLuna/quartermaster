@@ -13,7 +13,7 @@ from .naming import normalize_name
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 class MigrationError(RuntimeError):
@@ -325,6 +325,13 @@ MIGRATIONS: dict[int, str] = {
     );
     CREATE INDEX character_dossiers_freshness_idx
         ON character_dossiers(source_freshness, observed_at);
+    """,
+    14: """
+    -- Where the table stopped is one sentence a DM types. The other half of
+    -- "where we stopped" is the recording, when the table makes one, and it
+    -- was going in a channel message that scrolls away. Nullable and with no
+    -- default: a table that records nothing is the normal case.
+    ALTER TABLE sessions ADD COLUMN recording_url TEXT;
     """,
 }
 

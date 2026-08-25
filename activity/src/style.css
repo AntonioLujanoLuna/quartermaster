@@ -275,6 +275,21 @@ main:focus-visible {
   color: var(--muted);
 }
 
+.text-area {
+  font: inherit;
+  font-size: 13px;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--ground);
+  color: var(--ink);
+  /* The lines are `name: value` pairs, and a horizontal scroll on a field
+     somebody is copying a sheet into is a field they cannot read back. */
+  resize: vertical;
+  min-width: 14em;
+  flex: 1 1 16em;
+}
+
 .quantity-field,
 .text-field,
 .select {

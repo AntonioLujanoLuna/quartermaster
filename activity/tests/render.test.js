@@ -323,3 +323,82 @@ describe("a screen somebody cannot see, and a screen too narrow for a table", ()
     expect(cell.dataset.label).toBeUndefined();
   });
 });
+
+describe("a dossier has somewhere to come from", () => {
+  const dmWithRoster = (overrides = {}) =>
+    populatedState({
+      screen: "dossier",
+      actor: { id: "1", isDm: true },
+      dossier: {
+        status: "UNAVAILABLE",
+        reason: "No verified snapshot is available.",
+        character: null,
+      },
+      ...overrides,
+    });
+
+  it("offers the DM an import form on the screen that reads it back", () => {
+    const node = renderApp(dmWithRoster(), handlers);
+    expect(node.textContent).toContain("Import a sheet snapshot");
+    expect(node.querySelector('[data-input-key="dossier:scores"]')).not.toBeNull();
+    expect(node.querySelector('[data-input-key="dossier:character"]')).not.toBeNull();
+  });
+
+  it("offers it beside a snapshot that already exists, because sheets change", () => {
+    const node = renderApp(
+      dmWithRoster({
+        dossier: {
+          status: "CURRENT",
+          character: { id: "c1", name: "Vex" },
+          snapshot: {
+            system: "D&D 5e",
+            rules_version: "2014",
+            source: "MANUAL_IMPORT",
+            observed_at: "2026-08-25T10:00:00Z",
+            level: 4,
+            ability_modifiers: { STR: 3 },
+            ability_scores: { STR: 16 },
+            saving_throws: {},
+            spell_resources: {},
+            equipped: {},
+          },
+        },
+      }),
+      handlers,
+    );
+    expect(node.textContent).toContain("Vex dossier");
+    expect(node.textContent).toContain("Import a sheet snapshot");
+  });
+
+  it("shows a player neither the form nor a reason to want one", () => {
+    const node = renderApp(dmWithRoster({ actor: { id: "1", isDm: false } }), handlers);
+    expect(node.textContent).not.toContain("Import a sheet snapshot");
+  });
+
+  it("says so rather than offering a form with nobody to import for", () => {
+    const node = renderApp(dmWithRoster({ roster: [] }), handlers);
+    expect(node.textContent).toContain("No active character is registered");
+  });
+
+  it("keeps the recording beside where the table stopped", () => {
+    const node = renderApp(
+      populatedState({
+        home: { ...populatedState().home, active_session_number: null },
+        continuity: {
+          active_session_number: null,
+          previous: {
+            session_number: 2,
+            where_ended: "At the gates",
+            recording_url: "https://rec/2",
+          },
+          recap: [],
+          recap_total: 0,
+        },
+      }),
+      handlers,
+    );
+    const link = node.querySelector("a.recording");
+    expect(link.href).toBe("https://rec/2");
+    expect(link.rel).toContain("noopener");
+  });
+});

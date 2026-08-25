@@ -297,13 +297,24 @@ export function createActions({ notify, ask, reload }) {
       });
     },
 
-    async endSession(whereEnded) {
+    async importDossier(snapshot, characterName) {
       return perform(async () => {
-        const it = (await api.endSession(whereEnded, actionKey())).result;
+        const it = (await api.importDossier(snapshot, actionKey())).result;
+        const version = it?.snapshot_version;
+        return version
+          ? `Snapshot version ${version} imported for ${characterName}.`
+          : `Snapshot imported for ${characterName}.`;
+      });
+    },
+
+    async endSession(whereEnded, recordingUrl) {
+      return perform(async () => {
+        const it = (await api.endSession(whereEnded, recordingUrl, actionKey())).result;
         if (it.status === "NO_ACTIVE_SESSION") return "There is no session running.";
         const parts = [`Session ${it.session_number} ended.`];
         if (it.closed_drops) parts.push(`${it.closed_drops} open drops closed.`);
         if (it.closed_combats) parts.push(`${it.closed_combats} open fights closed.`);
+        if (it.recording_url) parts.push("Recording saved.");
         return parts.join(" ");
       });
     },

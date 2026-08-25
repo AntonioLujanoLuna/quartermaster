@@ -556,6 +556,37 @@ class AuthorizationTests(ApiTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("# Quartermaster Export", response.json()["export"])
 
+    def test_the_export_is_also_readable_by_something_other_than_a_person(self) -> None:
+        """One read, two renderings.
+
+        The table reads the Markdown during an outage; a machine reads the same
+        collection unrendered. Two queries answering the same question would be
+        two chances to disagree about what the campaign holds.
+        """
+        structured = self.client.get(
+            "/api/export", params={"format": "json"}, headers=self.headers("dm-code")
+        )
+        self.assertEqual(structured.status_code, 200, structured.text)
+        document = structured.json()["export"]
+        self.assertIn("party_stash", document)
+        self.assertIn("characters", document)
+        self.assertIn("history", document)
+        self.assertEqual(document["schema_version"], SCHEMA_VERSION)
+
+    def test_the_export_refuses_a_rendering_it_does_not_have(self) -> None:
+        refused = self.client.get(
+            "/api/export", params={"format": "yaml"}, headers=self.headers("dm-code")
+        )
+        self.assertEqual(refused.status_code, 422)
+
+    def test_the_structured_export_is_still_the_dm_only_document(self) -> None:
+        self.assertEqual(
+            self.client.get(
+                "/api/export", params={"format": "json"}, headers=self.headers()
+            ).status_code,
+            403,
+        )
+
     def test_no_configured_dm_role_grants_nobody_authority(self) -> None:
         self.assertFalse(is_dm(("1", DM_ROLE_ID), ()))
         self.assertTrue(is_dm(("1", DM_ROLE_ID), (DM_ROLE_ID,)))
@@ -1241,6 +1272,51 @@ class DmSurfaceTests(ApiTestCase):
         self.assertEqual(ended.status_code, 200, ended.text)
         continuity = self.client.get("/api/session/continuity", headers=self.headers()).json()
         self.assertEqual(continuity["previous"]["where_ended"], "The Sunken Tomb")
+
+    def test_a_session_can_carry_the_recording_the_table_made(self) -> None:
+        """The other half of where the table stopped.
+
+        Craig is already in the toolchain and where the recording ended up was
+        going into a channel message that scrolls away, while the one line that
+        does not scroll away is the endpoint sentence beside it.
+        """
+        self.dm("/api/session/start")
+        ended = self.dm(
+            "/api/session/end",
+            {"where_ended": "The Sunken Tomb", "recording_url": "https://craig.test/rec/1"},
+        )
+        self.assertEqual(ended.status_code, 200, ended.text)
+        self.assertEqual(ended.json()["result"]["recording_url"], "https://craig.test/rec/1")
+        continuity = self.client.get("/api/session/continuity", headers=self.headers()).json()
+        self.assertEqual(continuity["previous"]["recording_url"], "https://craig.test/rec/1")
+        # It reaches the document every truncated surface points at.
+        export = self.client.get("/api/export", headers=self.headers("dm-code")).json()["export"]
+        self.assertIn("https://craig.test/rec/1", export)
+
+    def test_a_recording_link_that_would_run_as_a_script_is_refused(self) -> None:
+        """Every surface renders this as a link, so it has to be one.
+
+        A `javascript:` URL rendered as a link is a script the next person to
+        open the continuity panel runs.
+        """
+        self.dm("/api/session/start")
+        for bad in ("javascript:alert(1)", "not a url", "https://one two"):
+            with self.subTest(link=bad):
+                refused = self.dm(
+                    "/api/session/end", {"where_ended": "The Sunken Tomb", "recording_url": bad}
+                )
+                self.assertEqual(refused.status_code, 422, refused.text)
+        # And the session is still open, because the refusal happened before it
+        # was closed rather than after.
+        ended = self.dm("/api/session/end", {"where_ended": "The Sunken Tomb"})
+        self.assertEqual(ended.status_code, 200, ended.text)
+        self.assertIsNone(ended.json()["result"]["recording_url"])
+
+    def test_a_session_ended_without_a_recording_says_nothing_about_one(self) -> None:
+        self.dm("/api/session/start")
+        self.dm("/api/session/end", {"where_ended": "The Sunken Tomb"})
+        export = self.client.get("/api/export", headers=self.headers("dm-code")).json()["export"]
+        self.assertNotIn("Recording:", export)
 
     def test_ending_a_session_closes_what_the_session_owned(self) -> None:
         self.dm("/api/session/start")
