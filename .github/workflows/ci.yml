@@ -40,6 +40,22 @@ jobs:
         working-directory: activity
         run: npm ci
 
+      # A build proves the module graph parses and resolves. It does not notice
+      # a handler nobody calls or a shadowed variable, and it cannot notice a
+      # screen that throws when a read has not landed yet — which is the failure
+      # that reaches a table mid-evening rather than a pull request.
+      - name: Lint the Activity
+        working-directory: activity
+        run: npm run lint
+
+      - name: Check the Activity's formatting
+        working-directory: activity
+        run: npm run format:check
+
+      - name: Test the Activity
+        working-directory: activity
+        run: npm test
+
       # A client id is needed to build, not to be correct: the value is read at
       # runtime and a placeholder is enough to prove the bundle compiles.
       - name: Build the Activity

@@ -1,0 +1,12 @@
+dist
+node_modules
+package-lock.json
+
+# Prose and hand-tuned presentation are not Prettier's to own. The Markdown
+# here is wrapped by hand around where a sentence turns, and Prettier's CSS
+# breaks a `font:` shorthand into five lines that read worse than the one they
+# replaced. The gate exists for the JavaScript, where it settles arguments
+# nobody wants to have in review.
+*.md
+*.css
+*.html
