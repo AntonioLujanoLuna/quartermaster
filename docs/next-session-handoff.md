@@ -1,6 +1,6 @@
 # Next-session handoff
 
-Updated: 2026-08-24 · Schema 13
+Updated: 2026-08-25 · Schema 15
 
 ## How to use this document
 
@@ -19,7 +19,7 @@ Two rules keep it useful:
 
 ## Current state
 
-Canonical state is SQLite at schema 13. Discord messages are disposable projections.
+Canonical state is SQLite at schema 15. Discord messages are disposable projections.
 
 **Runtime and durability.** Configuration is validated at startup. FAST interactions run
 their mutation and receipt in one transaction; DEFERRED interactions persist `PROCESSING`
@@ -182,13 +182,39 @@ one, because a form has no component budget to spend. Every one of those routes 
 by the API for a token that does not say DM, so a screen that renders none of them is a
 courtesy rather than the check.
 
-**Checks.** The current test count and build gates are recorded after the Stage 2 slice is
-validated; Ruff and the Activity production build remain required gates. The Activity
+**Relay.** `QM_WEBHOOK_URL` posts the ledger onwards to somewhere the table chooses, and
+Quartermaster never learns what is at the other end. It is a second reader of
+`domain_events` rather than a second outbox — the same shape as the live feed, for the
+same reason — so a table that has configured none pays nothing: no rows, no task. Each
+batch carries the sequence, the event type, the payload, and the line
+`narrative.render_entry` would have printed, so a relayed evening cannot describe itself
+differently from the evening the table watched. The cursor advances only once a receiver
+answers 2xx, which makes it at-least-once: a receiver down for an evening gets the
+evening rather than a hole, and may see a sequence twice. `QM_WEBHOOK_SECRET` signs the
+exact bytes. A configured webhook replays from sequence zero, which is right for a wiki
+being populated and is the one thing to know before pointing it somewhere; the runbook
+says how to start from now instead. Live-unverified: no receiver has been pointed at a
+real evening.
+
+**Checks.** Ruff now selects ASYNC, RUF, and SIM as well; SIM105 and SIM117 are ignored
+deliberately, with the reasons at the ignores. Mypy runs over all 42 source modules,
+with the five Discord adapter modules exempted per module from the codes discord.py's own
+idiom produces — that exemption is named in `pyproject.toml` rather than the check being
+turned off, and everything outside those five is checked in full. Ruff, mypy, pytest, the
+Activity's ESLint, Prettier, Vitest, production build, and `preflight` all run in CI on
+every pull request; superseded pull-request runs are cancelled, and Dependabot watches
+both lockfiles and the pinned actions monthly. The Activity
 production build also passes with `npm run build`. Both run in CI
 on every pull request, and CI builds the Activity bundle — with `VITE_DISCORD_CLIENT_ID`
 set, which matters: without it the client id is statically undefined, `boot()` returns on
 its first line, and Vite tree-shakes the entire application out of the bundle it just
 proved compiles.
+
+`activity/tests/wiring.test.js` is the gate neither the build nor ESLint can be:
+`render.js` reaches for `handlers.name` and `main.js` defines it, and the two only meet
+when somebody presses something, so a typo renders perfectly and throws on the press.
+Both directions are asserted — a handler nothing presses is dead wiring — and injecting
+a typo was confirmed to fail it.
 
 The Activity now has three gates the build could never be: ESLint, a Prettier check, and
 Vitest. The tests are `activity/tests/render.test.js` and they assert something deliberately
@@ -1089,6 +1115,39 @@ Runtime, unchanged by this pass and still unverified:
 22. Register a character and change a lifecycle with the session log in view, and confirm
     those lines read as sentences rather than JSON.
 
+Added on 2026-08-25, and none of it exercised against the guild:
+
+40. **The Activity on a keyboard, and with a screen reader.** The tab strip is a tablist
+    with roving focus and arrow keys, the confirmation prompt is a dialog that takes
+    focus and answers Escape, the notice announces itself, and focus survives a live
+    redraw for controls as well as for a half-typed quantity. The tests assert the
+    markup; whether a reader announces the right thing at the right moment is a question
+    only a reader answers. Worth one pass with VoiceOver or NVDA.
+41. **Enter in a form.** It presses the primary control of the block the field is in,
+    walking outwards until it finds one. The case worth trying at the table is the Loot
+    Drop form, where a row has three fields and no control of its own and the press
+    belongs to the form. If Enter ever submits something the DM did not mean, the scope
+    list in `main.js` is where it is decided.
+42. **The card layout on a phone.** This is checklist item 27's other half and the
+    reason it was worth doing before another evening: below 640px each row becomes a
+    card with the column name in front of the value. Whether a stash forty stacks deep
+    is usable that way is a judgement only a phone makes.
+43. **A dossier imported by a DM.** The form is the first caller `POST
+    /api/characters/dossier` has ever had, so the whole path — typed sheet, stored
+    snapshot, Character screen — has never run end to end outside the tests. Import one
+    real character and then answer the question the Dice plan is actually waiting on:
+    which values the table asks for.
+44. **A session ended with a recording link.** Both surfaces take one. Check it reads
+    acceptably on the continuity panel and that the link opens from inside the Activity's
+    iframe, which is the half a test cannot reach.
+45. **The export copied out of the Activity.** The clipboard needs a permission the
+    embed may not have. If Discord refuses it, the notice says so and says to select the
+    text — confirm that is what happens rather than a button that looks like it worked.
+46. **A webhook pointed at a real receiver.** Nothing has consumed a delivery. Point it
+    at a request bin first and watch one evening: what is worth knowing is whether the
+    batch boundaries land where a receiver would want them, and whether the replay-from-
+    zero default surprises anyone.
+
 ## Live Discord setup
 
 - Server `Quartermaster Test`, guild `1536121899388506222`
@@ -1139,7 +1198,11 @@ runs. These are fixtures retained for cleanup and audit, not campaign data.
    the one that should wait: what the bot keeps forever is a judgement about what people
    reach for outside a session, and nobody has been outside one yet.
 
-6. Use the live-accepted server-authoritative Dice view described in [Dice, Character Sheets,
+6. Import one real character through the new dossier form. Until this pass there was no
+   caller for that route at all, so the Character screen could only ever say no snapshot
+   was available — which is why item 6 below has never had the evidence it asks for.
+
+7. Use the live-accepted server-authoritative Dice view described in [Dice, Character Sheets,
    and Explainable Mechanics](dice-and-mechanics-plan.md) in a real play session, then observe
    which character values the table actually asks for. The Dice view now includes safe d20,
    Advantage, and Disadvantage form presets, explicit recorded/private status, and a clear
