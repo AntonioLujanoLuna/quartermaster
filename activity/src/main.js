@@ -137,14 +137,12 @@ function scheduleRefresh() {
     refreshTimer = null;
     // Serialized rather than overlapped: two reads in flight can land in
     // either order, and the older one would paint over the newer.
-    refreshing = (refreshing || Promise.resolve())
-      .then(refresh)
-      .catch((error) => {
-        // A failed refresh is not a dead screen. The socket is still open, so
-        // the next change is another chance, and what is rendered is still the
-        // last state that was actually read.
-        console.warn("Quartermaster could not refresh", error);
-      });
+    refreshing = (refreshing || Promise.resolve()).then(refresh).catch((error) => {
+      // A failed refresh is not a dead screen. The socket is still open, so
+      // the next change is another chance, and what is rendered is still the
+      // last state that was actually read.
+      console.warn("Quartermaster could not refresh", error);
+    });
   }, REFRESH_DEBOUNCE_MS);
 }
 
@@ -559,7 +557,9 @@ async function watchParticipants(sdk) {
 async function boot() {
   if (!CLIENT_ID) {
     app.replaceChildren(
-      renderError("VITE_DISCORD_CLIENT_ID is not set, so the Activity cannot identify itself to Discord."),
+      renderError(
+        "VITE_DISCORD_CLIENT_ID is not set, so the Activity cannot identify itself to Discord.",
+      ),
     );
     return;
   }
@@ -585,9 +585,10 @@ async function boot() {
     // gap between them. Connecting first can only cost a redundant refresh.
     openLiveFeed({
       token: sessionTokenValue,
-      renew: () => authenticate(sdk).then((actor) => {
-        state.actor = actor;
-      }),
+      renew: () =>
+        authenticate(sdk).then((actor) => {
+          state.actor = actor;
+        }),
       onChange: scheduleRefresh,
       onStatus: (status) => {
         state.live = status;

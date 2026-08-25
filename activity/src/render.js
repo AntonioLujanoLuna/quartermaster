@@ -97,7 +97,10 @@ function filterValue(state, key) {
 
 function matchesFilter(needle, ...fields) {
   if (!needle) return true;
-  return fields.some((field) => String(field ?? "").toLowerCase().includes(needle));
+  return fields.some((field) => {
+    const text = String(field ?? "").toLowerCase();
+    return text.includes(needle);
+  });
 }
 
 /**
@@ -235,7 +238,11 @@ function renderTabs(state, handlers) {
   const nav = element("nav", "tabs");
   for (const screen of SCREENS) {
     if (screen.dm && !state.actor?.isDm) continue;
-    const tab = element("button", state.screen === screen.id ? "tab tab-current" : "tab", screen.label);
+    const tab = element(
+      "button",
+      state.screen === screen.id ? "tab tab-current" : "tab",
+      screen.label,
+    );
     tab.type = "button";
     if (screen.id === "loot" && state.home?.unclaimed) {
       tab.append(element("span", "badge", state.home.unclaimed));
@@ -350,7 +357,9 @@ function renderDiceResult(result) {
     block.append(element("p", "muted", `Natural ${result.natural}`));
   }
   if (result.recorded === false) {
-    block.append(element("p", "dice-status dice-private", "Private roll · not added to the session log."));
+    block.append(
+      element("p", "dice-status dice-private", "Private roll · not added to the session log."),
+    );
   } else if (result.recorded === true || result.visibility === "PUBLIC") {
     block.append(element("p", "dice-status", "Recorded in the session log."));
   }
@@ -433,7 +442,9 @@ function renderDiceScreen(state, handlers) {
     option.selected = (state.inputs["dice:visibility"] || "PUBLIC") === option.value;
     visibility.append(option);
   }
-  visibility.addEventListener("change", () => handlers.setInput("dice:visibility", visibility.value));
+  visibility.addEventListener("change", () =>
+    handlers.setInput("dice:visibility", visibility.value),
+  );
   visibilityLabel.append(visibility);
   form.append(visibilityLabel);
   form.append(
@@ -514,9 +525,7 @@ function renderStashScreen(state, handlers) {
     row.append(element("td", "quantity", item.quantity));
     row.append(element("td", "provenance muted", item.provenance || "—"));
     const controls = element("td", "controls");
-    controls.append(
-      button("Take 1", { busy: state.busy, onPress: () => handlers.take(item, 1) }),
-    );
+    controls.append(button("Take 1", { busy: state.busy, onPress: () => handlers.take(item, 1) }));
     if (item.quantity > 1) {
       controls.append(
         button("Take all", {
@@ -778,7 +787,9 @@ function renderDossierScreen(state) {
     screen.append(element("h2", null, "Character dossier"));
     screen.append(element("p", "dossier-status dossier-unavailable", dossier.reason));
     if (dossier.character) {
-      screen.append(element("p", "muted", `${dossier.character.name} has no imported sheet snapshot yet.`));
+      screen.append(
+        element("p", "muted", `${dossier.character.name} has no imported sheet snapshot yet.`),
+      );
     }
     return screen;
   }
@@ -800,13 +811,16 @@ function renderDossierScreen(state) {
       `${snapshot.system} · rules ${snapshot.rules_version} · source ${snapshot.source} · observed ${snapshot.observed_at}`,
     ),
   );
-  if (snapshot.source_reference) screen.append(element("p", "muted", `Source reference: ${snapshot.source_reference}`));
+  if (snapshot.source_reference)
+    screen.append(element("p", "muted", `Source reference: ${snapshot.source_reference}`));
 
   const [listing, body] = table(["Value", "Reading", "Source"]);
   const add = (label, value) => {
     const row = element("tr");
     row.append(element("td", "name", label));
-    row.append(element("td", "quantity", value === null || value === undefined ? "Not supplied" : value));
+    row.append(
+      element("td", "quantity", value === null || value === undefined ? "Not supplied" : value),
+    );
     row.append(element("td", "muted", "Imported snapshot"));
     body.append(row);
   };
@@ -818,8 +832,10 @@ function renderDossierScreen(state) {
   add("Initiative", snapshot.initiative);
   add("Spell attack modifier", snapshot.spell_attack_modifier);
   add("Spell save DC", snapshot.spell_save_dc);
-  for (const [name, value] of Object.entries(snapshot.ability_modifiers || {})) add(`${name} modifier`, value);
-  for (const [name, value] of Object.entries(snapshot.saving_throws || {})) add(`${name} save`, value);
+  for (const [name, value] of Object.entries(snapshot.ability_modifiers || {}))
+    add(`${name} modifier`, value);
+  for (const [name, value] of Object.entries(snapshot.saving_throws || {}))
+    add(`${name} save`, value);
   screen.append(listing);
 
   const details = element("div", "dossier-details");
@@ -1018,12 +1034,17 @@ function renderTreasuryScreen(state, handlers) {
         style: "primary",
         busy: state.busy,
         onPress: () =>
-          handlers.returnCoin(coinAmounts(state, "coin"), state.inputs["coin-destination"] ?? "party"),
+          handlers.returnCoin(
+            coinAmounts(state, "coin"),
+            state.inputs["coin-destination"] ?? "party",
+          ),
       }),
     );
     screen.append(form);
   } else {
-    screen.append(element("p", "muted", "You have no active character, so you are carrying nothing."));
+    screen.append(
+      element("p", "muted", "You have no active character, so you are carrying nothing."),
+    );
   }
 
   if (state.actor?.isDm) {
@@ -1049,7 +1070,10 @@ function renderTreasuryAdjust(state, handlers) {
       style: "primary",
       busy: state.busy,
       onPress: () =>
-        handlers.adjustTreasury(signedCoinAmounts(state, "adjust"), state.inputs["adjust:reason"] ?? ""),
+        handlers.adjustTreasury(
+          signedCoinAmounts(state, "adjust"),
+          state.inputs["adjust:reason"] ?? "",
+        ),
     }),
   );
   block.append(form);
@@ -1066,7 +1090,9 @@ function renderTreasuryAdjust(state, handlers) {
 function renderTreasurySplit(state, handlers) {
   const block = element("div", "dm-block");
   block.append(element("h2", null, "Split the treasury"));
-  const active = (state.roster || []).filter((character) => character.lifecycle === "ACTIVE").length;
+  const active = (state.roster || []).filter(
+    (character) => character.lifecycle === "ACTIVE",
+  ).length;
   block.append(
     element(
       "p",
@@ -1074,7 +1100,7 @@ function renderTreasurySplit(state, handlers) {
       active === 0
         ? "Nobody is active, so there is nobody to split it among."
         : `Among ${active} active ${active === 1 ? "character" : "characters"}. Each denomination ` +
-          "divides on its own, and what will not divide stays in the treasury.",
+            "divides on its own, and what will not divide stays in the treasury.",
     ),
   );
   const form = element("div", "form");
@@ -1179,7 +1205,9 @@ function renderSessionBlock(state, handlers) {
   // Required, here as on the panel. It is the whole of the continuity the next
   // evening opens on, and a session ended without one leaves nothing to pick
   // up — so it is a field on the screen rather than a prompt after the press.
-  form.append(labelled("Where did it end?", textField(state, "end:where", "The Sunken Tomb", handlers)));
+  form.append(
+    labelled("Where did it end?", textField(state, "end:where", "The Sunken Tomb", handlers)),
+  );
   form.append(
     button("End the session", {
       style: "danger",
@@ -1217,10 +1245,16 @@ function renderCombatBlock(state, handlers) {
       ),
     );
     block.append(
-      element("p", null, `A fight has been open for ${Math.round(combat.encounter.elapsed_seconds)}s.`),
+      element(
+        "p",
+        null,
+        `A fight has been open for ${Math.round(combat.encounter.elapsed_seconds)}s.`,
+      ),
     );
     const form = element("div", "form");
-    form.append(labelled("How did it end?", textField(state, "combat:outcome", "The ogre fled", handlers)));
+    form.append(
+      labelled("How did it end?", textField(state, "combat:outcome", "The ogre fled", handlers)),
+    );
     form.append(
       button("End combat", {
         style: "primary",
@@ -1235,7 +1269,11 @@ function renderCombatBlock(state, handlers) {
     block.append(element("p", "muted", `Last fight: ${combat.last_closed.outcome}`));
   }
   block.append(
-    button("Start combat", { style: "primary", busy: state.busy, onPress: () => handlers.openCombat() }),
+    button("Start combat", {
+      style: "primary",
+      busy: state.busy,
+      onPress: () => handlers.openCombat(),
+    }),
   );
   return block;
 }
@@ -1254,7 +1292,9 @@ function renderRosterBlock(state, handlers) {
   block.append(element("h2", null, "Characters"));
   const roster = state.roster || [];
   if (roster.length === 0) {
-    block.append(element("p", "muted", "Nobody is registered. Register from the roster beside this."));
+    block.append(
+      element("p", "muted", "Nobody is registered. Register from the roster beside this."),
+    );
     return block;
   }
   const [listing, body] = table(["Character", "State", "Change to", "Belongings"]);
@@ -1312,8 +1352,7 @@ function renderRosterBlock(state, handlers) {
       estate.append(
         button("Resolve", {
           busy: state.busy,
-          onPress: () =>
-            handlers.resolveEstate(character, state.inputs[destinationKey] ?? "party"),
+          onPress: () => handlers.resolveEstate(character, state.inputs[destinationKey] ?? "party"),
         }),
       );
     }
@@ -1337,8 +1376,12 @@ function renderMaintenanceBlock(state, handlers) {
   const form = element("div", "form");
   form.append(button("Health", { busy: state.busy, onPress: () => handlers.health() }));
   form.append(button("Back up", { busy: state.busy, onPress: () => handlers.backup() }));
-  form.append(button("Run maintenance", { busy: state.busy, onPress: () => handlers.runMaintenance() }));
-  form.append(button("Export", { style: "quiet", busy: state.busy, onPress: () => handlers.export() }));
+  form.append(
+    button("Run maintenance", { busy: state.busy, onPress: () => handlers.runMaintenance() }),
+  );
+  form.append(
+    button("Export", { style: "quiet", busy: state.busy, onPress: () => handlers.export() }),
+  );
   block.append(form);
   if (state.report) {
     // A pre rather than a paragraph: this is the operator's text, and it is
