@@ -55,6 +55,12 @@ const state = {
   busy: false,
 };
 
+// Which control was pressed, so the screen can say *this* is what is happening
+// rather than greying out everything at once. Held outside `state` because it
+// describes the DOM rather than the campaign.
+let pressed = null;
+let noticeTimer = null;
+
 let refreshTimer = null;
 let refreshing = null;
 // Held past boot for one reason: opening combat records which channel the
@@ -148,34 +154,117 @@ function scheduleRefresh() {
 
 // Drawing --------------------------------------------------------------------
 
-function draw() {
-  // A live screen redraws while somebody is halfway through typing a quantity
-  // into it. The value survives in `state.inputs`; this is what stops the
-  // caret from moving to the top of the page with it.
-  const focused = document.activeElement;
-  const key = focused?.dataset?.inputKey;
-  let caret = null;
-  try {
-    caret = key ? [focused.selectionStart, focused.selectionEnd] : null;
-  } catch {
-    // A number field refuses to report a selection, which is not a failure.
+const FOCUSABLE = "button, input, select, textarea";
+
+/** What a control is called, for the purpose of finding it again. */
+function focusLabel(node) {
+  return (node.textContent || "").trim() || node.getAttribute("aria-label") || "";
+}
+
+/**
+ * Enough to find this control again in a tree that has not been built yet.
+ *
+ * A field is found by the key its value is already stored under. Everything
+ * else — a button, a select — is found by what it says and by which of the
+ * controls saying that it is, because `renderApp` builds a fresh tree every
+ * draw and nothing in the old one survives to be compared against.
+ *
+ * This exists because the live feed redraws under whoever is at the table. It
+ * already put the caret back for a half-typed quantity; without this, a player
+ * who has tabbed to `Take 1` loses it every time somebody else grants an item.
+ */
+function focusMark(node) {
+  if (!node || !app.contains(node) || !node.matches?.(FOCUSABLE)) return null;
+  const key = node.dataset?.inputKey;
+  if (key) {
+    let caret = null;
+    try {
+      caret = [node.selectionStart, node.selectionEnd];
+    } catch {
+      // A number field refuses to report a selection, which is not a failure.
+    }
+    return { by: "input", key, caret };
   }
+  const label = focusLabel(node);
+  const peers = [...app.querySelectorAll(FOCUSABLE)].filter(
+    (peer) => peer.tagName === node.tagName && focusLabel(peer) === label,
+  );
+  return { by: "label", tag: node.tagName, label, index: peers.indexOf(node) };
+}
+
+/** The same control in the tree that has just replaced the old one. */
+function findMarked(mark) {
+  if (!mark) return null;
+  if (mark.by === "input") {
+    return app.querySelector(`[data-input-key="${CSS.escape(mark.key)}"]`);
+  }
+  const peers = [...app.querySelectorAll(FOCUSABLE)].filter(
+    (peer) => peer.tagName === mark.tag && focusLabel(peer) === mark.label,
+  );
+  return peers[mark.index] ?? null;
+}
+
+function draw() {
+  const mark = focusMark(document.activeElement);
+  const promptWasOpen = Boolean(app.querySelector("[data-prompt]"));
 
   app.replaceChildren(renderApp(state, handlers));
 
-  if (!key) return;
-  const restored = app.querySelector(`[data-input-key="${CSS.escape(key)}"]`);
+  // One control is in flight rather than the whole screen being unavailable.
+  // Every control is still disabled — a second press is a second action with a
+  // second key, which is the one thing the receipt cannot sort out — but only
+  // the pressed one reads as working.
+  if (state.busy && pressed) {
+    const working = findMarked(pressed);
+    if (working) {
+      working.classList.add("press-pending");
+      working.setAttribute("aria-busy", "true");
+    }
+  }
+
+  const promptBox = app.querySelector("[data-prompt]");
+  if (promptBox && !promptWasOpen) {
+    // A question that appears where nobody is looking is a question nobody
+    // answers. Focus goes to the first thing that answers it.
+    const first = promptBox.querySelector("input, button");
+    first?.focus();
+    return;
+  }
+
+  const restored = findMarked(mark);
   if (!restored) return;
   restored.focus();
   try {
-    if (caret) restored.setSelectionRange(caret[0], caret[1]);
+    if (mark.caret) restored.setSelectionRange(mark.caret[0], mark.caret[1]);
   } catch {
     // As above.
   }
 }
 
+/**
+ * Say what happened, once.
+ *
+ * A refusal stays until it is read: it is a thing to do something about. A
+ * success is the receipt for a press somebody just made and is already looking
+ * at, so it goes away on its own rather than accumulating a Dismiss to press
+ * for every take of the evening.
+ */
+const NOTICE_SECONDS = 8;
+
 function notify(tone, text) {
   state.notice = { tone, text };
+  clearTimeout(noticeTimer);
+  noticeTimer = null;
+  if (tone !== "bad") {
+    noticeTimer = setTimeout(() => {
+      noticeTimer = null;
+      // Only if it is still the same notice: something newer has its own life.
+      if (state.notice?.text === text) {
+        state.notice = null;
+        draw();
+      }
+    }, NOTICE_SECONDS * 1000);
+  }
   draw();
 }
 
@@ -210,6 +299,7 @@ async function run(work) {
     notify("bad", error instanceof ApiError ? error.message : "That could not be completed.");
   } finally {
     state.busy = false;
+    pressed = null;
     draw();
   }
 }
@@ -274,6 +364,8 @@ const handlers = {
   },
 
   dismissNotice() {
+    clearTimeout(noticeTimer);
+    noticeTimer = null;
     state.notice = null;
     draw();
   },
@@ -541,6 +633,106 @@ async function authenticate(sdk) {
 
   return { id: session.actor_id, isDm: session.is_dm };
 }
+
+// Keyboard and pressing ------------------------------------------------------
+//
+// All of it is delegated from the root rather than bound per control, because
+// `renderApp` replaces the whole tree on every draw and a listener attached to
+// a button is gone the next time anyone else at the table takes something.
+
+/**
+ * Which control is working.
+ *
+ * Captured on the way down, before the handler runs and the redraw it causes
+ * throws the pressed element away.
+ */
+app.addEventListener(
+  "click",
+  (event) => {
+    const control = event.target.closest?.("button.press");
+    if (control) pressed = focusMark(control);
+  },
+  true,
+);
+
+/**
+ * What Enter means in a form that is not a form.
+ *
+ * Every screen here is built out of divs, so the browser's own "Enter submits"
+ * never applied. A DM granting ten items after a fight was reaching for the
+ * mouse between every one of them.
+ *
+ * Enter presses the primary control of whatever block the field is in — the
+ * same one the eye reads as the point of that block. A filter is exempt: its
+ * list is already answering as the letters arrive, so there is nothing for
+ * Enter to do that has not happened.
+ */
+const SUBMIT_SCOPE = ".prompt, .form, .dm-block, tr";
+
+function submitControl(scope) {
+  return (
+    scope.querySelector("button.press.primary:not(:disabled)") ||
+    scope.querySelector("button.press:not(.quiet):not(:disabled)")
+  );
+}
+
+app.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.shiftKey) return;
+  const field = event.target;
+  if (!field.matches?.("input") || field.type === "search") return;
+  // Outwards until a block is found that has something to press. A row of the
+  // Loot Drop form has three fields and no control of its own; the control
+  // belongs to the form the row is in, which is the next scope up.
+  let scope = field.closest(SUBMIT_SCOPE);
+  while (scope) {
+    const primary = submitControl(scope);
+    if (primary) {
+      event.preventDefault();
+      primary.click();
+      return;
+    }
+    scope = scope.parentElement?.closest(SUBMIT_SCOPE) ?? null;
+  }
+});
+
+/**
+ * Escape answers the question with "no".
+ *
+ * The prompt gates the one action with no way back, and a dialog that can only
+ * be dismissed by finding its Cancel button is one people answer "yes" to by
+ * accident.
+ */
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !state.prompt) return;
+  event.preventDefault();
+  handlers.dismissPrompt();
+});
+
+/**
+ * Hold focus inside the question while it is being asked.
+ *
+ * Without this, Tab walks out of the dialog and into the screen behind it,
+ * where every control is disabled and none of them is the answer.
+ */
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Tab") return;
+  const box = app.querySelector("[data-prompt]");
+  if (!box) return;
+  const stops = [...box.querySelectorAll(FOCUSABLE)].filter((node) => !node.disabled);
+  if (stops.length === 0) return;
+  const first = stops[0];
+  const last = stops[stops.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  } else if (!box.contains(document.activeElement)) {
+    event.preventDefault();
+    first.focus();
+  }
+});
 
 async function watchParticipants(sdk) {
   const apply = ({ participants }) => {

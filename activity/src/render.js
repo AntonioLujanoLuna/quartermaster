@@ -161,6 +161,10 @@ const LIVE_LABELS = {
 function renderLive(status) {
   const state = LIVE_LABELS[status] ? status : "connecting";
   const badge = element("span", `live live-${state}`);
+  // Announced, because the dot is the whole of this for a sighted reader and
+  // nothing at all for anyone else. Polite: a screen going offline is worth
+  // saying after the current sentence, not over the top of it.
+  badge.setAttribute("role", "status");
   badge.append(element("span", "live-dot"), element("span", null, LIVE_LABELS[state]));
   return badge;
 }
@@ -234,22 +238,45 @@ const SCREENS = [
   { id: "dm", label: "DM", dm: true },
 ];
 
+/**
+ * The way between screens.
+ *
+ * A tablist rather than a row of buttons, which is what it already looked
+ * like: the difference is that a reader who cannot see the row is now told
+ * how many tabs there are, which one is current, and that left and right move
+ * between them. Roving tabindex is what makes that last part true — one stop
+ * for the whole strip, arrows within it — rather than eight stops on the way
+ * to the screen.
+ */
 function renderTabs(state, handlers) {
   const nav = element("nav", "tabs");
-  for (const screen of SCREENS) {
-    if (screen.dm && !state.actor?.isDm) continue;
-    const tab = element(
-      "button",
-      state.screen === screen.id ? "tab tab-current" : "tab",
-      screen.label,
-    );
+  nav.setAttribute("role", "tablist");
+  nav.setAttribute("aria-label", "Quartermaster screens");
+  const shown = SCREENS.filter((screen) => !screen.dm || state.actor?.isDm);
+  shown.forEach((screen, index) => {
+    const current = state.screen === screen.id;
+    const tab = element("button", current ? "tab tab-current" : "tab", screen.label);
     tab.type = "button";
+    tab.id = `tab-${screen.id}`;
+    tab.setAttribute("role", "tab");
+    tab.setAttribute("aria-selected", current ? "true" : "false");
+    tab.setAttribute("aria-controls", "screen");
+    tab.tabIndex = current ? 0 : -1;
     if (screen.id === "loot" && state.home?.unclaimed) {
-      tab.append(element("span", "badge", state.home.unclaimed));
+      const badge = element("span", "badge", state.home.unclaimed);
+      badge.setAttribute("aria-label", `${state.home.unclaimed} unclaimed`);
+      tab.append(badge);
     }
     tab.addEventListener("click", () => handlers.select(screen.id));
+    tab.addEventListener("keydown", (event) => {
+      const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+      if (step === 0) return;
+      event.preventDefault();
+      const next = shown[(index + step + shown.length) % shown.length];
+      handlers.select(next.id);
+    });
     nav.append(tab);
-  }
+  });
   return nav;
 }
 
@@ -264,6 +291,12 @@ function renderTabs(state, handlers) {
 function renderNotice(state, handlers) {
   if (!state.notice) return null;
   const box = element("div", `notice notice-${state.notice.tone}`);
+  // This line is the whole report that a mutation committed — the panels sent
+  // a separate ephemeral message for the same reason. A reader who cannot see
+  // it appear is otherwise told nothing at all about what their press did.
+  // A refusal interrupts; a success waits its turn.
+  box.setAttribute("role", state.notice.tone === "bad" ? "alert" : "status");
+  box.setAttribute("aria-live", state.notice.tone === "bad" ? "assertive" : "polite");
   box.append(element("p", null, state.notice.text));
   box.append(button("Dismiss", { style: "quiet", onPress: handlers.dismissNotice }));
   return box;
@@ -280,7 +313,17 @@ function renderNotice(state, handlers) {
 function renderPrompt(state, handlers) {
   if (!state.prompt) return null;
   const box = element("div", "prompt");
-  box.append(element("p", "prompt-text", state.prompt.text));
+  // It stands between a player and the one action with no way back, so it says
+  // it is a dialog and names itself by the question it is asking. Moving focus
+  // into it, holding focus inside it, and Escape are in `main.js`, where the
+  // element exists to be focused.
+  box.setAttribute("role", "dialog");
+  box.setAttribute("aria-modal", "true");
+  box.setAttribute("aria-labelledby", "prompt-text");
+  box.dataset.prompt = "open";
+  const text = element("p", "prompt-text", state.prompt.text);
+  text.id = "prompt-text";
+  box.append(text);
   const controls = element("div", "prompt-controls");
   for (const field of state.prompt.fields || []) {
     controls.append(textField(state, `prompt:${field.name}`, field.placeholder, handlers));
@@ -1403,6 +1446,33 @@ const SCREEN_BODIES = {
   dm: renderDmScreen,
 };
 
+/**
+ * Give every cell the heading it sits under.
+ *
+ * A phone cannot show six columns, so below the breakpoint the stylesheet
+ * turns each row into a card and prints these labels in front of the values.
+ * Reading the headings back out of the table that was just built is what keeps
+ * the two from disagreeing: there is no second list of column names to update
+ * when a screen gains a column.
+ */
+function labelCells(root) {
+  for (const listing of root.querySelectorAll("table.listing")) {
+    const headings = [...listing.querySelectorAll("thead th")].map((cell) =>
+      cell.textContent.trim(),
+    );
+    for (const row of listing.querySelectorAll("tbody tr")) {
+      [...row.children].forEach((cell, index) => {
+        // A cell spanning the table is a sentence about the whole list — "no
+        // open drops" — and putting a column name in front of it would be
+        // inventing a column it is not in.
+        if (cell.colSpan > 1) return;
+        const heading = headings[index];
+        if (heading) cell.dataset.label = heading;
+      });
+    }
+  }
+}
+
 export function renderApp(state, handlers) {
   const root = element("div", "layout");
 
@@ -1415,6 +1485,12 @@ export function renderApp(state, handlers) {
   root.append(header);
 
   const main = element("main");
+  // The panel half of the tablist above. It is labelled by whichever tab is
+  // current, so arriving here says which screen this is.
+  main.id = "screen";
+  main.setAttribute("role", "tabpanel");
+  main.setAttribute("aria-labelledby", `tab-${state.screen}`);
+  main.tabIndex = -1;
   const continuity = renderContinuity(state.continuity);
   if (continuity) main.append(continuity);
   const notice = renderNotice(state, handlers);
@@ -1425,5 +1501,6 @@ export function renderApp(state, handlers) {
   root.append(main);
 
   root.append(renderRoster(state, handlers));
+  labelCells(root);
   return root;
 }

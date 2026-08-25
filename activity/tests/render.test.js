@@ -254,3 +254,72 @@ describe("my items", () => {
     expect(renderApp(state, handlers).textContent).toContain("no active character");
   });
 });
+
+describe("a screen somebody cannot see, and a screen too narrow for a table", () => {
+  it("says which screen is current, as a tablist rather than as a row of buttons", () => {
+    const node = renderApp(populatedState({ screen: "loot" }), handlers);
+    const tabs = [...node.querySelectorAll('[role="tab"]')];
+    expect(tabs.length).toBeGreaterThan(1);
+    const current = tabs.filter((tab) => tab.getAttribute("aria-selected") === "true");
+    expect(current).toHaveLength(1);
+    expect(current[0].textContent).toContain("Loot");
+    // One tab stop for the whole strip; the arrows move within it.
+    expect(tabs.filter((tab) => tab.tabIndex === 0)).toHaveLength(1);
+  });
+
+  it("points the panel at the tab that named it", () => {
+    const node = renderApp(populatedState({ screen: "treasury" }), handlers);
+    const panel = node.querySelector('[role="tabpanel"]');
+    expect(panel.getAttribute("aria-labelledby")).toBe("tab-treasury");
+    expect(node.querySelector("#tab-treasury")).not.toBeNull();
+  });
+
+  it("announces a refusal over what is being read and a receipt after it", () => {
+    const bad = renderApp(
+      populatedState({ notice: { tone: "bad", text: "That was refused." } }),
+      handlers,
+    );
+    expect(bad.querySelector(".notice").getAttribute("aria-live")).toBe("assertive");
+
+    const ok = renderApp(
+      populatedState({ notice: { tone: "ok", text: "Took 1 Rope." } }),
+      handlers,
+    );
+    expect(ok.querySelector(".notice").getAttribute("aria-live")).toBe("polite");
+  });
+
+  it("asks its one irreversible question as a dialog, named by the question", () => {
+    const node = renderApp(
+      populatedState({
+        prompt: { text: "Use 1 Rope?", confirmLabel: "Use it", fields: [], run: () => {} },
+      }),
+      handlers,
+    );
+    const box = node.querySelector('[role="dialog"]');
+    expect(box.getAttribute("aria-modal")).toBe("true");
+    expect(node.querySelector(`#${box.getAttribute("aria-labelledby")}`).textContent).toContain(
+      "Use 1 Rope?",
+    );
+  });
+
+  it("gives every named cell the heading it sits under, for the phone layout", () => {
+    const node = renderApp(populatedState({ screen: "stash" }), handlers);
+    const row = node.querySelector(".listing tbody tr");
+    const labels = [...row.children].map((cell) => cell.dataset.label);
+    expect(labels[0]).toBe("Item");
+    expect(labels[2]).toBe("Where it came from");
+    // The controls column is deliberately headed with nothing, and a card that
+    // printed a blank label in front of two buttons would be printing the
+    // absence of a heading rather than a heading.
+    expect(row.querySelector("td.controls").dataset.label).toBeUndefined();
+  });
+
+  it("does not put a column name in front of a sentence about the whole list", () => {
+    const node = renderApp(
+      populatedState({ screen: "stash", stash: { items: [], total: 0 } }),
+      handlers,
+    );
+    const cell = node.querySelector(".listing tbody td[colspan]");
+    expect(cell.dataset.label).toBeUndefined();
+  });
+});
