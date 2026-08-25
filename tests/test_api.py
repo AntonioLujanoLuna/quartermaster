@@ -591,6 +591,7 @@ class ReadSurfaceTests(ApiTestCase):
             "/api/home",
             "/api/stash",
             "/api/me/items",
+            "/api/holdings",
             "/api/loot",
             "/api/loot/claimable",
             "/api/treasury",
@@ -610,6 +611,49 @@ class ReadSurfaceTests(ApiTestCase):
     def test_a_vast_page_size_is_clamped_rather_than_refused(self) -> None:
         response = self.client.get("/api/me/items?limit=100000", headers=self.headers())
         self.assertEqual(response.status_code, 200)
+
+    def test_who_holds_what_names_the_holder_the_export_names(self) -> None:
+        """The column the export has always carried, as a read the table can see."""
+
+        self.register("Vex", PLAYER_ID, interaction="register-holder")
+        self.grant("Rope", 2, interaction="grant-rope")
+        self.take("Rope")
+
+        body = self.client.get("/api/holdings", headers=self.headers()).json()
+        self.assertEqual(body["total_stacks"], 1)
+        holder = body["characters"][0]
+        self.assertEqual(holder["character_name"], "Vex")
+        self.assertEqual(holder["lifecycle"], "ACTIVE")
+        self.assertEqual(holder["items"][0]["item_name"], "Rope")
+        self.assertEqual(holder["items"][0]["quantity"], 1)
+
+    def test_what_the_party_shares_is_not_what_anybody_is_holding(self) -> None:
+        """The Party Stash is not a holder, so a stash-only campaign lists nobody."""
+
+        self.grant("Rope", 2, interaction="grant-rope")
+        body = self.client.get("/api/holdings", headers=self.headers()).json()
+        self.assertEqual(body, {"characters": [], "total_stacks": 0})
+
+    def test_a_holder_who_has_stopped_playing_still_shows_what_is_outstanding(self) -> None:
+        """An unresolved estate is the reason this read carries a lifecycle."""
+
+        character_id = self.register("Vex", PLAYER_ID, interaction="register-holder")
+        self.grant("Rope", 1, interaction="grant-rope")
+        self.take("Rope")
+        self.context.characters.transition_interaction(
+            "retire-holder", actor_id=DM_ID, character_id=character_id, lifecycle="DEAD"
+        )
+
+        holder = self.client.get("/api/holdings", headers=self.headers()).json()["characters"][0]
+        self.assertEqual(holder["lifecycle"], "DEAD")
+        self.assertEqual(holder["items"][0]["item_name"], "Rope")
+
+    def test_who_holds_what_is_open_to_the_table_rather_than_to_a_dm(self) -> None:
+        """Unlike the export, which is the DM-only document this replaces a trip to."""
+
+        self.assertEqual(
+            self.client.get("/api/holdings", headers=self.headers("player-code")).status_code, 200
+        )
 
     def test_health_needs_no_session_and_names_no_campaign_state(self) -> None:
         body = self.client.get("/api/health").json()

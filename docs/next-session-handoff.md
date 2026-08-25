@@ -155,11 +155,21 @@ tree-shaken away, both path forms, the page and its assets, the refusal of an
 unauthenticated read, and that `/api/live` upgrades and refuses a token this process did
 not sign.
 
-`activity/` is the frontend: the SDK handshake, seven screens — Party Stash, My Items,
-Character, Loot, Treasury, Dice, and a DM screen only a DM is shown — the instance roster beside them, a
+`activity/` is the frontend: the SDK handshake, eight screens — Party Stash, My Items,
+Who Has What, Character, Loot, Treasury, Dice, and a DM screen only a DM is shown — the instance roster beside them, a
 reconnecting socket that resumes from its cursor, a header that says whether it is live,
 and a re-handshake when a session token is refused. A player takes, gives, uses, claims,
 and moves coin from it.
+
+**Who Has What** is a read and only a read. `GET /api/holdings` groups every character-held
+stack under the character holding it and is open to the table rather than to a DM: nothing on
+it is secret, since the give controls already name every active character and the stacks came
+out of a stash everybody can read. It carries lifecycle, so a stack still held by somebody who
+has stopped playing is visible as the outstanding estate it is. Nothing on the screen presses:
+a give is made by the character holding the stack, so there is no control here that the domain
+would accept. The three item lists — the stash, what you carry, and this — each filter on name
+and provenance, and a filtered list reports how many of the campaign's stacks it is showing
+rather than passing the narrowed count off as the total.
 
 A DM runs the rest of it from the same place. Grant and Correct sit on the Party Stash, the
 drop form on Loot, adjust and split on Treasury — each control on the screen showing what it
@@ -179,6 +189,15 @@ on every pull request, and CI builds the Activity bundle — with `VITE_DISCORD_
 set, which matters: without it the client id is statically undefined, `boot()` returns on
 its first line, and Vite tree-shakes the entire application out of the bundle it just
 proved compiles.
+
+The Activity now has three gates the build could never be: ESLint, a Prettier check, and
+Vitest. The tests are `activity/tests/render.test.js` and they assert something deliberately
+weak — that every screen renders without throwing, first with nothing read yet and then
+against a played campaign. `renderApp` replaces the whole tree on every draw, so a screen
+that reaches into a null read does not render a wrong number; it throws inside `draw`, the
+tree is never replaced, and the table is left looking at a dead page with no control to
+press, because the controls were what failed to render. That is the failure these exist for.
+Prettier's width is 100, which is the width the frontend was already written to.
 
 ## Live Activity acceptance on 2026-08-23
 

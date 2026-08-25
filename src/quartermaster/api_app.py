@@ -295,6 +295,20 @@ def my_items(state: State, actor: CurrentActor, limit: int = 200) -> dict[str, A
     return state.context.inventory.holdings(actor_id=actor.id, limit=_bounded(limit))
 
 
+@router.get("/holdings")
+def holdings(state: State, _: CurrentActor) -> dict[str, Any]:
+    """Who is carrying what, for the whole party.
+
+    Open to the table rather than to a DM. Until now the only surface that
+    named a holder was the export, which is DM-only, so the question every
+    table asks out loud had no answer on screen. Nothing here is secret: the
+    give controls already list every active character by name, and the stacks
+    themselves came out of a Party Stash everybody can read.
+    """
+
+    return state.context.inventory.held_by_character()
+
+
 @router.get("/loot")
 def loot(state: State, _: CurrentActor) -> dict[str, Any]:
     drops = state.context.loot.list_open()

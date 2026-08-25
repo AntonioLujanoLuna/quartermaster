@@ -592,6 +592,21 @@ table.listing td.controls {
   font-size: 12px;
 }
 
+/* The filter sits above the list it narrows and is the full width of it, so
+   that it reads as belonging to the table rather than as one more form
+   control among the DM's. */
+.filter {
+  display: flex;
+  margin-bottom: 10px;
+}
+
+.filter .text-field {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  padding: 6px 8px;
+}
+
 .status,
 .error {
   padding: 24px;

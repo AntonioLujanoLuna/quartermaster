@@ -32,6 +32,9 @@ const state = {
   home: null,
   stash: null,
   holdings: null,
+  // What every character is carrying. Read only by the screen that shows it,
+  // like every other list here.
+  party: null,
   loot: null,
   treasury: null,
   combat: null,
@@ -82,6 +85,9 @@ const READERS = {
   holdings: async () => {
     state.holdings = await api.myItems();
   },
+  party: async () => {
+    state.party = await api.partyHoldings();
+  },
   loot: async () => {
     state.loot = await api.loot();
   },
@@ -109,6 +115,7 @@ const READERS = {
 const SCREEN_READS = {
   stash: ["stash"],
   items: ["holdings"],
+  party: ["party"],
   dossier: ["dossier"],
   loot: ["loot"],
   treasury: ["treasury"],
@@ -245,6 +252,21 @@ const handlers = {
   // rebuilding it under the caret is how a live screen becomes unusable.
   setInput(key, value) {
     state.inputs[key] = value;
+  },
+
+  /**
+   * The one typed value that does redraw.
+   *
+   * `setInput` deliberately does not, because rebuilding a form under the
+   * caret is how a live screen becomes unusable. A filter is the exception
+   * that proves it: the list underneath is the whole answer, so it has to
+   * change as the letters arrive. `draw` puts the caret back, which is the
+   * same mechanism that already lets the live feed redraw under somebody
+   * halfway through typing a quantity.
+   */
+  setFilter(key, value) {
+    state.inputs[key] = value;
+    draw();
   },
 
   setDicePreset(expression, mode) {

@@ -108,6 +108,7 @@ export const api = {
   home: () => request("/home"),
   stash: () => request("/stash"),
   myItems: () => request("/me/items"),
+  partyHoldings: () => request("/holdings"),
   loot: () => request("/loot"),
   treasury: () => request("/treasury"),
   characters: () => request("/characters"),

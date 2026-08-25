@@ -79,6 +79,61 @@ function amountIn(state, key, fallback = 1) {
   return Number.isFinite(typed) && typed > 0 ? typed : fallback;
 }
 
+/**
+ * Narrow a list to what somebody is looking for.
+ *
+ * The panels truncated because Discord gave them twenty-five controls and two
+ * thousand characters. This surface has neither bound and says so — it
+ * scrolls — but a stash forty stacks deep still answers "have we got rope" by
+ * making somebody read all forty. Filtering is that question asked once.
+ *
+ * It matches the provenance as well as the name, because half of what the
+ * table wants to find again it remembers by where it came from rather than by
+ * what it is called.
+ */
+function filterValue(state, key) {
+  return (state.inputs[key] ?? "").trim().toLowerCase();
+}
+
+function matchesFilter(needle, ...fields) {
+  if (!needle) return true;
+  return fields.some((field) => String(field ?? "").toLowerCase().includes(needle));
+}
+
+/**
+ * The field itself.
+ *
+ * Unlike every other input on these screens it redraws on each keystroke,
+ * because the list underneath it *is* the answer and a filter that only
+ * applies once you look away is not one. `draw` puts the caret back where it
+ * was, which is the mechanism that already exists for the live feed redrawing
+ * under somebody who is typing.
+ */
+function filterField(state, key, placeholder, handlers) {
+  const wrap = element("div", "filter");
+  const node = element("input", "text-field");
+  node.type = "search";
+  node.placeholder = placeholder;
+  node.value = state.inputs[key] ?? "";
+  node.dataset.inputKey = key;
+  node.setAttribute("aria-label", placeholder);
+  node.addEventListener("input", () => handlers.setFilter(key, node.value));
+  wrap.append(node);
+  return wrap;
+}
+
+/**
+ * How many rows the reader is looking at, and how many exist.
+ *
+ * A filtered list that only says "3 stacks" has quietly become a lie about the
+ * campaign, so the total stays and the shown count joins it.
+ */
+function countLine(shown, total, noun) {
+  const plural = total === 1 ? noun : `${noun}s`;
+  const text = shown === total ? `${total} ${plural}` : `${shown} of ${total} ${plural} shown`;
+  return element("p", "count muted", text);
+}
+
 export function renderStatus(message) {
   return element("p", "status", message);
 }
@@ -162,6 +217,9 @@ function renderContinuity(continuity) {
 const SCREENS = [
   { id: "stash", label: "Party Stash" },
   { id: "items", label: "My Items" },
+  // Between "what we share" and "what I carry" sits "who has the rope", which
+  // until now only the DM-only export could answer.
+  { id: "party", label: "Who Has What" },
   { id: "dossier", label: "Character" },
   { id: "loot", label: "Loot" },
   { id: "treasury", label: "Treasury" },
@@ -442,10 +500,15 @@ function table(headings) {
 function renderStashScreen(state, handlers) {
   const screen = element("section", "screen");
   const stash = state.stash || { items: [], total: 0 };
+  const needle = filterValue(state, "filter:stash");
+  const shown = stash.items.filter((item) =>
+    matchesFilter(needle, item.item_name, item.provenance),
+  );
+  screen.append(filterField(state, "filter:stash", "Filter the stash", handlers));
   const [listing, body] = table(["Item", "Qty", "Where it came from", ""]);
   // No truncation and no "dropped N entries". The list scrolls, which is the
   // whole reason this surface exists.
-  for (const item of stash.items) {
+  for (const item of shown) {
     const row = element("tr");
     row.append(element("td", "name", item.item_name));
     row.append(element("td", "quantity", item.quantity));
@@ -478,9 +541,18 @@ function renderStashScreen(state, handlers) {
     row.append(controls);
     body.append(row);
   }
-  if (stash.items.length === 0) body.append(emptyRow(4, "The Party Stash is empty."));
+  if (shown.length === 0) {
+    body.append(
+      emptyRow(
+        4,
+        stash.items.length === 0
+          ? "The Party Stash is empty."
+          : "Nothing in the stash matches that.",
+      ),
+    );
+  }
   screen.append(listing);
-  screen.append(element("p", "count muted", `${stash.total} stacks`));
+  screen.append(countLine(shown.length, stash.total, "stack"));
   if (!state.home?.character) {
     screen.append(
       element(
@@ -561,12 +633,23 @@ function renderItemsScreen(state, handlers) {
   }
   screen.append(renderDestination(state, handlers, "destination"));
 
-  const [listing, body] = table(["Item", "Held", "How many", ""]);
-  for (const item of holdings.items) {
+  const needle = filterValue(state, "filter:items");
+  const shown = holdings.items.filter((item) =>
+    matchesFilter(needle, item.item_name, item.provenance),
+  );
+  screen.append(filterField(state, "filter:items", "Filter what you are carrying", handlers));
+
+  // "Where it came from" travels with the stack and the Party Stash has always
+  // shown it. Not showing it here made the same fact answerable about what the
+  // party shares and unanswerable about what a player is holding, which is the
+  // half somebody actually has to account for.
+  const [listing, body] = table(["Item", "Held", "Where it came from", "How many", ""]);
+  for (const item of shown) {
     const key = `give:${item.id}`;
     const row = element("tr");
     row.append(element("td", "name", item.item_name));
     row.append(element("td", "quantity", item.quantity));
+    row.append(element("td", "provenance muted", item.provenance || "—"));
     const field = element("td", "field");
     field.append(quantityField(state, key, { max: item.quantity, handlers }));
     row.append(field);
@@ -601,12 +684,85 @@ function renderItemsScreen(state, handlers) {
     row.append(controls);
     body.append(row);
   }
-  if (holdings.items.length === 0) {
-    body.append(emptyRow(4, `${holdings.character.name} is carrying nothing.`));
+  if (shown.length === 0) {
+    body.append(
+      emptyRow(
+        5,
+        holdings.items.length === 0
+          ? `${holdings.character.name} is carrying nothing.`
+          : "Nothing you are carrying matches that.",
+      ),
+    );
   }
   screen.append(listing);
+  const count = countLine(shown.length, holdings.total_items, "stack");
+  count.textContent = `${holdings.character.name} · ${count.textContent}`;
+  screen.append(count);
+  return screen;
+}
+
+/**
+ * Who has the rope.
+ *
+ * The Party Stash screen answers what the party shares and My Items answers
+ * what you are carrying. Between them sat the question the table actually asks
+ * out loud, and until now the only surface that named a holder was the export,
+ * which is a DM-only document and a wall of prose.
+ *
+ * It reads rather than acts. Moving somebody else's property is not a thing
+ * the domain allows — a give is made by the character holding the stack — so
+ * there is nothing here to press, and the screen does not pretend otherwise.
+ */
+function renderPartyScreen(state, handlers) {
+  const screen = element("section", "screen");
+  const party = state.party;
+  if (!party) {
+    screen.append(element("p", "muted", "Reading what everyone is carrying…"));
+    return screen;
+  }
+
+  const needle = filterValue(state, "filter:party");
+  screen.append(filterField(state, "filter:party", "Filter by item, holder, or origin", handlers));
+
+  const [listing, body] = table(["Item", "Qty", "Held by", "Where it came from"]);
+  let shown = 0;
+  for (const holder of party.characters) {
+    for (const item of holder.items) {
+      if (!matchesFilter(needle, item.item_name, holder.character_name, item.provenance)) continue;
+      shown += 1;
+      const row = element("tr");
+      row.append(element("td", "name", item.item_name));
+      row.append(element("td", "quantity", item.quantity));
+      const holderCell = element("td", null, holder.character_name);
+      if (holder.lifecycle !== "ACTIVE") {
+        // A stack still held by somebody who has stopped playing is exactly
+        // what estate resolution is for, and seeing it is how a DM knows one
+        // is outstanding.
+        holderCell.append(element("span", "muted", ` · ${holder.lifecycle.toLowerCase()}`));
+      }
+      row.append(holderCell);
+      row.append(element("td", "provenance muted", item.provenance || "—"));
+      body.append(row);
+    }
+  }
+  if (shown === 0) {
+    body.append(
+      emptyRow(
+        4,
+        party.total_stacks === 0
+          ? "Nobody is carrying anything yet."
+          : "Nothing anybody is carrying matches that.",
+      ),
+    );
+  }
+  screen.append(listing);
+  screen.append(countLine(shown, party.total_stacks, "stack"));
   screen.append(
-    element("p", "count muted", `${holdings.character.name} · ${holdings.total_items} stacks`),
+    element(
+      "p",
+      "count muted",
+      "What the party shares is on the Party Stash screen. This is what people are holding.",
+    ),
   );
   return screen;
 }
@@ -1196,6 +1352,7 @@ function renderMaintenanceBlock(state, handlers) {
 const SCREEN_BODIES = {
   stash: renderStashScreen,
   items: renderItemsScreen,
+  party: renderPartyScreen,
   dossier: renderDossierScreen,
   loot: renderLootScreen,
   treasury: renderTreasuryScreen,
