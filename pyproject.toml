@@ -17,20 +17,20 @@ dependencies = [
 # discord.py already requires it, and the OAuth exchange uses that one.
 activity = [
     "fastapi>=0.115",
-    "uvicorn>=0.30",
+    "uvicorn>=0.52.4",
     # The live feed. uvicorn speaks HTTP without this and answers a WebSocket
     # upgrade with 404, which would look like a missing route rather than a
     # missing dependency. The test suite does not need it — Starlette's test
     # client runs a socket in-process — so it is here rather than in dev.
-    "websockets>=13",
+    "websockets>=17.1",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
-    "ruff>=0.16.3",
+    "ruff>=0.16.5",
     "fastapi>=0.115",
-    "uvicorn>=0.30",
+    "uvicorn>=0.52.4",
     "httpx>=0.27",
     "mypy>=1.13",
 ]
